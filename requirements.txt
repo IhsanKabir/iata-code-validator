@@ -1,0 +1,4 @@
+patchright==1.59.1
+openpyxl==3.1.5
+faster-whisper==1.2.1
+pyinstaller==6.20.0

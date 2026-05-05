@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tests
+.pytest_cache/
+.pytest_tmp/
+
+# PyInstaller artifacts
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Local cache / output (anything user-generated)
+*.sqlite
+iata_results_*.xlsx
+*.log
+
+# Whisper model — too large for git (75 MB). CI downloads it on each build.
+assets/whisper_model/
+assets/whisper_tmp/
+
+# OS
+Thumbs.db
+.DS_Store
