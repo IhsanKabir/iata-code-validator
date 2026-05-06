@@ -48,3 +48,36 @@ STATUS_VALID = "VALID"
 STATUS_INVALID = "INVALID"
 STATUS_ERROR = "ERROR"
 STATUS_CACHED = "CACHED"
+
+# ---------------------------------------------------------------------------
+# BD Travel Agency Lookup tab
+# ---------------------------------------------------------------------------
+
+BD_CACHE_DB = APP_DIR / "bd_agencies.sqlite"
+BD_CACHE_STALE_AFTER_DAYS = 7  # warn the user when the cached list is older
+
+BD_OUTPUT_COLUMNS_LOOKUP = [
+    "Searched Input",
+    "Match Method",
+    "Match Score",
+    "Agency Name",
+    "License No",
+    "Email",
+    "Mobile",
+    "Website",
+    "Address",
+    "License Expiry",
+    "Status",
+    "Other Matches",
+]
+
+BD_OUTPUT_COLUMNS_FULL = [
+    "Agency Name",
+    "License No",
+    "Email",
+    "Mobile",
+    "Website",
+    "Address",
+    "License Expiry",
+    "Status",
+]

@@ -9,7 +9,11 @@ from typing import Iterable
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-from .config import OUTPUT_COLUMNS
+from .config import (
+    BD_OUTPUT_COLUMNS_FULL,
+    BD_OUTPUT_COLUMNS_LOOKUP,
+    OUTPUT_COLUMNS,
+)
 from .parser import LookupResult
 
 
@@ -138,3 +142,60 @@ class ResultWriter:
 
     def _save(self) -> None:
         self._wb.save(self.path)
+
+
+# ---------------------------------------------------------------------------
+# BD Travel Agency exports
+# ---------------------------------------------------------------------------
+
+
+def write_bd_full_list(path: Path, agencies: list) -> None:
+    """Dump the full BD agency list to a fresh Excel file."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "BD Agencies"
+    ws.append(BD_OUTPUT_COLUMNS_FULL)
+    for a in agencies:
+        ws.append([
+            a.agency_name,
+            a.license_no,
+            a.email,
+            a.mobile,
+            a.website,
+            a.address,
+            a.license_expired_date,
+            a.status,
+        ])
+    wb.save(path)
+
+
+def write_bd_lookup_results(path: Path, results: list) -> None:
+    """Write BD lookup results (one row per input)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Lookup Results"
+    ws.append(BD_OUTPUT_COLUMNS_LOOKUP)
+    for r in results:
+        a = r.agency
+        ws.append([
+            r.searched_input,
+            r.match_method,
+            r.match_score,
+            a.agency_name if a else "",
+            a.license_no if a else "",
+            a.email if a else "",
+            a.mobile if a else "",
+            a.website if a else "",
+            a.address if a else "",
+            a.license_expired_date if a else "",
+            a.status if a else "",
+            r.other_matches,
+        ])
+    wb.save(path)
+
+
+def build_bd_output_path(folder: Path, kind: str = "lookup") -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = "bd_agency_full_list" if kind == "full" else "bd_agency_lookup"
+    return folder / f"{stem}_{timestamp}.xlsx"

@@ -35,6 +35,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import config, excel_io
+from .bd_agency_client import Agency, fetch_all_agencies, filter_status
+from .bd_cache import BDAgencyCache
+from .bd_matcher import AgencyIndex
 from .cache import Cache
 from .parser import LookupResult, now_iso
 from .validator import (
@@ -47,7 +50,7 @@ from .validator import (
 log = logging.getLogger(__name__)
 
 
-# Worker → GUI message types
+# IATA worker → GUI message types
 MSG_LOG = "log"
 MSG_PROGRESS = "progress"
 MSG_RESULT = "result"
@@ -55,15 +58,22 @@ MSG_CAPTCHA = "captcha"
 MSG_DONE = "done"
 MSG_ERROR = "error"
 
+# BD Agency worker → GUI message types
+MSG_BD_LOG = "bd_log"
+MSG_BD_PROGRESS = "bd_progress"
+MSG_BD_DONE = "bd_done"
+MSG_BD_ERROR = "bd_error"
+MSG_BD_REFRESHED = "bd_refreshed"   # payload: (count:int, last_refresh:str)
+
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("IATA CheckACode — Bulk Validator")
-        self.root.geometry("900x680")
-        self.root.minsize(820, 600)
+        self.root.title("IATA Code Validator")
+        self.root.geometry("960x720")
+        self.root.minsize(860, 620)
 
-        # State
+        # ----- IATA tab state -----
         self.input_path = tk.StringVar()
         self.sheet_name = tk.StringVar()
         self.column_name = tk.StringVar()
@@ -75,12 +85,27 @@ class App:
         self._worker: threading.Thread | None = None
         self._validator: IATAValidator | None = None
         self._pause_event = threading.Event()
-        self._pause_event.set()  # set = running, clear = paused
+        self._pause_event.set()
         self._stop_flag = threading.Event()
         self._captcha_clear_flag = threading.Event()
+
+        # ----- BD tab state -----
+        self.bd_mode = tk.StringVar(value="full")  # "full" or "lookup"
+        self.bd_input_path = tk.StringVar()
+        self.bd_sheet_name = tk.StringVar()
+        self.bd_column_name = tk.StringVar()
+        self.bd_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.bd_include_expired = tk.BooleanVar(value=True)
+
+        self._bd_sheet_columns: list[str] = []
+        self._bd_worker: threading.Thread | None = None
+        self._bd_cache = BDAgencyCache(config.BD_CACHE_DB)
+
+        # ----- Shared message queue -----
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
         self._build_ui()
+        self._refresh_bd_status_label()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -89,11 +114,24 @@ class App:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Wrap everything in a Notebook so each tool gets its own tab.
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        iata_tab = ttk.Frame(notebook)
+        bd_tab = ttk.Frame(notebook)
+        notebook.add(iata_tab, text="IATA Code Validator")
+        notebook.add(bd_tab, text="BD Travel Agency Lookup")
+
+        self._build_iata_tab(iata_tab)
+        self._build_bd_tab(bd_tab)
+
+    def _build_iata_tab(self, parent: ttk.Frame) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # Top frame: file pickers
-        frm = ttk.LabelFrame(self.root, text="Input")
-        frm.pack(fill="x", padx=10, pady=(10, 4))
+        # Input frame
+        frm = ttk.LabelFrame(parent, text="Input")
+        frm.pack(fill="x", padx=6, pady=(6, 4))
 
         ttk.Label(frm, text="Input Excel:").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.input_path).grid(row=0, column=1, sticky="ew", **pad)
@@ -119,16 +157,16 @@ class App:
         frm.columnconfigure(1, weight=1)
 
         # Output frame
-        out = ttk.LabelFrame(self.root, text="Output")
-        out.pack(fill="x", padx=10, pady=4)
+        out = ttk.LabelFrame(parent, text="Output")
+        out.pack(fill="x", padx=6, pady=4)
         ttk.Label(out, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(out, textvariable=self.output_dir).grid(row=0, column=1, sticky="ew", **pad)
         ttk.Button(out, text="Browse...", command=self._pick_output).grid(row=0, column=2, **pad)
         out.columnconfigure(1, weight=1)
 
         # Controls
-        ctrl = ttk.Frame(self.root)
-        ctrl.pack(fill="x", padx=10, pady=4)
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill="x", padx=6, pady=4)
         self.btn_start = ttk.Button(ctrl, text="Start", command=self._start)
         self.btn_start.pack(side="left", padx=4)
         self.btn_pause = ttk.Button(ctrl, text="Pause", command=self._pause, state="disabled")
@@ -139,21 +177,131 @@ class App:
         self.btn_stop.pack(side="left", padx=4)
 
         # Progress
-        progress_frm = ttk.LabelFrame(self.root, text="Progress")
-        progress_frm.pack(fill="x", padx=10, pady=4)
+        progress_frm = ttk.LabelFrame(parent, text="Progress")
+        progress_frm.pack(fill="x", padx=6, pady=4)
         self.progress_bar = ttk.Progressbar(progress_frm, mode="determinate")
         self.progress_bar.pack(fill="x", padx=8, pady=6)
         self.progress_label = ttk.Label(progress_frm, text="Idle.")
         self.progress_label.pack(anchor="w", padx=8, pady=(0, 6))
 
         # Log
-        log_frm = ttk.LabelFrame(self.root, text="Log")
-        log_frm.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-        self.log_text = tk.Text(log_frm, height=18, wrap="none", font=("Consolas", 9))
+        log_frm = ttk.LabelFrame(parent, text="Log")
+        log_frm.pack(fill="both", expand=True, padx=6, pady=(4, 6))
+        self.log_text = tk.Text(log_frm, height=14, wrap="none", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         scroll = ttk.Scrollbar(log_frm, command=self.log_text.yview)
         scroll.pack(side="right", fill="y", pady=8, padx=(0, 8))
         self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
+
+    # ------------------------------------------------------------------
+    # BD Travel Agency tab
+    # ------------------------------------------------------------------
+
+    def _build_bd_tab(self, parent: ttk.Frame) -> None:
+        pad = {"padx": 8, "pady": 4}
+
+        # Step 1: Refresh / cache status
+        refresh_frm = ttk.LabelFrame(parent, text="Step 1: Refresh data from regtravelagency.gov.bd")
+        refresh_frm.pack(fill="x", padx=6, pady=(6, 4))
+        self.bd_status_label = ttk.Label(refresh_frm, text="…", justify="left")
+        self.bd_status_label.pack(anchor="w", padx=8, pady=(8, 4))
+        self.btn_bd_refresh = ttk.Button(
+            refresh_frm,
+            text="🔄 Refresh now",
+            command=self._bd_refresh,
+        )
+        self.btn_bd_refresh.pack(anchor="w", padx=8, pady=(0, 8))
+
+        # Step 2: Mode
+        mode_frm = ttk.LabelFrame(parent, text="Step 2: Choose what to do")
+        mode_frm.pack(fill="x", padx=6, pady=4)
+        ttk.Radiobutton(
+            mode_frm,
+            text="Export FULL list to Excel (all cached agencies)",
+            variable=self.bd_mode,
+            value="full",
+            command=self._toggle_bd_mode,
+        ).pack(anchor="w", padx=8, pady=(8, 2))
+        ttk.Radiobutton(
+            mode_frm,
+            text="Lookup names from Excel (match each name against the cached list)",
+            variable=self.bd_mode,
+            value="lookup",
+            command=self._toggle_bd_mode,
+        ).pack(anchor="w", padx=8, pady=(2, 8))
+
+        # Step 3: input file picker (only enabled in lookup mode)
+        self.bd_input_frm = ttk.LabelFrame(parent, text="Step 3: Input Excel (lookup mode only)")
+        self.bd_input_frm.pack(fill="x", padx=6, pady=4)
+        ttk.Label(self.bd_input_frm, text="File:").grid(row=0, column=0, sticky="w", **pad)
+        self.bd_input_entry = ttk.Entry(self.bd_input_frm, textvariable=self.bd_input_path)
+        self.bd_input_entry.grid(row=0, column=1, sticky="ew", **pad)
+        self.bd_input_btn = ttk.Button(
+            self.bd_input_frm, text="Browse...", command=self._bd_pick_input
+        )
+        self.bd_input_btn.grid(row=0, column=2, **pad)
+
+        ttk.Label(self.bd_input_frm, text="Sheet:").grid(row=1, column=0, sticky="w", **pad)
+        self.bd_sheet_combo = ttk.Combobox(
+            self.bd_input_frm, textvariable=self.bd_sheet_name, state="readonly"
+        )
+        self.bd_sheet_combo.grid(row=1, column=1, sticky="ew", **pad)
+        self.bd_sheet_combo.bind("<<ComboboxSelected>>", lambda _e: self._bd_reload_columns())
+
+        ttk.Label(self.bd_input_frm, text="Name / License # column:").grid(
+            row=2, column=0, sticky="w", **pad
+        )
+        self.bd_col_combo = ttk.Combobox(
+            self.bd_input_frm, textvariable=self.bd_column_name, state="readonly"
+        )
+        self.bd_col_combo.grid(row=2, column=1, sticky="ew", **pad)
+        self.bd_input_frm.columnconfigure(1, weight=1)
+
+        # Filter
+        filter_frm = ttk.LabelFrame(parent, text="Filter")
+        filter_frm.pack(fill="x", padx=6, pady=4)
+        ttk.Checkbutton(
+            filter_frm,
+            text="Include EXPIRED-PENDING agencies (license expired but still in active list)",
+            variable=self.bd_include_expired,
+        ).pack(anchor="w", padx=8, pady=8)
+
+        # Output
+        out_frm = ttk.LabelFrame(parent, text="Output")
+        out_frm.pack(fill="x", padx=6, pady=4)
+        ttk.Label(out_frm, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(out_frm, textvariable=self.bd_output_dir).grid(
+            row=0, column=1, sticky="ew", **pad
+        )
+        ttk.Button(out_frm, text="Browse...", command=self._bd_pick_output).grid(
+            row=0, column=2, **pad
+        )
+        out_frm.columnconfigure(1, weight=1)
+
+        # Run
+        run_frm = ttk.Frame(parent)
+        run_frm.pack(fill="x", padx=6, pady=4)
+        self.btn_bd_run = ttk.Button(run_frm, text="Run", command=self._bd_run)
+        self.btn_bd_run.pack(side="left", padx=4)
+
+        # Progress
+        bd_progress_frm = ttk.LabelFrame(parent, text="Progress")
+        bd_progress_frm.pack(fill="x", padx=6, pady=4)
+        self.bd_progress_bar = ttk.Progressbar(bd_progress_frm, mode="determinate")
+        self.bd_progress_bar.pack(fill="x", padx=8, pady=6)
+        self.bd_progress_label = ttk.Label(bd_progress_frm, text="Idle.")
+        self.bd_progress_label.pack(anchor="w", padx=8, pady=(0, 6))
+
+        # Log
+        bd_log_frm = ttk.LabelFrame(parent, text="Log")
+        bd_log_frm.pack(fill="both", expand=True, padx=6, pady=(4, 6))
+        self.bd_log_text = tk.Text(bd_log_frm, height=10, wrap="none", font=("Consolas", 9))
+        self.bd_log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        bd_scroll = ttk.Scrollbar(bd_log_frm, command=self.bd_log_text.yview)
+        bd_scroll.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        self.bd_log_text.configure(yscrollcommand=bd_scroll.set, state="disabled")
+
+        self._toggle_bd_mode()
 
     # ------------------------------------------------------------------
     # File pickers
@@ -249,7 +397,11 @@ class App:
             self._validator.stop()
 
     def _on_close(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
+        any_alive = (
+            (self._worker is not None and self._worker.is_alive())
+            or (self._bd_worker is not None and self._bd_worker.is_alive())
+        )
+        if any_alive:
             if not messagebox.askyesno("Quit?", "A run is in progress. Quit anyway?"):
                 return
             self._stop_flag.set()
@@ -257,8 +409,9 @@ class App:
             self._captcha_clear_flag.set()
             if self._validator is not None:
                 self._validator.stop()
-            # Give the worker a moment to clean up.
-            self._worker.join(timeout=5)
+            if self._worker is not None:
+                self._worker.join(timeout=5)
+            # BD worker is HTTP-only and short-lived; just let it die.
         self.root.destroy()
 
     def _validate_inputs(self) -> dict | None:
@@ -466,6 +619,28 @@ class App:
             self._log(f"ERROR: {payload}")
             messagebox.showerror("Error", str(payload))
             self._reset_buttons()
+        # ------ BD tab messages ------
+        elif kind == MSG_BD_LOG:
+            self._bd_log(str(payload))
+        elif kind == MSG_BD_PROGRESS:
+            idx, total, msg = payload  # type: ignore[misc]
+            self.bd_progress_bar["maximum"] = total
+            self.bd_progress_bar["value"] = idx
+            self.bd_progress_label.configure(text=msg)
+        elif kind == MSG_BD_REFRESHED:
+            count, last_refresh = payload  # type: ignore[misc]
+            self._bd_log(f"Refreshed: {count:,} agencies cached at {last_refresh}.")
+            self._refresh_bd_status_label()
+            self._bd_reset_buttons()
+        elif kind == MSG_BD_DONE:
+            path = str(payload)
+            self._bd_log(f"Done. File: {path}")
+            messagebox.showinfo("BD Agency Lookup — Done", f"Finished.\n\nOutput:\n{path}")
+            self._bd_reset_buttons()
+        elif kind == MSG_BD_ERROR:
+            self._bd_log(f"ERROR: {payload}")
+            messagebox.showerror("BD Agency Lookup — Error", str(payload))
+            self._bd_reset_buttons()
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -496,6 +671,265 @@ class App:
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    # ==================================================================
+    # BD Travel Agency tab — actions + worker
+    # ==================================================================
+
+    def _refresh_bd_status_label(self) -> None:
+        """Update the 'Last fetched: ...' label using the cache."""
+        last = self._bd_cache.last_refresh()
+        count = self._bd_cache.count()
+        if not last or count == 0:
+            self.bd_status_label.configure(
+                text="No cached data yet. Click Refresh to download the agency list."
+            )
+            return
+        self.bd_status_label.configure(
+            text=f"Last fetched: {last}  ·  {count:,} cached records"
+        )
+
+    def _toggle_bd_mode(self) -> None:
+        """Enable/disable input pickers based on current mode."""
+        is_lookup = self.bd_mode.get() == "lookup"
+        state = "normal" if is_lookup else "disabled"
+        for widget in (
+            self.bd_input_entry,
+            self.bd_input_btn,
+            self.bd_sheet_combo,
+            self.bd_col_combo,
+        ):
+            widget.configure(state=state if widget is not self.bd_sheet_combo and widget is not self.bd_col_combo else ("readonly" if is_lookup else "disabled"))
+
+    def _bd_pick_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Excel with agency names",
+            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.bd_input_path.set(path)
+        self._bd_reload_sheets()
+
+    def _bd_pick_output(self) -> None:
+        path = filedialog.askdirectory(title="Select output folder")
+        if path:
+            self.bd_output_dir.set(path)
+
+    def _bd_reload_sheets(self) -> None:
+        try:
+            sheets = excel_io.list_sheet_names(Path(self.bd_input_path.get()))
+        except Exception as e:
+            messagebox.showerror("Cannot read Excel", str(e))
+            return
+        self.bd_sheet_combo["values"] = sheets
+        if sheets:
+            self.bd_sheet_combo.current(0)
+            self._bd_reload_columns()
+
+    def _bd_reload_columns(self) -> None:
+        try:
+            cols = excel_io.list_columns(
+                Path(self.bd_input_path.get()), self.bd_sheet_name.get()
+            )
+        except Exception as e:
+            messagebox.showerror("Cannot read columns", str(e))
+            return
+        self._bd_sheet_columns = cols
+        self.bd_col_combo["values"] = cols
+        guess = next(
+            (c for c in cols if "name" in c.lower() or "agency" in c.lower() or "license" in c.lower()),
+            cols[0] if cols else "",
+        )
+        self.bd_column_name.set(guess)
+
+    # ------------------------------------------------------------------
+    # Refresh worker
+    # ------------------------------------------------------------------
+
+    def _bd_refresh(self) -> None:
+        if self._bd_worker is not None and self._bd_worker.is_alive():
+            messagebox.showinfo("Busy", "Another BD task is already running.")
+            return
+        self.btn_bd_refresh.configure(state="disabled")
+        self.btn_bd_run.configure(state="disabled")
+        self._post(MSG_BD_LOG, "Refreshing agency list from regtravelagency.gov.bd ...")
+        self._bd_worker = threading.Thread(
+            target=self._bd_run_refresh,
+            daemon=True,
+        )
+        self._bd_worker.start()
+
+    def _bd_run_refresh(self) -> None:
+        try:
+            agencies = fetch_all_agencies()
+            self._bd_cache.replace_all(agencies)
+            self._post(
+                MSG_BD_REFRESHED,
+                (len(agencies), self._bd_cache.last_refresh()),
+            )
+        except Exception as e:
+            log.exception("BD refresh failed")
+            self._post(MSG_BD_ERROR, f"Refresh failed: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Run worker (full export OR lookup)
+    # ------------------------------------------------------------------
+
+    def _bd_run(self) -> None:
+        if self._bd_worker is not None and self._bd_worker.is_alive():
+            messagebox.showinfo("Busy", "Another BD task is already running.")
+            return
+        if self._bd_cache.count() == 0:
+            messagebox.showerror(
+                "No cached data",
+                "Click Refresh first to download the agency list.",
+            )
+            return
+
+        out_dir = Path(self.bd_output_dir.get())
+        if not out_dir.exists():
+            messagebox.showerror("Invalid output", "Output folder does not exist.")
+            return
+
+        mode = self.bd_mode.get()
+        cfg: dict = {
+            "mode": mode,
+            "output_dir": out_dir,
+            "include_expired": bool(self.bd_include_expired.get()),
+        }
+        if mode == "lookup":
+            input_path = self.bd_input_path.get().strip()
+            if not input_path or not Path(input_path).exists():
+                messagebox.showerror("Invalid input", "Pick a valid Excel file.")
+                return
+            if not self.bd_sheet_name.get():
+                messagebox.showerror("Invalid input", "Pick a sheet.")
+                return
+            if (
+                not self.bd_column_name.get()
+                or self.bd_column_name.get() not in self._bd_sheet_columns
+            ):
+                messagebox.showerror("Invalid input", "Pick the column.")
+                return
+            cfg["input_path"] = Path(input_path)
+            cfg["sheet"] = self.bd_sheet_name.get()
+            cfg["column_index"] = self._bd_sheet_columns.index(self.bd_column_name.get())
+
+        self.btn_bd_refresh.configure(state="disabled")
+        self.btn_bd_run.configure(state="disabled")
+        self._bd_worker = threading.Thread(
+            target=self._bd_worker_run,
+            args=(cfg,),
+            daemon=True,
+        )
+        self._bd_worker.start()
+
+    def _bd_worker_run(self, cfg: dict) -> None:
+        try:
+            agencies = self._bd_cache.all()
+            agencies = filter_status(agencies, cfg["include_expired"])
+            self._post(MSG_BD_LOG, f"Loaded {len(agencies):,} cached agencies after filter.")
+
+            if cfg["mode"] == "full":
+                output_path = excel_io.build_bd_output_path(cfg["output_dir"], kind="full")
+                self._post(MSG_BD_LOG, f"Writing full list to {output_path} ...")
+                excel_io.write_bd_full_list(output_path, agencies)
+                self._post(MSG_BD_DONE, str(output_path))
+                return
+
+            # Lookup mode
+            inputs = excel_io.read_iata_numbers(  # reuses generic Excel reader
+                cfg["input_path"],
+                cfg["sheet"],
+                cfg["column_index"],
+                start_row=2,
+                end_row=None,
+            )
+            # read_iata_numbers strips and normalises — but BD names need
+            # less normalisation. Re-read raw values so names like
+            # "ZEPHYR TOURS & TRAVELS" survive.
+            inputs = self._read_bd_inputs(
+                cfg["input_path"], cfg["sheet"], cfg["column_index"]
+            )
+            if not inputs:
+                self._post(MSG_BD_ERROR, "No values found in the selected column.")
+                return
+
+            self._post(MSG_BD_LOG, f"Building search index over {len(agencies):,} agencies ...")
+            index = AgencyIndex(agencies)
+
+            self._post(MSG_BD_LOG, f"Matching {len(inputs):,} input rows ...")
+            results = []
+            total = len(inputs)
+            for i, (_, value) in enumerate(inputs, start=1):
+                results.append(index.lookup(value))
+                if i % 50 == 0 or i == total:
+                    self._post(MSG_BD_PROGRESS, (i, total, f"{i}/{total} matched"))
+
+            output_path = excel_io.build_bd_output_path(cfg["output_dir"], kind="lookup")
+            self._post(MSG_BD_LOG, f"Writing lookup results to {output_path} ...")
+            excel_io.write_bd_lookup_results(output_path, results)
+
+            # Summary
+            counts: dict[str, int] = {}
+            for r in results:
+                counts[r.match_method] = counts.get(r.match_method, 0) + 1
+            summary = ", ".join(
+                f"{k}={v}"
+                for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+            self._post(MSG_BD_LOG, f"Match summary: {summary}")
+            self._post(MSG_BD_DONE, str(output_path))
+
+        except Exception as e:
+            log.exception("BD worker crashed")
+            self._post(MSG_BD_ERROR, f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _read_bd_inputs(
+        path: Path, sheet: str, column_index: int
+    ) -> list[tuple[int, str]]:
+        """Read a column of free-form text from Excel.
+
+        Unlike `read_iata_numbers`, we don't strip hyphens/spaces — agency
+        names need to keep their formatting for matching.
+        """
+        from openpyxl import load_workbook
+
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb[sheet]
+            rows: list[tuple[int, str]] = []
+            for row_idx, row in enumerate(
+                ws.iter_rows(min_row=2, values_only=True), start=2
+            ):
+                if column_index >= len(row):
+                    continue
+                value = row[column_index]
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if not text:
+                    continue
+                rows.append((row_idx, text))
+            return rows
+        finally:
+            wb.close()
+
+    # ------------------------------------------------------------------
+    # BD message handling
+    # ------------------------------------------------------------------
+
+    def _bd_log(self, msg: str) -> None:
+        self.bd_log_text.configure(state="normal")
+        self.bd_log_text.insert("end", msg + "\n")
+        self.bd_log_text.see("end")
+        self.bd_log_text.configure(state="disabled")
+
+    def _bd_reset_buttons(self) -> None:
+        self.btn_bd_refresh.configure(state="normal")
+        self.btn_bd_run.configure(state="normal")
 
 
 def _fmt_dur(seconds: float) -> str:
