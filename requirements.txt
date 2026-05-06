@@ -3,4 +3,5 @@ openpyxl==3.1.5
 faster-whisper==1.2.1
 requests==2.33.1
 rapidfuzz==3.14.5
+keyring==25.7.0
 pyinstaller==6.20.0

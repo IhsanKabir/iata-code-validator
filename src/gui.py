@@ -34,10 +34,15 @@ import winsound
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import config, excel_io
+from . import __version__, auth, config, excel_io, updater
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
-from .bd_matcher import AgencyIndex
+from .bd_matcher import (
+    FIELD_ADDRESS,
+    FIELD_LICENSE,
+    FIELD_NAME,
+    AgencyIndex,
+)
 from .cache import Cache
 from .parser import LookupResult, now_iso
 from .validator import (
@@ -64,6 +69,14 @@ MSG_BD_PROGRESS = "bd_progress"
 MSG_BD_DONE = "bd_done"
 MSG_BD_ERROR = "bd_error"
 MSG_BD_REFRESHED = "bd_refreshed"   # payload: (count:int, last_refresh:str)
+
+# Updater worker → GUI message types
+MSG_UPDATE_LOG = "update_log"
+MSG_UPDATE_PROGRESS = "update_progress"  # payload: (downloaded:int, total:int)
+MSG_UPDATE_FOUND = "update_found"        # payload: UpdateInfo
+MSG_UPDATE_NONE = "update_none"          # payload: UpdateInfo (or None)
+MSG_UPDATE_DOWNLOADED = "update_downloaded"  # payload: Path
+MSG_UPDATE_ERROR = "update_error"
 
 
 class App:
@@ -96,6 +109,9 @@ class App:
         self.bd_column_name = tk.StringVar()
         self.bd_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
         self.bd_include_expired = tk.BooleanVar(value=True)
+        self.bd_match_name = tk.BooleanVar(value=True)       # default ON
+        self.bd_match_license = tk.BooleanVar(value=True)    # default ON
+        self.bd_match_address = tk.BooleanVar(value=False)   # default OFF
 
         self._bd_sheet_columns: list[str] = []
         self._bd_worker: threading.Thread | None = None
@@ -103,6 +119,10 @@ class App:
 
         # ----- Shared message queue -----
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
+        # ----- Auth + updater state -----
+        self._signed_in_user: dict | None = None
+        self._update_worker: threading.Thread | None = None
 
         self._build_ui()
         self._refresh_bd_status_label()
@@ -114,6 +134,30 @@ class App:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Bottom status bar — packed first so the Notebook fills the rest.
+        status_frm = ttk.Frame(self.root, relief="sunken", borderwidth=1)
+        status_frm.pack(side="bottom", fill="x")
+
+        self.status_user_label = ttk.Label(status_frm, text="Not signed in")
+        self.status_user_label.pack(side="left", padx=8, pady=2)
+
+        self.status_version_label = ttk.Label(
+            status_frm, text=f"v{__version__}", foreground="#475569"
+        )
+        self.status_version_label.pack(side="right", padx=(0, 8), pady=2)
+
+        self.btn_check_updates = ttk.Button(
+            status_frm,
+            text="Check for updates",
+            command=self._on_check_for_updates,
+        )
+        self.btn_check_updates.pack(side="right", padx=4, pady=2)
+
+        self.btn_sign_out = ttk.Button(
+            status_frm, text="Sign out", command=self._on_sign_out, state="disabled"
+        )
+        self.btn_sign_out.pack(side="right", padx=4, pady=2)
+
         # Wrap everything in a Notebook so each tool gets its own tab.
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -256,6 +300,23 @@ class App:
         )
         self.bd_col_combo.grid(row=2, column=1, sticky="ew", **pad)
         self.bd_input_frm.columnconfigure(1, weight=1)
+
+        # Match against (lookup mode only) — three independent checkboxes.
+        # Default Name+License preserves v1.1.0 behaviour; tick Address
+        # to also match against the agency's full address.
+        match_frm = ttk.LabelFrame(
+            parent, text="Match against (lookup mode only)"
+        )
+        match_frm.pack(fill="x", padx=6, pady=4)
+        ttk.Checkbutton(
+            match_frm, text="Agency Name", variable=self.bd_match_name,
+        ).pack(side="left", padx=8, pady=8)
+        ttk.Checkbutton(
+            match_frm, text="License Number", variable=self.bd_match_license,
+        ).pack(side="left", padx=8, pady=8)
+        ttk.Checkbutton(
+            match_frm, text="Address", variable=self.bd_match_address,
+        ).pack(side="left", padx=8, pady=8)
 
         # Filter
         filter_frm = ttk.LabelFrame(parent, text="Filter")
@@ -519,6 +580,16 @@ class App:
             self._post(MSG_LOG, f"Done. Output: {output_path}")
             self._post(MSG_DONE, str(output_path))
 
+            # Best-effort usage log. Never breaks the run on failure.
+            try:
+                auth.log_lookup_event(
+                    action="iata_validate",
+                    target=str(cfg["input_path"].name),
+                    count=total,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("usage log failed: %s", exc)
+
         except Exception as e:
             log.exception("worker crashed")
             self._post(MSG_ERROR, f"{type(e).__name__}: {e}")
@@ -641,6 +712,30 @@ class App:
             self._bd_log(f"ERROR: {payload}")
             messagebox.showerror("BD Agency Lookup — Error", str(payload))
             self._bd_reset_buttons()
+        # ------ Update messages ------
+        elif kind == MSG_UPDATE_FOUND:
+            self._on_update_found(payload)  # type: ignore[arg-type]
+        elif kind == MSG_UPDATE_NONE:
+            self.btn_check_updates.configure(state="normal", text="Check for updates")
+            messagebox.showinfo(
+                "Up to date",
+                f"You're on the latest version (v{__version__}).",
+            )
+        elif kind == MSG_UPDATE_PROGRESS:
+            downloaded, total = payload  # type: ignore[misc]
+            if total > 0:
+                pct = 100 * downloaded / total
+                self.btn_check_updates.configure(
+                    text=f"Downloading… {pct:.0f}%"
+                )
+            else:
+                mb = downloaded / 1_000_000
+                self.btn_check_updates.configure(text=f"Downloading… {mb:.0f} MB")
+        elif kind == MSG_UPDATE_DOWNLOADED:
+            self._on_update_downloaded(str(payload))
+        elif kind == MSG_UPDATE_ERROR:
+            self.btn_check_updates.configure(state="normal", text="Check for updates")
+            messagebox.showerror("Update", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -768,6 +863,14 @@ class App:
                 MSG_BD_REFRESHED,
                 (len(agencies), self._bd_cache.last_refresh()),
             )
+            try:
+                auth.log_lookup_event(
+                    action="bd_refresh",
+                    target="get-list",
+                    count=len(agencies),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("usage log failed: %s", exc)
         except Exception as e:
             log.exception("BD refresh failed")
             self._post(MSG_BD_ERROR, f"Refresh failed: {type(e).__name__}: {e}")
@@ -812,9 +915,27 @@ class App:
             ):
                 messagebox.showerror("Invalid input", "Pick the column.")
                 return
+
+            # Field selector — pick the checked ones in priority order.
+            fields: list[str] = []
+            if self.bd_match_name.get():
+                fields.append(FIELD_NAME)
+            if self.bd_match_license.get():
+                fields.append(FIELD_LICENSE)
+            if self.bd_match_address.get():
+                fields.append(FIELD_ADDRESS)
+            if not fields:
+                messagebox.showerror(
+                    "Invalid input",
+                    "Tick at least one field to match against "
+                    "(Agency Name / License Number / Address).",
+                )
+                return
+
             cfg["input_path"] = Path(input_path)
             cfg["sheet"] = self.bd_sheet_name.get()
             cfg["column_index"] = self._bd_sheet_columns.index(self.bd_column_name.get())
+            cfg["match_fields"] = tuple(fields)
 
         self.btn_bd_refresh.configure(state="disabled")
         self.btn_bd_run.configure(state="disabled")
@@ -836,6 +957,14 @@ class App:
                 self._post(MSG_BD_LOG, f"Writing full list to {output_path} ...")
                 excel_io.write_bd_full_list(output_path, agencies)
                 self._post(MSG_BD_DONE, str(output_path))
+                try:
+                    auth.log_lookup_event(
+                        action="bd_export",
+                        target="full-list",
+                        count=len(agencies),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("usage log failed: %s", exc)
                 return
 
             # Lookup mode
@@ -859,11 +988,15 @@ class App:
             self._post(MSG_BD_LOG, f"Building search index over {len(agencies):,} agencies ...")
             index = AgencyIndex(agencies)
 
-            self._post(MSG_BD_LOG, f"Matching {len(inputs):,} input rows ...")
+            fields = cfg.get("match_fields") or (FIELD_NAME, FIELD_LICENSE)
+            self._post(
+                MSG_BD_LOG,
+                f"Matching {len(inputs):,} input rows against fields: {', '.join(fields)} ...",
+            )
             results = []
             total = len(inputs)
             for i, (_, value) in enumerate(inputs, start=1):
-                results.append(index.lookup(value))
+                results.append(index.lookup(value, fields=fields))
                 if i % 50 == 0 or i == total:
                     self._post(MSG_BD_PROGRESS, (i, total, f"{i}/{total} matched"))
 
@@ -881,6 +1014,16 @@ class App:
             )
             self._post(MSG_BD_LOG, f"Match summary: {summary}")
             self._post(MSG_BD_DONE, str(output_path))
+
+            try:
+                auth.log_lookup_event(
+                    action="bd_lookup",
+                    target=str(cfg["input_path"].name),
+                    count=len(inputs),
+                    notes="fields=" + "/".join(fields),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("usage log failed: %s", exc)
 
         except Exception as e:
             log.exception("BD worker crashed")
@@ -931,6 +1074,175 @@ class App:
         self.btn_bd_refresh.configure(state="normal")
         self.btn_bd_run.configure(state="normal")
 
+    # ==================================================================
+    # Auth + status bar
+    # ==================================================================
+
+    def ensure_signed_in(self) -> bool:
+        """Show the login dialog if no valid session, return True on success."""
+        # 1. If we already have a token, validate it server-side.
+        if auth.is_signed_in():
+            user = auth.whoami()
+            if user:
+                self._signed_in_user = user
+                self._refresh_user_label()
+                return True
+            # Stale token — drop it and prompt fresh sign-in.
+            auth.clear_token()
+
+        # 2. Show modal sign-in dialog.
+        return self._show_login_dialog()
+
+    def _show_login_dialog(self) -> bool:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Sign in — IATA Code Validator")
+        dlg.geometry("480x230")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: dlg.destroy())
+
+        ttk.Label(
+            dlg,
+            text="Sign in to continue",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(pady=(20, 6), padx=16)
+        ttk.Label(
+            dlg,
+            text=(
+                "The IATA Code Validator is licensed to your team. "
+                "Click below and complete the Google sign-in in your browser."
+            ),
+            wraplength=440,
+            justify="left",
+        ).pack(padx=16, pady=(0, 16))
+
+        status_var = tk.StringVar(value="")
+        status_label = ttk.Label(dlg, textvariable=status_var, foreground="#b91c1c")
+        status_label.pack(padx=16)
+
+        result = {"ok": False}
+
+        def do_signin() -> None:
+            btn_signin.configure(state="disabled", text="Opening browser…")
+            status_var.set("")
+            dlg.update_idletasks()
+            try:
+                oauth_result = auth.run_google_oauth_flow()
+                auth.save_token(oauth_result.session_token)
+                self._signed_in_user = {
+                    "email": oauth_result.email,
+                    "full_name": oauth_result.name,
+                    "user_id": oauth_result.user_id,
+                }
+                result["ok"] = True
+                dlg.destroy()
+            except auth.AuthError as exc:
+                status_var.set(str(exc))
+                btn_signin.configure(state="normal", text="Sign in with Google")
+            except Exception as exc:  # noqa: BLE001
+                status_var.set(f"Unexpected error: {exc}")
+                btn_signin.configure(state="normal", text="Sign in with Google")
+
+        btn_signin = ttk.Button(dlg, text="Sign in with Google", command=do_signin)
+        btn_signin.pack(pady=(12, 8))
+
+        ttk.Button(dlg, text="Quit", command=dlg.destroy).pack()
+
+        self.root.wait_window(dlg)
+        if result["ok"]:
+            self._refresh_user_label()
+        return result["ok"]
+
+    def _refresh_user_label(self) -> None:
+        if self._signed_in_user:
+            email = self._signed_in_user.get("email") or "(signed in)"
+            self.status_user_label.configure(text=f"Signed in: {email}")
+            self.btn_sign_out.configure(state="normal")
+        else:
+            self.status_user_label.configure(text="Not signed in")
+            self.btn_sign_out.configure(state="disabled")
+
+    def _on_sign_out(self) -> None:
+        if not messagebox.askyesno(
+            "Sign out?",
+            "Sign out of the IATA Code Validator? You will need to sign in again on next launch.",
+        ):
+            return
+        try:
+            auth.logout()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("logout error: %s", exc)
+        self._signed_in_user = None
+        self._refresh_user_label()
+        messagebox.showinfo("Signed out", "Signed out. Please restart the app.")
+
+    # ==================================================================
+    # Self-updater
+    # ==================================================================
+
+    def _on_check_for_updates(self) -> None:
+        if self._update_worker is not None and self._update_worker.is_alive():
+            return
+        self.btn_check_updates.configure(state="disabled", text="Checking…")
+        self._update_worker = threading.Thread(
+            target=self._update_check_worker, daemon=True
+        )
+        self._update_worker.start()
+
+    def _update_check_worker(self) -> None:
+        info = updater.check_for_update()
+        if info is None:
+            self._post(MSG_UPDATE_ERROR, "Could not check for updates (network error or no published release).")
+            return
+        if info.is_newer:
+            self._post(MSG_UPDATE_FOUND, info)
+        else:
+            self._post(MSG_UPDATE_NONE, info)
+
+    def _on_update_found(self, info: "updater.UpdateInfo") -> None:
+        self.btn_check_updates.configure(state="normal", text="Check for updates")
+        msg = (
+            f"A new version is available.\n\n"
+            f"Current : v{__version__}\n"
+            f"Latest  : v{info.latest_version}\n\n"
+            f"Download (~380 MB) and restart now?"
+        )
+        if not messagebox.askyesno("Update available", msg):
+            return
+        self.btn_check_updates.configure(state="disabled", text="Downloading…")
+        self._update_worker = threading.Thread(
+            target=self._update_download_worker,
+            args=(info.download_url,),
+            daemon=True,
+        )
+        self._update_worker.start()
+
+    def _update_download_worker(self, url: str) -> None:
+        def progress(downloaded: int, total: int) -> None:
+            self._post(MSG_UPDATE_PROGRESS, (downloaded, total))
+        try:
+            staged = updater.download_update(url, on_progress=progress)
+            self._post(MSG_UPDATE_DOWNLOADED, str(staged))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("update download failed")
+            self._post(MSG_UPDATE_ERROR, f"Download failed: {exc}")
+
+    def _on_update_downloaded(self, staged_path: str) -> None:
+        self.btn_check_updates.configure(text="Restart to update", state="normal")
+        if not messagebox.askyesno(
+            "Download complete",
+            "The new version is ready. The app will close and the new version will launch automatically. Continue?",
+        ):
+            return
+        ok = updater.apply_update_and_exit()
+        if not ok:
+            messagebox.showwarning(
+                "Cannot self-update",
+                "Self-update is only supported in the bundled .exe. "
+                f"Your downloaded file is at:\n{staged_path}",
+            )
+
 
 def _fmt_dur(seconds: float) -> str:
     seconds = int(seconds)
@@ -966,5 +1278,21 @@ def run() -> None:
         default.configure(family="Segoe UI", size=10)
     except Exception:
         pass
-    App(root)
+    app = App(root)
+
+    # Gate the app behind sign-in. The dialog is modal — if the user
+    # closes it without signing in, we exit cleanly. If sign-in is not
+    # configured (no GOOGLE_CLIENT_ID baked in), we show a one-time
+    # warning and let the app run unauthenticated, so a developer build
+    # without secrets still works.
+    if auth.GOOGLE_CLIENT_ID:
+        if not app.ensure_signed_in():
+            root.destroy()
+            return
+    else:
+        log.warning(
+            "IATA_GOOGLE_CLIENT_ID not set — running unauthenticated. "
+            "Set it before building the .exe to require sign-in."
+        )
+
     root.mainloop()

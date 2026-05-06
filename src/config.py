@@ -59,6 +59,7 @@ BD_CACHE_STALE_AFTER_DAYS = 7  # warn the user when the cached list is older
 BD_OUTPUT_COLUMNS_LOOKUP = [
     "Searched Input",
     "Match Method",
+    "Matched Field",
     "Match Score",
     "Agency Name",
     "License No",

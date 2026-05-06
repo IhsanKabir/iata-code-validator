@@ -20,7 +20,14 @@ if not (WHISPER_SRC / "model.bin").exists():
 
 datas = []
 binaries = []
-hiddenimports = ["openpyxl", "openpyxl.cell._writer", "tkinter"]
+hiddenimports = [
+    "openpyxl",
+    "openpyxl.cell._writer",
+    "tkinter",
+    # Windows Credential Manager backend for `keyring` — required for
+    # token persistence in the auth module.
+    "keyring.backends.Windows",
+]
 
 # Bundle whisper model files individually (more reliable than dir-tuple form
 # on some PyInstaller versions on Windows).
@@ -29,7 +36,15 @@ for f in WHISPER_SRC.iterdir():
         datas.append((str(f), "whisper_model"))
 
 # Pull in everything from these packages
-for pkg in ["patchright", "faster_whisper", "ctranslate2", "tokenizers", "onnxruntime"]:
+for pkg in [
+    "patchright",
+    "faster_whisper",
+    "ctranslate2",
+    "tokenizers",
+    "onnxruntime",
+    "keyring",
+    "rapidfuzz",
+]:
     pkg_datas, pkg_bins, pkg_hi = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_bins

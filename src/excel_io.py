@@ -180,6 +180,7 @@ def write_bd_lookup_results(path: Path, results: list) -> None:
         ws.append([
             r.searched_input,
             r.match_method,
+            r.matched_field,
             r.match_score,
             a.agency_name if a else "",
             a.license_no if a else "",

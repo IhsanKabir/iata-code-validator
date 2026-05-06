@@ -1,0 +1,388 @@
+"""Authentication + API client for the IATA Code Validator.
+
+Reuses the TravelportAuto Cloud Run backend so all desktop sign-ins
+flow through the same user pool. The desktop never holds the Google
+OAuth client secret — the auth code is exchanged server-side.
+
+Three responsibilities, kept narrow:
+
+  1. Token storage   — Windows Credential Manager via `keyring`.
+  2. Google OAuth    — PKCE flow with a one-shot localhost redirect.
+  3. API client      — `whoami`, `logout`, `log_lookup_event`.
+
+The session token returned by the API is a 40+ character urlsafe string
+distinct from the IATA Code Validator's own state. We attach it via
+`X-User-Session` on every authenticated request.
+
+Configuration is read from environment variables, baked at build time:
+
+  IATA_API_BASE_URL   default https://travelport-auto-api-...run.app
+  IATA_GOOGLE_CLIENT_ID  default empty
+  IATA_APP_ID         default 'iata-validator'
+
+For local development you can override either by setting the env vars
+before launching the app. CI tags pass them via PyInstaller env or a
+runtime config file.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import http.server
+import json
+import logging
+import os
+import secrets
+import socket
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config (read once at import; override via env if needed)
+# ---------------------------------------------------------------------------
+
+# Default to the public Cloud Run URL the TravelportAuto desktop uses.
+# If it's hosted under a different name, set IATA_API_BASE_URL at build time.
+DEFAULT_API_BASE_URL = "https://aero-pulse-api-cuoiwdgdaq-uc.a.run.app"
+
+API_BASE_URL = os.environ.get(
+    "IATA_API_BASE_URL", DEFAULT_API_BASE_URL
+).rstrip("/")
+GOOGLE_CLIENT_ID = os.environ.get("IATA_GOOGLE_CLIENT_ID", "").strip()
+APP_ID = os.environ.get("IATA_APP_ID", "iata-validator").strip() or "iata-validator"
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_OAUTH_SCOPES = "openid email profile"
+_OAUTH_TIMEOUT_SEC = 120
+
+_KEYRING_SERVICE = "IATACodeValidator"
+_KEYRING_USERNAME = "session_token"
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class AuthError(Exception):
+    """Top-level error for the auth module — sign-in failed for some reason."""
+
+
+class GoogleOAuthError(AuthError):
+    pass
+
+
+class KeyringUnavailableError(AuthError):
+    """Raised when the Windows Credential Manager cannot store/read tokens."""
+
+
+# ---------------------------------------------------------------------------
+# Token storage (Windows Credential Manager via keyring)
+# ---------------------------------------------------------------------------
+
+
+def save_token(token: str) -> None:
+    """Persist `token` to the system keyring."""
+    import keyring
+
+    try:
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, token)
+    except Exception as exc:  # noqa: BLE001
+        raise KeyringUnavailableError(
+            "Could not save your session to the Windows Credential Manager."
+        ) from exc
+
+
+def get_token() -> str | None:
+    """Return the stored session token, or None if not signed in."""
+    try:
+        import keyring  # local import so missing dep doesn't crash startup
+    except ImportError:
+        log.warning("keyring not installed — running unauthenticated")
+        return None
+    try:
+        return keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME) or None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("keyring read failed: %s", exc)
+        return None
+
+
+def clear_token() -> None:
+    """Remove the stored token (sign-out)."""
+    try:
+        import keyring
+        from keyring.errors import PasswordDeleteError
+    except ImportError:
+        return
+    try:
+        keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+    except PasswordDeleteError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("keyring delete failed: %s", exc)
+
+
+def is_signed_in() -> bool:
+    return get_token() is not None
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth — desktop PKCE flow
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OAuthResult:
+    session_token: str
+    email: str
+    name: str | None
+    user_id: str | None
+
+
+def _random_string(n: int = 64) -> str:
+    return secrets.token_urlsafe(n)[:n]
+
+
+def _code_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _post_json(url: str, body: dict, timeout: int = 40) -> dict:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            msg = json.loads(raw).get("detail", raw)
+        except Exception:  # noqa: BLE001
+            msg = raw[:200] or f"HTTP {exc.code}"
+        raise GoogleOAuthError(f"API call to {url} failed: {msg}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise GoogleOAuthError(f"API request failed: {exc}") from exc
+
+
+def run_google_oauth_flow(
+    *,
+    client_id: str | None = None,
+    api_base_url: str | None = None,
+) -> OAuthResult:
+    """Block until the user completes Google sign-in or the timeout expires.
+
+    Spins up a one-shot HTTP server on 127.0.0.1, opens the browser to
+    Google's consent page, captures the redirect, then asks the API to
+    exchange the auth code for our session token (passing app_id so the
+    backend can tag this session as 'iata-validator').
+    """
+    cid = (client_id or GOOGLE_CLIENT_ID).strip()
+    base = (api_base_url or API_BASE_URL).rstrip("/")
+    if not cid:
+        raise GoogleOAuthError(
+            "Google sign-in is not configured on this build. "
+            "Set IATA_GOOGLE_CLIENT_ID before building the .exe."
+        )
+
+    code_verifier = _random_string(64)
+    state = _random_string(16)
+    port = _find_free_port()
+    redirect_uri = f"http://127.0.0.1:{port}/"
+
+    auth_params = {
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": _OAUTH_SCOPES,
+        "state": state,
+        "code_challenge": _code_challenge(code_verifier),
+        "code_challenge_method": "S256",
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    auth_url = f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(auth_params)}"
+
+    captured: dict[str, str] = {}
+    done_event = threading.Event()
+
+    class _OneShotHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 — required name
+            try:
+                qs = urllib.parse.urlparse(self.path).query
+                params = {k: v[0] for k, v in urllib.parse.parse_qs(qs).items()}
+                if params.get("state") != state:
+                    self._reply(400, "state mismatch")
+                    return
+                if "error" in params:
+                    captured["error"] = params["error"]
+                    self._reply(400, f"Authorization error: {params['error']}")
+                    return
+                if "code" in params:
+                    captured["code"] = params["code"]
+                    self._reply(
+                        200,
+                        "Sign-in complete. You can close this tab.",
+                    )
+                    return
+                self._reply(400, "Missing code in callback.")
+            finally:
+                done_event.set()
+
+        def _reply(self, status: int, body: str) -> None:
+            payload = (
+                "<!doctype html><html><body style=\"font-family:sans-serif\">"
+                f"<h2>{body}</h2></body></html>"
+            ).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args, **_kwargs) -> None:  # silence stdout spam
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", port), _OneShotHandler)
+    try:
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        webbrowser.open(auth_url, new=1, autoraise=True)
+        if not done_event.wait(timeout=_OAUTH_TIMEOUT_SEC):
+            raise GoogleOAuthError("Sign-in timed out — no Google response.")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    if "error" in captured:
+        raise GoogleOAuthError(f"Google returned an error: {captured['error']}")
+    code = captured.get("code")
+    if not code:
+        raise GoogleOAuthError("Sign-in completed but no code was returned.")
+
+    # Server-side code exchange — the backend holds the client secret and
+    # also tags the new session row with our app_id.
+    endpoint = f"{base}/api/v1/user-auth/google-code-exchange"
+    payload = _post_json(endpoint, {
+        "code": code,
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+        "client_id": cid,
+        "app_id": APP_ID,
+    })
+    session_token = payload.get("session_token")
+    if not session_token:
+        raise GoogleOAuthError("API did not return a session token.")
+    user = payload.get("user") or {}
+    return OAuthResult(
+        session_token=session_token,
+        email=user.get("email") or "",
+        name=user.get("full_name"),
+        user_id=user.get("user_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+
+
+def _api_request(
+    method: str,
+    path: str,
+    *,
+    body: dict | None = None,
+    timeout: int = 30,
+) -> tuple[int, dict | None]:
+    """Authenticated request to the API. Returns (status, json or None)."""
+    token = get_token()
+    if not token:
+        return 401, {"detail": "Not signed in."}
+    url = f"{API_BASE_URL}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "X-User-Session": token,
+        "User-Agent": f"IATACodeValidator/{_app_version()}",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read().decode("utf-8")
+            return resp.status, (json.loads(payload) if payload else None)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return exc.code, {"detail": raw[:200]}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("API %s %s failed: %s", method, path, exc)
+        return 0, None
+
+
+def _app_version() -> str:
+    try:
+        from . import __version__
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def whoami() -> dict | None:
+    """Return the current user's payload, or None if unauthenticated."""
+    status, payload = _api_request("GET", "/api/v1/user-auth/me")
+    if status != 200 or not payload:
+        return None
+    return payload.get("user")
+
+
+def logout() -> bool:
+    """Revoke the current session on the server, then drop the local token."""
+    status, _ = _api_request("POST", "/api/v1/user-auth/logout")
+    clear_token()
+    return status == 200
+
+
+def log_lookup_event(
+    *,
+    action: str,
+    target: str | None = None,
+    count: int = 0,
+    notes: str | None = None,
+) -> bool:
+    """Fire-and-forget batch-level usage event.
+
+    Best effort: returns False on any error but never raises. If the
+    network is down or the backend is misconfigured we don't fail the
+    user's actual lookup.
+    """
+    body = {
+        "app_id": APP_ID,
+        "action": action,
+        "target": target,
+        "count": int(count or 0),
+        "notes": notes,
+    }
+    status, _payload = _api_request("POST", "/api/v1/lookups/log", body=body)
+    return status == 200
