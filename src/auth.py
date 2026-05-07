@@ -85,7 +85,11 @@ APP_ID = _resolve("IATA_APP_ID", "iata-validator") or "iata-validator"
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _OAUTH_SCOPES = "openid email profile"
-_OAUTH_TIMEOUT_SEC = 120
+# 5 minutes — enough room for the user to handle the Google account
+# picker, password prompt, and (for 2FA accounts) a security key tap.
+# Anything shorter and the localhost listener is already gone by the
+# time Google redirects back: the browser then sees ERR_CONNECTION_REFUSED.
+_OAUTH_TIMEOUT_SEC = 300
 
 _KEYRING_SERVICE = "IATACodeValidator"
 _KEYRING_USERNAME = "session_token"
@@ -292,7 +296,12 @@ def run_google_oauth_flow(
         server_thread.start()
         webbrowser.open(auth_url, new=1, autoraise=True)
         if not done_event.wait(timeout=_OAUTH_TIMEOUT_SEC):
-            raise GoogleOAuthError("Sign-in timed out — no Google response.")
+            raise GoogleOAuthError(
+                f"Sign-in timed out after {_OAUTH_TIMEOUT_SEC}s. "
+                "Close the Google tab and click 'Sign in with Google' again. "
+                "If your browser shows the redirect after this, it means "
+                "you took longer than the timeout — just retry."
+            )
     finally:
         server.shutdown()
         server.server_close()
