@@ -124,10 +124,68 @@ class App:
         self._signed_in_user: dict | None = None
         self._update_worker: threading.Thread | None = None
 
+        self._setup_styles()
         self._build_ui()
         self._refresh_bd_status_label()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------
+    # Theme + custom widget styles
+    # ------------------------------------------------------------------
+
+    def _setup_styles(self) -> None:
+        """Pick a modern theme and define our reusable styles."""
+        style = ttk.Style()
+        # Vista is Windows-native and looks much better than the default
+        # 'default' theme. Fall through to clam on non-Windows / older Tk.
+        for name in ("vista", "winnative", "clam"):
+            if name in style.theme_names():
+                style.theme_use(name)
+                break
+        # Reusable named styles
+        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"))
+        style.configure("Hint.TLabel", foreground="#64748b", font=("Segoe UI", 9))
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(18, 8))
+
+    # ------------------------------------------------------------------
+    # Layout helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _section(parent: tk.Widget, title: str) -> ttk.Frame:
+        """Section heading + separator + inner content frame.
+
+        Returns the inner frame. Caller should `.pack(...)` widgets into it.
+        """
+        wrapper = ttk.Frame(parent)
+        wrapper.pack(fill="x", pady=(8, 4), padx=4)
+        header = ttk.Frame(wrapper)
+        header.pack(fill="x")
+        ttk.Label(header, text=title, style="Section.TLabel").pack(side="left")
+        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(2, 6))
+        body = ttk.Frame(wrapper)
+        body.pack(fill="x")
+        return body
+
+    @staticmethod
+    def _form_row(
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        widget: tk.Widget,
+        *,
+        suffix: tk.Widget | None = None,
+        label_width: int = 16,
+    ) -> None:
+        """Add a `Label: [widget]` row to a 2- or 3-column grid in `parent`."""
+        ttk.Label(parent, text=label, width=label_width, anchor="w").grid(
+            row=row, column=0, sticky="w", padx=(2, 8), pady=4
+        )
+        widget.grid(row=row, column=1, sticky="ew", padx=(0, 4), pady=4)
+        if suffix is not None:
+            suffix.grid(row=row, column=2, padx=(4, 2), pady=4)
+        parent.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -171,48 +229,47 @@ class App:
         self._build_bd_tab(bd_tab)
 
     def _build_iata_tab(self, parent: ttk.Frame) -> None:
-        pad = {"padx": 8, "pady": 4}
+        # ----- Input -----
+        body = self._section(parent, "Input Excel")
 
-        # Input frame
-        frm = ttk.LabelFrame(parent, text="Input")
-        frm.pack(fill="x", padx=6, pady=(6, 4))
+        entry = ttk.Entry(body, textvariable=self.input_path)
+        self._form_row(
+            body, 0, "File:",
+            entry,
+            suffix=ttk.Button(body, text="Browse...", command=self._pick_input),
+        )
 
-        ttk.Label(frm, text="Input Excel:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.input_path).grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(frm, text="Browse...", command=self._pick_input).grid(row=0, column=2, **pad)
-
-        ttk.Label(frm, text="Sheet:").grid(row=1, column=0, sticky="w", **pad)
-        self.sheet_combo = ttk.Combobox(frm, textvariable=self.sheet_name, state="readonly")
-        self.sheet_combo.grid(row=1, column=1, sticky="ew", **pad)
+        self.sheet_combo = ttk.Combobox(body, textvariable=self.sheet_name, state="readonly")
         self.sheet_combo.bind("<<ComboboxSelected>>", lambda _e: self._reload_columns())
+        self._form_row(body, 1, "Sheet:", self.sheet_combo)
 
-        ttk.Label(frm, text="IATA column:").grid(row=2, column=0, sticky="w", **pad)
-        self.col_combo = ttk.Combobox(frm, textvariable=self.column_name, state="readonly")
-        self.col_combo.grid(row=2, column=1, sticky="ew", **pad)
+        self.col_combo = ttk.Combobox(body, textvariable=self.column_name, state="readonly")
+        self._form_row(body, 2, "IATA column:", self.col_combo)
 
-        ttk.Label(frm, text="Row range:").grid(row=3, column=0, sticky="w", **pad)
-        rr = ttk.Frame(frm)
-        rr.grid(row=3, column=1, sticky="w", **pad)
-        ttk.Label(rr, text="start").pack(side="left")
-        ttk.Entry(rr, textvariable=self.start_row, width=8).pack(side="left", padx=(4, 12))
-        ttk.Label(rr, text="end (blank=all)").pack(side="left")
-        ttk.Entry(rr, textvariable=self.end_row, width=8).pack(side="left", padx=(4, 0))
+        rr = ttk.Frame(body)
+        ttk.Label(rr, text="from").pack(side="left")
+        ttk.Entry(rr, textvariable=self.start_row, width=7).pack(side="left", padx=(4, 12))
+        ttk.Label(rr, text="to").pack(side="left")
+        ttk.Entry(rr, textvariable=self.end_row, width=7).pack(side="left", padx=(4, 8))
+        ttk.Label(rr, text="(blank = all)", style="Hint.TLabel").pack(side="left")
+        self._form_row(body, 3, "Row range:", rr)
 
-        frm.columnconfigure(1, weight=1)
+        # ----- Output -----
+        body = self._section(parent, "Output")
+        entry = ttk.Entry(body, textvariable=self.output_dir)
+        self._form_row(
+            body, 0, "Folder:",
+            entry,
+            suffix=ttk.Button(body, text="Browse...", command=self._pick_output),
+        )
 
-        # Output frame
-        out = ttk.LabelFrame(parent, text="Output")
-        out.pack(fill="x", padx=6, pady=4)
-        ttk.Label(out, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(out, textvariable=self.output_dir).grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(out, text="Browse...", command=self._pick_output).grid(row=0, column=2, **pad)
-        out.columnconfigure(1, weight=1)
-
-        # Controls
+        # ----- Controls -----
         ctrl = ttk.Frame(parent)
-        ctrl.pack(fill="x", padx=6, pady=4)
-        self.btn_start = ttk.Button(ctrl, text="Start", command=self._start)
-        self.btn_start.pack(side="left", padx=4)
+        ctrl.pack(fill="x", pady=(8, 4), padx=4)
+        self.btn_start = ttk.Button(
+            ctrl, text="Start", command=self._start, style="Primary.TButton"
+        )
+        self.btn_start.pack(side="left", padx=(0, 8))
         self.btn_pause = ttk.Button(ctrl, text="Pause", command=self._pause, state="disabled")
         self.btn_pause.pack(side="left", padx=4)
         self.btn_resume = ttk.Button(ctrl, text="Resume", command=self._resume, state="disabled")
@@ -220,21 +277,26 @@ class App:
         self.btn_stop = ttk.Button(ctrl, text="Stop", command=self._stop, state="disabled")
         self.btn_stop.pack(side="left", padx=4)
 
-        # Progress
-        progress_frm = ttk.LabelFrame(parent, text="Progress")
-        progress_frm.pack(fill="x", padx=6, pady=4)
-        self.progress_bar = ttk.Progressbar(progress_frm, mode="determinate")
-        self.progress_bar.pack(fill="x", padx=8, pady=6)
-        self.progress_label = ttk.Label(progress_frm, text="Idle.")
-        self.progress_label.pack(anchor="w", padx=8, pady=(0, 6))
+        # ----- Progress -----
+        prog = ttk.Frame(parent)
+        prog.pack(fill="x", padx=4, pady=(8, 4))
+        self.progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.progress_bar.pack(fill="x")
+        self.progress_label = ttk.Label(prog, text="Idle.", style="Hint.TLabel")
+        self.progress_label.pack(anchor="w", pady=(2, 0))
 
-        # Log
-        log_frm = ttk.LabelFrame(parent, text="Log")
-        log_frm.pack(fill="both", expand=True, padx=6, pady=(4, 6))
-        self.log_text = tk.Text(log_frm, height=14, wrap="none", font=("Consolas", 9))
-        self.log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        scroll = ttk.Scrollbar(log_frm, command=self.log_text.yview)
-        scroll.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        # ----- Log -----
+        body = self._section(parent, "Log")
+        log_box = ttk.Frame(body)
+        log_box.pack(fill="both", expand=True)
+        self.log_text = tk.Text(
+            log_box, height=12, wrap="none", font=("Consolas", 9),
+            relief="flat", borderwidth=1, highlightthickness=1,
+            highlightbackground="#cbd5e1",
+        )
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(log_box, command=self.log_text.yview)
+        scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
 
     # ------------------------------------------------------------------
@@ -242,124 +304,113 @@ class App:
     # ------------------------------------------------------------------
 
     def _build_bd_tab(self, parent: ttk.Frame) -> None:
-        pad = {"padx": 8, "pady": 4}
-
-        # Step 1: Refresh / cache status
-        refresh_frm = ttk.LabelFrame(parent, text="Step 1: Refresh data from regtravelagency.gov.bd")
-        refresh_frm.pack(fill="x", padx=6, pady=(6, 4))
-        self.bd_status_label = ttk.Label(refresh_frm, text="…", justify="left")
-        self.bd_status_label.pack(anchor="w", padx=8, pady=(8, 4))
+        # ----- Cached data + Refresh action -----
+        body = self._section(parent, "Cached agency list  ·  regtravelagency.gov.bd")
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        self.bd_status_label = ttk.Label(row, text="…", style="Hint.TLabel")
+        self.bd_status_label.pack(side="left", padx=2)
         self.btn_bd_refresh = ttk.Button(
-            refresh_frm,
-            text="🔄 Refresh now",
-            command=self._bd_refresh,
+            row, text="↻  Refresh now", command=self._bd_refresh,
         )
-        self.btn_bd_refresh.pack(anchor="w", padx=8, pady=(0, 8))
+        self.btn_bd_refresh.pack(side="right")
 
-        # Step 2: Mode
-        mode_frm = ttk.LabelFrame(parent, text="Step 2: Choose what to do")
-        mode_frm.pack(fill="x", padx=6, pady=4)
+        # ----- Mode -----
+        body = self._section(parent, "What to run")
         ttk.Radiobutton(
-            mode_frm,
-            text="Export FULL list to Excel (all cached agencies)",
-            variable=self.bd_mode,
-            value="full",
+            body,
+            text="Export full list to Excel (all cached agencies)",
+            variable=self.bd_mode, value="full",
             command=self._toggle_bd_mode,
-        ).pack(anchor="w", padx=8, pady=(8, 2))
+        ).pack(anchor="w", padx=2, pady=2)
         ttk.Radiobutton(
-            mode_frm,
-            text="Lookup names from Excel (match each name against the cached list)",
-            variable=self.bd_mode,
-            value="lookup",
+            body,
+            text="Lookup names from Excel (match each row against the cached list)",
+            variable=self.bd_mode, value="lookup",
             command=self._toggle_bd_mode,
-        ).pack(anchor="w", padx=8, pady=(2, 8))
+        ).pack(anchor="w", padx=2, pady=2)
 
-        # Step 3: input file picker (only enabled in lookup mode)
-        self.bd_input_frm = ttk.LabelFrame(parent, text="Step 3: Input Excel (lookup mode only)")
-        self.bd_input_frm.pack(fill="x", padx=6, pady=4)
-        ttk.Label(self.bd_input_frm, text="File:").grid(row=0, column=0, sticky="w", **pad)
-        self.bd_input_entry = ttk.Entry(self.bd_input_frm, textvariable=self.bd_input_path)
-        self.bd_input_entry.grid(row=0, column=1, sticky="ew", **pad)
+        # ----- Input (lookup mode) -----
+        body = self._section(parent, "Input Excel  ·  lookup mode only")
+        self.bd_input_frm = body
+        self.bd_input_entry = ttk.Entry(body, textvariable=self.bd_input_path)
         self.bd_input_btn = ttk.Button(
-            self.bd_input_frm, text="Browse...", command=self._bd_pick_input
+            body, text="Browse...", command=self._bd_pick_input,
         )
-        self.bd_input_btn.grid(row=0, column=2, **pad)
+        self._form_row(
+            body, 0, "File:", self.bd_input_entry, suffix=self.bd_input_btn,
+        )
 
-        ttk.Label(self.bd_input_frm, text="Sheet:").grid(row=1, column=0, sticky="w", **pad)
         self.bd_sheet_combo = ttk.Combobox(
-            self.bd_input_frm, textvariable=self.bd_sheet_name, state="readonly"
+            body, textvariable=self.bd_sheet_name, state="readonly",
         )
-        self.bd_sheet_combo.grid(row=1, column=1, sticky="ew", **pad)
         self.bd_sheet_combo.bind("<<ComboboxSelected>>", lambda _e: self._bd_reload_columns())
+        self._form_row(body, 1, "Sheet:", self.bd_sheet_combo)
 
-        ttk.Label(self.bd_input_frm, text="Name / License # column:").grid(
-            row=2, column=0, sticky="w", **pad
-        )
         self.bd_col_combo = ttk.Combobox(
-            self.bd_input_frm, textvariable=self.bd_column_name, state="readonly"
+            body, textvariable=self.bd_column_name, state="readonly",
         )
-        self.bd_col_combo.grid(row=2, column=1, sticky="ew", **pad)
-        self.bd_input_frm.columnconfigure(1, weight=1)
+        self._form_row(body, 2, "Input column:", self.bd_col_combo)
 
-        # Match against (lookup mode only) — three independent checkboxes.
-        # Default Name+License preserves v1.1.0 behaviour; tick Address
-        # to also match against the agency's full address.
-        match_frm = ttk.LabelFrame(
-            parent, text="Match against (lookup mode only)"
-        )
-        match_frm.pack(fill="x", padx=6, pady=4)
+        # Match-against checkboxes — same row, no nested frame.
+        match_row = ttk.Frame(body)
         ttk.Checkbutton(
-            match_frm, text="Agency Name", variable=self.bd_match_name,
-        ).pack(side="left", padx=8, pady=8)
+            match_row, text="Agency Name", variable=self.bd_match_name,
+        ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
-            match_frm, text="License Number", variable=self.bd_match_license,
-        ).pack(side="left", padx=8, pady=8)
+            match_row, text="License Number", variable=self.bd_match_license,
+        ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
-            match_frm, text="Address", variable=self.bd_match_address,
-        ).pack(side="left", padx=8, pady=8)
+            match_row, text="Address", variable=self.bd_match_address,
+        ).pack(side="left")
+        self._form_row(body, 3, "Match against:", match_row)
 
-        # Filter
-        filter_frm = ttk.LabelFrame(parent, text="Filter")
-        filter_frm.pack(fill="x", padx=6, pady=4)
+        # ----- Output + filter -----
+        body = self._section(parent, "Output")
         ttk.Checkbutton(
-            filter_frm,
+            body,
             text="Include EXPIRED-PENDING agencies (license expired but still in active list)",
             variable=self.bd_include_expired,
-        ).pack(anchor="w", padx=8, pady=8)
-
-        # Output
-        out_frm = ttk.LabelFrame(parent, text="Output")
-        out_frm.pack(fill="x", padx=6, pady=4)
-        ttk.Label(out_frm, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(out_frm, textvariable=self.bd_output_dir).grid(
-            row=0, column=1, sticky="ew", **pad
+        ).pack(anchor="w", padx=2, pady=(0, 6))
+        out_row = ttk.Frame(body)
+        out_row.pack(fill="x")
+        out_entry = ttk.Entry(out_row, textvariable=self.bd_output_dir)
+        ttk.Label(out_row, text="Folder:", width=16, anchor="w").pack(
+            side="left", padx=(2, 8)
         )
-        ttk.Button(out_frm, text="Browse...", command=self._bd_pick_output).grid(
-            row=0, column=2, **pad
+        out_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(
+            out_row, text="Browse...", command=self._bd_pick_output,
+        ).pack(side="right", padx=(4, 2))
+
+        # ----- Run -----
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill="x", pady=(8, 4), padx=4)
+        self.btn_bd_run = ttk.Button(
+            ctrl, text="Run", command=self._bd_run, style="Primary.TButton",
         )
-        out_frm.columnconfigure(1, weight=1)
+        self.btn_bd_run.pack(side="left")
 
-        # Run
-        run_frm = ttk.Frame(parent)
-        run_frm.pack(fill="x", padx=6, pady=4)
-        self.btn_bd_run = ttk.Button(run_frm, text="Run", command=self._bd_run)
-        self.btn_bd_run.pack(side="left", padx=4)
+        # ----- Progress -----
+        prog = ttk.Frame(parent)
+        prog.pack(fill="x", padx=4, pady=(8, 4))
+        self.bd_progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.bd_progress_bar.pack(fill="x")
+        self.bd_progress_label = ttk.Label(prog, text="Idle.", style="Hint.TLabel")
+        self.bd_progress_label.pack(anchor="w", pady=(2, 0))
 
-        # Progress
-        bd_progress_frm = ttk.LabelFrame(parent, text="Progress")
-        bd_progress_frm.pack(fill="x", padx=6, pady=4)
-        self.bd_progress_bar = ttk.Progressbar(bd_progress_frm, mode="determinate")
-        self.bd_progress_bar.pack(fill="x", padx=8, pady=6)
-        self.bd_progress_label = ttk.Label(bd_progress_frm, text="Idle.")
-        self.bd_progress_label.pack(anchor="w", padx=8, pady=(0, 6))
-
-        # Log
-        bd_log_frm = ttk.LabelFrame(parent, text="Log")
-        bd_log_frm.pack(fill="both", expand=True, padx=6, pady=(4, 6))
-        self.bd_log_text = tk.Text(bd_log_frm, height=10, wrap="none", font=("Consolas", 9))
-        self.bd_log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        bd_scroll = ttk.Scrollbar(bd_log_frm, command=self.bd_log_text.yview)
-        bd_scroll.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        # ----- Log -----
+        body = self._section(parent, "Log")
+        log_box = ttk.Frame(body)
+        log_box.pack(fill="both", expand=True)
+        self.bd_log_text = tk.Text(
+            log_box, height=10, wrap="none", font=("Consolas", 9),
+            relief="flat", borderwidth=1, highlightthickness=1,
+            highlightbackground="#cbd5e1",
+        )
+        self.bd_log_text.pack(side="left", fill="both", expand=True)
+        bd_scroll = ttk.Scrollbar(log_box, command=self.bd_log_text.yview)
+        bd_scroll.pack(side="right", fill="y")
         self.bd_log_text.configure(yscrollcommand=bd_scroll.set, state="disabled")
 
         self._toggle_bd_mode()
