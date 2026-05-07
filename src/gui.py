@@ -1280,20 +1280,16 @@ def run() -> None:
         pass
     app = App(root)
 
-    # NOTE: sign-in is intentionally disabled in v1.2.3.
-    # The Cloud Run backend is missing the GOOGLE_CLIENT_SECRET env var,
-    # so the OAuth code exchange fails with HTTP 503. When that env var
-    # is set on the Cloud Run service, re-enable the gate by changing
-    # `_REQUIRE_SIGN_IN` below to True and bumping to v1.3.0 — existing
-    # v1.2.x users will receive the change via Check-for-updates.
-    _REQUIRE_SIGN_IN = False
+    # Sign-in gate. The Cloud Run backend now has GOOGLE_CLIENT_SECRET
+    # configured, so the OAuth code exchange works end-to-end.
+    # If IATA_GOOGLE_CLIENT_ID isn't baked (dev build / fork), we still
+    # let the app run unauthenticated so a developer build keeps working.
+    _REQUIRE_SIGN_IN = True
     if _REQUIRE_SIGN_IN and auth.GOOGLE_CLIENT_ID:
         if not app.ensure_signed_in():
             root.destroy()
             return
     elif not auth.GOOGLE_CLIENT_ID:
         log.info("running unauthenticated — IATA_GOOGLE_CLIENT_ID not baked")
-    else:
-        log.info("running unauthenticated — sign-in gate disabled in this build")
 
     root.mainloop()
