@@ -56,6 +56,8 @@ STATUS_CACHED = "CACHED"
 BD_CACHE_DB = APP_DIR / "bd_agencies.sqlite"
 BD_CACHE_STALE_AFTER_DAYS = 7  # warn the user when the cached list is older
 
+OEP_PRESET_FILE = APP_DIR / "oep_presets.json"
+
 BD_OUTPUT_COLUMNS_LOOKUP = [
     "Searched Input",
     "Match Method",
@@ -81,4 +83,55 @@ BD_OUTPUT_COLUMNS_FULL = [
     "Address",
     "License Expiry",
     "Status",
+]
+
+# ---------------------------------------------------------------------------
+# BD Overseas Movement tab (oep.gov.bd)
+# ---------------------------------------------------------------------------
+
+OEP_OUTPUT_COLUMNS_COUNTRY_SUMMARY = [
+    "Rank",
+    "Destination Country",
+    "Total Employees",
+    "Job Categories",
+    "Share %",
+]
+
+OEP_OUTPUT_COLUMNS_COUNTRY_RAW = [
+    "Country ID",
+    "Country Name",
+    "Job Category",
+    "Total Employees",
+]
+
+OEP_OUTPUT_COLUMNS_DIVISION_SUMMARY = [
+    "Rank",
+    "Division",
+    "Total Employees",
+    "Districts",
+    "Share %",
+]
+
+OEP_OUTPUT_COLUMNS_DIVISION_RAW = [
+    "Division",
+    "District",
+    "Total Employees",
+]
+
+OEP_OUTPUT_COLUMNS_CATEGORY_SUMMARY = [
+    "Rank",
+    "Job Category",
+    "Total Employees",
+    "Destination Countries",
+    "Share %",
+]
+
+OEP_OUTPUT_COLUMNS_GENDER_SUMMARY = [
+    "Rank",
+    "Destination Country",
+    "Male",
+    "Female",
+    "Other",
+    "Total",
+    "Female %",
 ]

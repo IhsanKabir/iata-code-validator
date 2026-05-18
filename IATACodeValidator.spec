@@ -31,6 +31,11 @@ hiddenimports = [
     # would normally pick this up via `from . import _build_config`, but
     # the import is wrapped in try/except, so we list it explicitly.
     "src._build_config",
+    # Lazy-imported only when the user opens the time-series view on the
+    # OEP tab; PyInstaller's static analyzer can't see the deferred import.
+    "matplotlib",
+    "matplotlib.backends.backend_tkagg",
+    "matplotlib.pyplot",
 ]
 
 # Bundle whisper model files individually (more reliable than dir-tuple form

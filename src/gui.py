@@ -34,7 +34,7 @@ import winsound
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, auth, config, excel_io, updater
+from . import __version__, auth, config, excel_io, oep_client, oep_presets, updater
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
 from .bd_matcher import (
@@ -70,6 +70,12 @@ MSG_BD_DONE = "bd_done"
 MSG_BD_ERROR = "bd_error"
 MSG_BD_REFRESHED = "bd_refreshed"   # payload: (count:int, last_refresh:str)
 
+# OEP worker → GUI message types
+MSG_OEP_LOG = "oep_log"
+MSG_OEP_DONE = "oep_done"         # payload: dict (see _oep_worker_run)
+MSG_OEP_ERROR = "oep_error"
+MSG_OEP_BUSY = "oep_busy"         # payload: str (status text)
+
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
 MSG_UPDATE_PROGRESS = "update_progress"  # payload: (downloaded:int, total:int)
@@ -83,8 +89,8 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("IATA Code Validator")
-        self.root.geometry("960x720")
-        self.root.minsize(860, 620)
+        self.root.geometry("1080x820")
+        self.root.minsize(900, 640)
 
         # ----- IATA tab state -----
         self.input_path = tk.StringVar()
@@ -117,6 +123,31 @@ class App:
         self._bd_worker: threading.Thread | None = None
         self._bd_cache = BDAgencyCache(config.BD_CACHE_DB)
 
+        # ----- OEP tab state -----
+        from datetime import date, timedelta
+        today = date.today()
+        year_ago = today - timedelta(days=365)
+        self.oep_date_from = tk.StringVar(value=year_ago.isoformat())
+        self.oep_date_to = tk.StringVar(value=today.isoformat())
+        self.oep_mode = tk.StringVar(value="country")
+        # country | division | category | gender
+        self.oep_gender = tk.StringVar(value="")        # "", "1", "2", "3"
+        self.oep_country_filter = tk.StringVar(value="")  # country option label
+        self.oep_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.oep_top_n = tk.StringVar(value="5")
+        self.oep_preset_name = tk.StringVar(value="")
+
+        self._oep_worker: threading.Thread | None = None
+        self._oep_last_result: dict | None = None
+        self._oep_country_options: list[oep_client.Option] = []
+        # Set by the background country-list thread, drained by the main
+        # thread's `_oep_poll_country_load`. Tuple of (labels, error_msg).
+        self._oep_pending_country_payload: tuple[list[str], str | None] | None = None
+        self._oep_preset_store = oep_presets.PresetStore(config.OEP_PRESET_FILE)
+        # Embedded matplotlib chart; instantiated lazily on first time-series view.
+        self._oep_chart_canvas = None
+        self._oep_chart_figure = None
+
         # ----- Shared message queue -----
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
@@ -127,6 +158,9 @@ class App:
         self._setup_styles()
         self._build_ui()
         self._refresh_bd_status_label()
+        # Show the correct auth button (Sign in or Sign out) from launch,
+        # before `ensure_signed_in` runs.
+        self._refresh_user_label()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -151,6 +185,53 @@ class App:
     # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_scrollable(parent: ttk.Frame) -> ttk.Frame:
+        """Wrap `parent` in a vertical scrollable Canvas and return the inner Frame.
+
+        Widgets added to the returned frame scroll vertically when content
+        overflows the visible area. Mouse-wheel events are captured so
+        users don't have to grab the scrollbar.
+        """
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
+        scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            # Make the inner frame at least as wide as the canvas viewport,
+            # so child widgets that use `fill="x"` actually stretch.
+            canvas.itemconfigure(window_id, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel scroll while pointer is over the canvas.
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_wheel(_e):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_e):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        inner.bind("<Enter>", _bind_wheel)
+        inner.bind("<Leave>", _unbind_wheel)
+
+        return inner
 
     @staticmethod
     def _section(parent: tk.Widget, title: str) -> ttk.Frame:
@@ -211,10 +292,14 @@ class App:
         )
         self.btn_check_updates.pack(side="right", padx=4, pady=2)
 
+        # Two mutually-exclusive auth buttons sitting in the same slot —
+        # whichever is appropriate gets packed in `_refresh_user_label`.
         self.btn_sign_out = ttk.Button(
-            status_frm, text="Sign out", command=self._on_sign_out, state="disabled"
+            status_frm, text="Sign out", command=self._on_sign_out,
         )
-        self.btn_sign_out.pack(side="right", padx=4, pady=2)
+        self.btn_sign_in = ttk.Button(
+            status_frm, text="Sign in", command=self._on_sign_in,
+        )
 
         # Wrap everything in a Notebook so each tool gets its own tab.
         notebook = ttk.Notebook(self.root)
@@ -222,11 +307,14 @@ class App:
 
         iata_tab = ttk.Frame(notebook)
         bd_tab = ttk.Frame(notebook)
+        oep_tab = ttk.Frame(notebook)
         notebook.add(iata_tab, text="IATA Code Validator")
         notebook.add(bd_tab, text="BD Travel Agency Lookup")
+        notebook.add(oep_tab, text="BD Overseas Movement")
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
+        self._build_oep_tab(oep_tab)
 
     def _build_iata_tab(self, parent: ttk.Frame) -> None:
         # ----- Input -----
@@ -414,6 +502,1259 @@ class App:
         self.bd_log_text.configure(yscrollcommand=bd_scroll.set, state="disabled")
 
         self._toggle_bd_mode()
+
+    # ------------------------------------------------------------------
+    # OEP tab (BD Overseas Movement — oep.gov.bd)
+    # ------------------------------------------------------------------
+
+    def _build_oep_tab(self, parent: ttk.Frame) -> None:
+        # Wrap the whole tab so a smaller window still reaches every control.
+        parent = self._make_scrollable(parent)
+
+        # ----- Description -----
+        intro = self._section(
+            parent,
+            "Where are Bangladeshi workers going?  ·  oep.gov.bd",
+        )
+        ttk.Label(
+            intro,
+            text=(
+                "Pulls clearance data straight from the Overseas Employment "
+                "Platform. Pick a date range and view, then Run."
+            ),
+            style="Hint.TLabel",
+            wraplength=820,
+            justify="left",
+        ).pack(anchor="w")
+
+        # ----- Filters -----
+        body = self._section(parent, "Filters")
+        date_row = ttk.Frame(body)
+        ttk.Label(date_row, text="From:", width=6, anchor="w").pack(side="left")
+        ttk.Entry(date_row, textvariable=self.oep_date_from, width=12).pack(
+            side="left", padx=(0, 12)
+        )
+        ttk.Label(date_row, text="To:", width=4, anchor="w").pack(side="left")
+        ttk.Entry(date_row, textvariable=self.oep_date_to, width=12).pack(
+            side="left", padx=(0, 12)
+        )
+        ttk.Label(
+            date_row,
+            text="(YYYY-MM-DD — leave full range for all historical data)",
+            style="Hint.TLabel",
+        ).pack(side="left")
+        self._form_row(body, 0, "Date range:", date_row)
+
+        # Gender + country filter
+        gender_row = ttk.Frame(body)
+        for value, label in oep_client.GENDER_OPTIONS:
+            ttk.Radiobutton(
+                gender_row, text=label, variable=self.oep_gender, value=value,
+            ).pack(side="left", padx=(0, 12))
+        self._form_row(body, 1, "Gender:", gender_row)
+
+        self.oep_country_combo = ttk.Combobox(
+            body, textvariable=self.oep_country_filter, state="readonly",
+            values=("(loading…)",),
+        )
+        self._form_row(body, 2, "Country filter:", self.oep_country_combo)
+
+        # Multi-country selector (used by time-series + pivot only)
+        multi_row = ttk.Frame(body)
+        self.oep_country_listbox = tk.Listbox(
+            multi_row, selectmode="extended", height=5, exportselection=False,
+        )
+        self.oep_country_listbox.pack(side="left", fill="x", expand=True)
+        multi_scroll = ttk.Scrollbar(multi_row, command=self.oep_country_listbox.yview)
+        multi_scroll.pack(side="left", fill="y")
+        self.oep_country_listbox.configure(yscrollcommand=multi_scroll.set)
+        multi_btns = ttk.Frame(multi_row)
+        multi_btns.pack(side="left", padx=(8, 0))
+        for n in (5, 10, 20):
+            ttk.Button(
+                multi_btns, text=f"Top {n}",
+                command=lambda n=n: self._oep_set_top_n(n),
+                width=8,
+            ).pack(anchor="w", pady=1)
+        ttk.Button(
+            multi_btns, text="All",
+            command=self._oep_select_all,
+            width=8,
+        ).pack(anchor="w", pady=1)
+        ttk.Button(
+            multi_btns, text="Clear",
+            command=lambda: self.oep_country_listbox.selection_clear(0, "end"),
+            width=8,
+        ).pack(anchor="w", pady=1)
+        self._form_row(body, 3, "Countries (multi):", multi_row)
+
+        # ----- Presets -----
+        body = self._section(parent, "Saved filter presets")
+        preset_row = ttk.Frame(body)
+        preset_row.pack(fill="x")
+        ttk.Label(preset_row, text="Preset:", width=8, anchor="w").pack(side="left")
+        self.oep_preset_combo = ttk.Combobox(
+            preset_row, textvariable=self.oep_preset_name, state="readonly", width=30,
+        )
+        self.oep_preset_combo.pack(side="left", padx=(0, 8))
+        ttk.Button(preset_row, text="Load", command=self._oep_preset_load).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(preset_row, text="Save current as...", command=self._oep_preset_save).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(preset_row, text="Delete", command=self._oep_preset_delete).pack(
+            side="left"
+        )
+        self._oep_refresh_preset_list()
+
+        # ----- View mode -----
+        body = self._section(parent, "View")
+        for value, label in (
+            ("country", "Top destination countries"),
+            ("division", "Top source districts (Bangladesh)"),
+            ("category", "Top job categories"),
+            ("gender", "Gender breakdown per destination"),
+            ("timeseries", "Monthly time series (chart)  ·  needs multi-country selection"),
+            ("pivot", "Country × Division pivot  ·  needs multi-country selection"),
+            ("full", "Full report — every view combined into one Excel  ·  needs multi-country"),
+            ("cdt", "Country × Division × Month — single flat sheet  ·  HEAVY, needs multi-country"),
+            ("cdtd", "Country × District × Month — district granularity  ·  HEAVY, needs multi-country"),
+        ):
+            ttk.Radiobutton(
+                body, text=label, variable=self.oep_mode, value=value,
+            ).pack(anchor="w", padx=2, pady=1)
+
+        # ----- Run / Export -----
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill="x", pady=(8, 4), padx=4)
+        self.btn_oep_run = ttk.Button(
+            ctrl, text="Run", command=self._oep_run, style="Primary.TButton",
+        )
+        self.btn_oep_run.pack(side="left")
+        self.btn_oep_export = ttk.Button(
+            ctrl, text="Export to Excel...", command=self._oep_export, state="disabled",
+        )
+        self.btn_oep_export.pack(side="left", padx=(8, 0))
+
+        self.oep_status_label = ttk.Label(ctrl, text="Idle.", style="Hint.TLabel")
+        self.oep_status_label.pack(side="left", padx=12)
+
+        # ----- Results panel — tree OR chart, depending on mode -----
+        body = self._section(parent, "Results")
+        # `oep_results_holder` holds whichever widget is currently visible
+        # (tree by default, chart for time-series). Swapping uses pack/forget.
+        self.oep_results_holder = ttk.Frame(body)
+        self.oep_results_holder.pack(fill="both", expand=True)
+
+        self.oep_tree_frame = ttk.Frame(self.oep_results_holder)
+        self.oep_tree = ttk.Treeview(self.oep_tree_frame, show="headings", height=14)
+        self.oep_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll = ttk.Scrollbar(self.oep_tree_frame, command=self.oep_tree.yview)
+        tree_scroll.pack(side="right", fill="y")
+        self.oep_tree.configure(yscrollcommand=tree_scroll.set)
+        # Double-click on a country row → category drilldown popup.
+        self.oep_tree.bind("<Double-1>", self._oep_on_double_click)
+
+        # Default columns; replaced when results arrive.
+        self._oep_set_columns([("#", 40), ("Info", 600)])
+        self.oep_tree.insert(
+            "", "end",
+            values=("—", "Click Run to fetch data. Double-click a country to drill into job categories."),
+        )
+
+        # Chart frame is created lazily the first time time-series view runs.
+        self.oep_chart_frame = ttk.Frame(self.oep_results_holder)
+
+        self._oep_show_tree()
+
+        # Load country list async so the form is usable immediately.
+        # The thread fetches; the main loop polls — see _oep_poll_country_load.
+        threading.Thread(target=self._oep_load_countries, daemon=True).start()
+        self.root.after(200, self._oep_poll_country_load)
+
+    # --- helpers for the multi-select listbox + presets ---
+
+    def _oep_set_top_n(self, n: int) -> None:
+        """Select the first `n` entries in the country listbox."""
+        if not self.oep_country_listbox.size():
+            messagebox.showinfo("OEP", "Country list still loading — try again in a moment.")
+            return
+        self.oep_country_listbox.selection_clear(0, "end")
+        for i in range(min(n, self.oep_country_listbox.size())):
+            self.oep_country_listbox.selection_set(i)
+        self.oep_country_listbox.see(0)
+
+    def _oep_select_all(self) -> None:
+        """Select every country in the listbox.
+
+        Time-series still does one call per month (cheap regardless of
+        country count); pivot does one call per country, so 200 countries
+        means ~200 round-trips. The progress bar handles the wait.
+        """
+        size = self.oep_country_listbox.size()
+        if not size:
+            messagebox.showinfo("OEP", "Country list still loading — try again in a moment.")
+            return
+        self.oep_country_listbox.selection_set(0, "end")
+
+    def _oep_selected_countries(self) -> list[oep_client.Option]:
+        """Return the currently selected items as Option objects."""
+        out: list[oep_client.Option] = []
+        for idx in self.oep_country_listbox.curselection():
+            label = self.oep_country_listbox.get(idx)
+            for opt in self._oep_country_options:
+                if opt.label == label:
+                    out.append(opt)
+                    break
+        return out
+
+    def _oep_apply_country_selection(self, country_ids: list[str]) -> None:
+        """Highlight matching country IDs in the listbox (used by preset load)."""
+        self.oep_country_listbox.selection_clear(0, "end")
+        for i in range(self.oep_country_listbox.size()):
+            label = self.oep_country_listbox.get(i)
+            opt = next((o for o in self._oep_country_options if o.label == label), None)
+            if opt and opt.value in country_ids:
+                self.oep_country_listbox.selection_set(i)
+
+    # --- chart/tree panel swap ---
+
+    def _oep_show_tree(self) -> None:
+        try:
+            self.oep_chart_frame.pack_forget()
+        except Exception:
+            pass
+        self.oep_tree_frame.pack(fill="both", expand=True)
+
+    def _oep_show_chart(self) -> None:
+        try:
+            self.oep_tree_frame.pack_forget()
+        except Exception:
+            pass
+        self.oep_chart_frame.pack(fill="both", expand=True)
+
+    # --- preset bar ---
+
+    def _oep_refresh_preset_list(self) -> None:
+        try:
+            names = self._oep_preset_store.list_names()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Preset list failed: %s", exc)
+            names = []
+        self.oep_preset_combo.configure(values=names)
+
+    def _oep_preset_load(self) -> None:
+        name = self.oep_preset_name.get().strip()
+        if not name:
+            messagebox.showinfo("OEP", "Pick a preset from the dropdown first.")
+            return
+        preset = self._oep_preset_store.get(name)
+        if not preset:
+            messagebox.showerror("OEP", f"Preset {name!r} not found.")
+            return
+        self.oep_date_from.set(preset.date_from)
+        self.oep_date_to.set(preset.date_to)
+        self.oep_mode.set(preset.mode)
+        self.oep_gender.set(preset.gender_id or "")
+        if preset.country_ids:
+            self._oep_apply_country_selection(preset.country_ids)
+
+    def _oep_preset_save(self) -> None:
+        from tkinter import simpledialog
+        default = self.oep_preset_name.get() or self.oep_mode.get().title()
+        name = simpledialog.askstring(
+            "Save preset",
+            "Preset name:",
+            initialvalue=default,
+            parent=self.root,
+        )
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        selected = self._oep_selected_countries()
+        preset = oep_presets.OEPPreset(
+            name=name,
+            mode=self.oep_mode.get(),
+            date_from=self.oep_date_from.get(),
+            date_to=self.oep_date_to.get(),
+            gender_id=self.oep_gender.get(),
+            country_ids=[o.value for o in selected],
+            country_labels=[o.label for o in selected],
+        )
+        try:
+            self._oep_preset_store.save(preset)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("OEP", f"Could not save preset:\n{exc}")
+            return
+        self._oep_refresh_preset_list()
+        self.oep_preset_name.set(name)
+        messagebox.showinfo("OEP", f"Preset {name!r} saved.")
+
+    def _oep_preset_delete(self) -> None:
+        name = self.oep_preset_name.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno("OEP", f"Delete preset {name!r}?"):
+            return
+        removed = self._oep_preset_store.delete(name)
+        if not removed:
+            messagebox.showinfo("OEP", "That preset doesn't exist anymore.")
+        self._oep_refresh_preset_list()
+        self.oep_preset_name.set("")
+
+    # --- category drilldown popup ---
+
+    def _oep_on_double_click(self, _event) -> None:
+        """If we're in 'country' mode, open a category drilldown for the row."""
+        if not self._oep_last_result:
+            return
+        if self._oep_last_result.get("mode") != "country":
+            return
+        sel = self.oep_tree.selection()
+        if not sel:
+            return
+        values = self.oep_tree.item(sel[0], "values")
+        if not values or len(values) < 2:
+            return
+        country_name = values[1]
+        rows = self._oep_last_result.get("raw") or []
+        cats = oep_client.categories_for_country(rows, country_name)
+        if not cats:
+            messagebox.showinfo("OEP", f"No category data for {country_name}.")
+            return
+        self._oep_open_category_popup(country_name, cats)
+
+    def _oep_open_category_popup(self, country_name: str, cats: list) -> None:
+        win = tk.Toplevel(self.root)
+        win.title(f"Job categories — {country_name}")
+        win.geometry("560x500")
+        win.transient(self.root)
+
+        header = ttk.Label(
+            win,
+            text=f"Top jobs for {country_name}  ·  {sum(c.total_employee for c in cats):,} total workers",
+            style="Section.TLabel",
+        )
+        header.pack(anchor="w", padx=10, pady=(10, 4))
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tree = ttk.Treeview(
+            tree_frame, show="headings",
+            columns=("Rank", "Job Category", "Total", "Share %"),
+        )
+        tree.heading("Rank", text="Rank")
+        tree.heading("Job Category", text="Job Category")
+        tree.heading("Total", text="Total")
+        tree.heading("Share %", text="Share %")
+        tree.column("Rank", width=50, anchor="e")
+        tree.column("Job Category", width=300, anchor="w")
+        tree.column("Total", width=100, anchor="e")
+        tree.column("Share %", width=80, anchor="e")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(tree_frame, command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+
+        grand = sum(c.total_employee for c in cats) or 1
+        for rank, c in enumerate(cats, start=1):
+            tree.insert("", "end", values=(
+                rank, c.category_name, f"{c.total_employee:,}",
+                f"{100 * c.total_employee / grand:.2f}",
+            ))
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def _oep_set_columns(self, cols: list[tuple[str, int]]) -> None:
+        """Reset the Treeview columns + headings."""
+        ids = [c[0] for c in cols]
+        self.oep_tree.configure(columns=ids)
+        for col_id, width in cols:
+            self.oep_tree.heading(col_id, text=col_id)
+            anchor = "e" if any(t in col_id.lower() for t in ("total", "%", "count", "male", "female", "other", "rank", "#")) else "w"
+            self.oep_tree.column(col_id, width=width, anchor=anchor, stretch=True)
+
+    def _oep_load_countries(self) -> None:
+        """Fetch country list off-thread and stash the result.
+
+        We deliberately *don't* call `root.after` from this thread —
+        when the sign-in modal is active during app startup, the
+        scheduled callback sometimes never fires. Instead the main
+        thread polls `_oep_pending_country_payload` via
+        `_oep_poll_country_load`, which is rock-solid because it runs
+        on the Tk event loop itself.
+        """
+        log.info("OEP loading country list from oep.gov.bd…")
+        error_msg: str | None = None
+        try:
+            opts = oep_client.list_countries()
+            log.info("OEP loaded %d country options", len(opts))
+        except Exception as exc:  # noqa: BLE001 — show fallback in UI
+            log.warning("OEP countries fetch failed: %s", exc)
+            opts = []
+            error_msg = f"{type(exc).__name__}: {exc}"
+        self._oep_country_options = opts
+        labels = ["(All countries)"] + [o.label for o in opts]
+        # Set the pending payload — the main-thread poller will pick it up.
+        self._oep_pending_country_payload = (labels, error_msg)
+
+    def _oep_poll_country_load(self) -> None:
+        """Run on the Tk main loop; applies country options once available."""
+        payload = self._oep_pending_country_payload
+        if payload is not None:
+            self._oep_pending_country_payload = None
+            labels, error_msg = payload
+            try:
+                self._oep_apply_country_options(labels, error_msg)
+            except Exception:  # noqa: BLE001 — never let a UI hiccup kill the poll
+                log.exception("OEP country-apply failed")
+            return
+        # Still waiting — keep polling. 200ms is fast enough that the user
+        # never notices, slow enough to be free CPU-wise.
+        try:
+            self.root.after(200, self._oep_poll_country_load)
+        except RuntimeError:
+            return
+
+    def _oep_apply_country_options(
+        self, labels: list[str], error_msg: str | None = None,
+    ) -> None:
+        log.info("OEP applying %d country options to UI", len(self._oep_country_options))
+        self.oep_country_combo.configure(values=labels)
+        if self.oep_country_filter.get() in ("", "(loading…)"):
+            self.oep_country_filter.set("(All countries)")
+        # The listbox holds only the real options — no "(All countries)" entry.
+        self.oep_country_listbox.delete(0, "end")
+        for o in self._oep_country_options:
+            self.oep_country_listbox.insert("end", o.label)
+        if error_msg:
+            self.oep_status_label.configure(
+                text=f"⚠ Could not load country list: {error_msg}",
+            )
+        elif not self._oep_country_options:
+            self.oep_status_label.configure(
+                text="⚠ Country list returned zero entries — oep.gov.bd may be down",
+            )
+        else:
+            self.oep_status_label.configure(
+                text=f"Ready · {len(self._oep_country_options)} countries loaded",
+            )
+
+    def _oep_resolve_country_id(self) -> str:
+        label = self.oep_country_filter.get().strip()
+        if not label or label.startswith("(All"):
+            return ""
+        for opt in self._oep_country_options:
+            if opt.label == label:
+                return opt.value
+        return ""
+
+    def _oep_run(self) -> None:
+        if self._oep_worker is not None and self._oep_worker.is_alive():
+            messagebox.showinfo("OEP", "A request is already running.")
+            return
+        date_from = self.oep_date_from.get().strip()
+        date_to = self.oep_date_to.get().strip()
+        try:
+            oep_client._validate_date(date_from, "date_from")
+            oep_client._validate_date(date_to, "date_to")
+        except ValueError as exc:
+            messagebox.showerror("OEP", str(exc))
+            return
+        if date_from > date_to:
+            messagebox.showerror("OEP", "'From' date must be on or before 'To' date.")
+            return
+
+        mode = self.oep_mode.get()
+        gender = self.oep_gender.get() or ""
+        country_id = self._oep_resolve_country_id()
+        selected_multi = self._oep_selected_countries()
+        if mode in ("timeseries", "pivot", "full", "cdt", "cdtd") and not selected_multi:
+            messagebox.showerror(
+                "OEP",
+                f"The {mode} view needs at least one country selected in the "
+                "multi-select box. Click 'Top 5' or 'All' to start.",
+            )
+            return
+        if mode in ("cdt", "cdtd", "full"):
+            n_months = len(oep_client.iter_year_months(date_from, date_to))
+            # Full report caps the heavy sections to 15 countries internally
+            # — see `_oep_worker_run`. Standalone CDT honours the full selection.
+            FULL_REPORT_HEAVY_CAP = 15
+            effective_countries = (
+                min(len(selected_multi), FULL_REPORT_HEAVY_CAP)
+                if mode == "full" else len(selected_multi)
+            )
+            est_calls = effective_countries * n_months
+            est_minutes = max(1, int(est_calls * 5 / 60))
+            if est_calls > 50:
+                if mode == "cdt":
+                    section_label = "The country×division×month sheet"
+                    cap_note = ""
+                elif mode == "cdtd":
+                    section_label = "The country×district×month sheet"
+                    cap_note = ""
+                else:
+                    section_label = "The Full report's heavy sections (pivot, time-series, country×division×month)"
+                    cap_note = (
+                        f"\n\nNote: Full report auto-caps to the top {FULL_REPORT_HEAVY_CAP} "
+                        f"destinations by volume (you selected {len(selected_multi)})."
+                    )
+                proceed = messagebox.askyesno(
+                    "OEP — heavy fetch",
+                    f"{section_label} needs "
+                    f"{effective_countries} countries × {n_months} months = "
+                    f"{est_calls} HTTP calls (~{est_minutes} min).{cap_note}\n\n"
+                    "Continue?",
+                )
+                if not proceed:
+                    return
+        cfg = {
+            "mode": mode,
+            "date_from": date_from,
+            "date_to": date_to,
+            "gender_id": gender,
+            "country_id": country_id,
+            "country_options": selected_multi,
+        }
+        self._oep_last_result = None
+        self.btn_oep_run.configure(state="disabled")
+        self.btn_oep_export.configure(state="disabled")
+        self._oep_show_tree()
+        self.oep_status_label.configure(text="Fetching from oep.gov.bd…")
+        self.oep_tree.delete(*self.oep_tree.get_children())
+        self._oep_set_columns([("#", 40), ("Info", 600)])
+        self.oep_tree.insert("", "end", values=("…", "Working — this may take 30-60s for wide date ranges."))
+
+        self._oep_worker = threading.Thread(
+            target=self._oep_worker_run, args=(cfg,), daemon=True,
+        )
+        self._oep_worker.start()
+
+    def _oep_worker_run(self, cfg: dict) -> None:
+        mode = cfg["mode"]
+        try:
+            if mode == "country":
+                rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id=cfg["gender_id"],
+                    country_id=cfg["country_id"],
+                )
+                summary = oep_client.aggregate_by_country(rows)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "country",
+                    "summary": summary,
+                    "raw": rows,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "category":
+                rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id=cfg["gender_id"],
+                    country_id=cfg["country_id"],
+                )
+                summary = oep_client.aggregate_by_category(rows)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "category",
+                    "summary": summary,
+                    "raw": rows,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "division":
+                country_ids = [cfg["country_id"]] if cfg["country_id"] else None
+                rows = oep_client.fetch_division_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id=cfg["gender_id"],
+                    country_ids=country_ids,
+                )
+                div_summary = oep_client.aggregate_by_division(rows)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "division",
+                    "summary": div_summary,
+                    "raw": rows,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "gender":
+                self._post(MSG_OEP_BUSY, "Fetching All…")
+                all_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    country_id=cfg["country_id"],
+                )
+                self._post(MSG_OEP_BUSY, "Fetching Male…")
+                male_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id="1", country_id=cfg["country_id"],
+                )
+                self._post(MSG_OEP_BUSY, "Fetching Female…")
+                female_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id="2", country_id=cfg["country_id"],
+                )
+                summary = oep_client.merge_gender_breakdowns(
+                    all_rows, male_rows, female_rows,
+                )
+                self._post(MSG_OEP_DONE, {
+                    "mode": "gender",
+                    "summary": summary,
+                    "raw": all_rows,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "timeseries":
+                opts = cfg["country_options"]
+
+                def progress(idx: int, total: int, label: str) -> None:
+                    self._post(MSG_OEP_BUSY, f"{label}  ({idx}/{total})")
+
+                rows = oep_client.fetch_monthly_timeseries(
+                    cfg["date_from"], cfg["date_to"],
+                    country_ids=[o.value for o in opts],
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                months, series = oep_client.pivot_timeseries(rows)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "timeseries",
+                    "months": months,
+                    "series": series,
+                    "raw": rows,
+                    "country_labels": [o.label for o in opts],
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "pivot":
+                opts = cfg["country_options"]
+
+                def progress(idx: int, total: int, label: str) -> None:
+                    self._post(MSG_OEP_BUSY, f"{label}  ({idx}/{total})")
+
+                cells = oep_client.fetch_country_division_pivot(
+                    cfg["date_from"], cfg["date_to"],
+                    country_options=opts,
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                divisions, countries, table = oep_client.pivot_country_division(cells)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "pivot",
+                    "divisions": divisions,
+                    "countries": countries,
+                    "table": table,
+                    "raw": cells,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "full":
+                user_opts = cfg["country_options"]
+
+                def progress(idx: int, total: int, label: str) -> None:
+                    self._post(MSG_OEP_BUSY, f"{label}  ({idx}/{total})")
+
+                # 1) all-rows (no country filter) — powers country/category/gender views
+                self._post(MSG_OEP_BUSY, "[1/7] All-country totals…")
+                all_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"],
+                    gender_id=cfg["gender_id"],
+                )
+                # 2) male-only and female-only — for gender breakdown
+                self._post(MSG_OEP_BUSY, "[2/7] Male totals…")
+                male_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"], gender_id="1",
+                )
+                self._post(MSG_OEP_BUSY, "[3/7] Female totals…")
+                female_rows = oep_client.fetch_country_clearance(
+                    cfg["date_from"], cfg["date_to"], gender_id="2",
+                )
+                # 4) division totals (Bangladesh-side)
+                self._post(MSG_OEP_BUSY, "[4/7] Division totals…")
+                div_rows = oep_client.fetch_division_clearance(
+                    cfg["date_from"], cfg["date_to"], gender_id=cfg["gender_id"],
+                )
+                # Cap the heavy per-country sections (time-series, pivot, CDT)
+                # to the top destinations by volume. Iterating 200 countries
+                # gets us IP-rate-limited on oep.gov.bd, and a 200-column
+                # pivot is unreadable anyway. The user's multi-selection is
+                # used only as an upper bound — if they picked Top 5 we
+                # honour that, but if they picked All we silently cap to 15.
+                FULL_REPORT_HEAVY_CAP = 15
+                country_summary = oep_client.aggregate_by_country(all_rows)
+                top_country_names = [
+                    c.country_name for c in country_summary[:FULL_REPORT_HEAVY_CAP]
+                ]
+                # Limit to the intersection of user's selection × top-N by
+                # volume, preserving the country-options shape for downstream
+                # calls.
+                user_names = {o.label for o in user_opts}
+                heavy_opts = [
+                    o for o in user_opts
+                    if o.label in top_country_names
+                ]
+                if not heavy_opts:
+                    # User picked countries with zero volume in this window —
+                    # fall back to top-N from the data so the report isn't empty.
+                    label_to_opt = {o.label: o for o in user_opts}
+                    heavy_opts = [
+                        label_to_opt[name] for name in top_country_names
+                        if name in label_to_opt
+                    ][:FULL_REPORT_HEAVY_CAP]
+                # Order heavy_opts by volume descending for predictable charts.
+                rank = {name: i for i, name in enumerate(top_country_names)}
+                heavy_opts = sorted(heavy_opts, key=lambda o: rank.get(o.label, 999))
+                log.info(
+                    "Full report heavy sections: user picked %d countries, "
+                    "capped to %d for pivot/CDT/time-series",
+                    len(user_opts), len(heavy_opts),
+                )
+
+                # 5) monthly time series for the heavy-capped country set
+                self._post(MSG_OEP_BUSY, "[5/7] Monthly time series…")
+                ts_rows = oep_client.fetch_monthly_timeseries(
+                    cfg["date_from"], cfg["date_to"],
+                    country_ids=[o.value for o in heavy_opts],
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                months, series = oep_client.pivot_timeseries(ts_rows)
+                # 6) country × division pivot for the heavy-capped country set
+                self._post(MSG_OEP_BUSY, "[6/7] Country × Division pivot…")
+                cells = oep_client.fetch_country_division_pivot(
+                    cfg["date_from"], cfg["date_to"],
+                    country_options=heavy_opts,
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                divisions, pivot_countries, table = oep_client.pivot_country_division(cells)
+                # 7) heavy: country × division × month flat sheet
+                self._post(MSG_OEP_BUSY, "[7/7] Country × Division × Month…")
+                cdt_cells = oep_client.fetch_country_division_timeseries(
+                    cfg["date_from"], cfg["date_to"],
+                    country_options=heavy_opts,
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                cdt_months, cdt_pairs, cdt_table = oep_client.pivot_country_division_timeseries(
+                    cdt_cells,
+                )
+
+                self._post(MSG_OEP_DONE, {
+                    "mode": "full",
+                    "country_summary": country_summary,
+                    "category_summary": oep_client.aggregate_by_category(all_rows),
+                    "division_summary": oep_client.aggregate_by_division(div_rows),
+                    "gender_summary": oep_client.merge_gender_breakdowns(
+                        all_rows, male_rows, female_rows,
+                    ),
+                    "raw_country": all_rows,
+                    "raw_division": div_rows,
+                    "months": months,
+                    "series": series,
+                    "divisions": divisions,
+                    "pivot_countries": pivot_countries,
+                    "table": table,
+                    # Country × Division × Month (flat sheet) — same shape as
+                    # the standalone 'cdt' view but bundled here too.
+                    "cdt_months": cdt_months,
+                    "cdt_pairs": cdt_pairs,
+                    "cdt_table": cdt_table,
+                    "country_labels": [o.label for o in heavy_opts],
+                    "user_country_labels": [o.label for o in user_opts],
+                    "heavy_country_cap": FULL_REPORT_HEAVY_CAP,
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                    "gender_id": cfg["gender_id"],
+                })
+            elif mode == "cdt":
+                opts = cfg["country_options"]
+
+                def progress(idx: int, total: int, label: str) -> None:
+                    self._post(MSG_OEP_BUSY, f"{label}  ({idx}/{total})")
+
+                cells = oep_client.fetch_country_division_timeseries(
+                    cfg["date_from"], cfg["date_to"],
+                    country_options=opts,
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                months, pairs, table = oep_client.pivot_country_division_timeseries(cells)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "cdt",
+                    "months": months,
+                    "pairs": pairs,
+                    "table": table,
+                    "raw": cells,
+                    "country_labels": [o.label for o in opts],
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            elif mode == "cdtd":
+                opts = cfg["country_options"]
+
+                def progress(idx: int, total: int, label: str) -> None:
+                    self._post(MSG_OEP_BUSY, f"{label}  ({idx}/{total})")
+
+                cells = oep_client.fetch_country_district_timeseries(
+                    cfg["date_from"], cfg["date_to"],
+                    country_options=opts,
+                    gender_id=cfg["gender_id"],
+                    progress_cb=progress,
+                )
+                months, triples, table = oep_client.pivot_country_district_timeseries(cells)
+                self._post(MSG_OEP_DONE, {
+                    "mode": "cdtd",
+                    "months": months,
+                    "triples": triples,
+                    "table": table,
+                    "raw": cells,
+                    "country_labels": [o.label for o in opts],
+                    "date_from": cfg["date_from"],
+                    "date_to": cfg["date_to"],
+                })
+            else:
+                self._post(MSG_OEP_ERROR, f"Unknown mode: {mode}")
+        except Exception as exc:  # noqa: BLE001 — surface in UI
+            log.exception("OEP worker failed")
+            self._post(MSG_OEP_ERROR, f"{type(exc).__name__}: {exc}")
+
+    def _oep_render_results(self, result: dict) -> None:
+        self._oep_last_result = result
+        mode = result["mode"]
+        # Modes with a flat "summary" list (country/division/category/gender)
+        # share a rendering branch below. Timeseries + pivot carry richer
+        # payloads instead.
+        summary = result.get("summary") or []
+        self.oep_tree.delete(*self.oep_tree.get_children())
+
+        if mode == "country":
+            cols = [("Rank", 50), ("Destination", 240), ("Total", 110), ("Categories", 100), ("Share %", 90)]
+            self._oep_set_columns(cols)
+            grand = sum(c.total_employee for c in summary) or 1
+            for rank, c in enumerate(summary, start=1):
+                self.oep_tree.insert("", "end", values=(
+                    rank, c.country_name, f"{c.total_employee:,}",
+                    c.category_count, f"{100 * c.total_employee / grand:.2f}",
+                ))
+            self.oep_status_label.configure(
+                text=f"{len(summary):,} destinations  ·  {grand:,} total workers"
+            )
+        elif mode == "division":
+            cols = [("Rank", 50), ("Division", 200), ("Total", 110), ("Districts", 90), ("Share %", 90)]
+            self._oep_set_columns(cols)
+            grand = sum(d.total_employee for d in summary) or 1
+            for rank, d in enumerate(summary, start=1):
+                self.oep_tree.insert("", "end", values=(
+                    rank, d.division, f"{d.total_employee:,}",
+                    d.district_count, f"{100 * d.total_employee / grand:.2f}",
+                ))
+            self.oep_status_label.configure(
+                text=f"{len(summary)} divisions  ·  {len(result['raw'])} districts  ·  {grand:,} total"
+            )
+        elif mode == "category":
+            cols = [("Rank", 50), ("Job Category", 260), ("Total", 110), ("Countries", 90), ("Share %", 90)]
+            self._oep_set_columns(cols)
+            grand = sum(c.total_employee for c in summary) or 1
+            for rank, c in enumerate(summary, start=1):
+                self.oep_tree.insert("", "end", values=(
+                    rank, c.category_name, f"{c.total_employee:,}",
+                    c.country_count, f"{100 * c.total_employee / grand:.2f}",
+                ))
+            self.oep_status_label.configure(
+                text=f"{len(summary):,} job categories  ·  {grand:,} total workers"
+            )
+        elif mode == "gender":
+            cols = [
+                ("Rank", 50), ("Destination", 220),
+                ("Male", 90), ("Female", 90), ("Other", 70),
+                ("Total", 100), ("Female %", 80),
+            ]
+            self._oep_set_columns(cols)
+            for rank, g in enumerate(summary, start=1):
+                pct = (100 * g.female / g.total) if g.total else 0.0
+                self.oep_tree.insert("", "end", values=(
+                    rank, g.country_name,
+                    f"{g.male:,}", f"{g.female:,}", f"{g.other:,}",
+                    f"{g.total:,}", f"{pct:.1f}",
+                ))
+            self.oep_status_label.configure(
+                text=f"{len(summary):,} destinations  ·  gender breakdown"
+            )
+        elif mode == "timeseries":
+            months = result["months"]
+            series = result["series"]
+            self._oep_render_timeseries(months, series, result)
+        elif mode == "pivot":
+            self._oep_render_pivot(result)
+        elif mode == "full":
+            self._oep_render_full_report(result)
+        elif mode == "cdt":
+            self._oep_render_cdt(result)
+        elif mode == "cdtd":
+            self._oep_render_cdtd(result)
+
+        self.btn_oep_run.configure(state="normal")
+        has_data = bool(
+            summary if mode in ("country", "division", "category", "gender") else
+            (result.get("series") if mode == "timeseries" else result.get("table"))
+        )
+        if has_data:
+            self.btn_oep_export.configure(state="normal")
+
+    def _oep_render_timeseries(
+        self, months: list[str], series: dict[str, list[int]], result: dict
+    ) -> None:
+        # Lazy import so non-OEP users don't pay the matplotlib startup cost.
+        import matplotlib
+        matplotlib.use("TkAgg", force=False)
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        if self._oep_chart_canvas is not None:
+            self._oep_chart_canvas.get_tk_widget().destroy()
+            self._oep_chart_canvas = None
+
+        fig = Figure(figsize=(8, 4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        # Preserve user-selected order for legend stacking.
+        order = [c for c in result.get("country_labels", []) if c in series]
+        order += [c for c in series if c not in order]
+        for country in order:
+            values = series[country]
+            ax.plot(months, values, marker="o", label=country, linewidth=1.6)
+        ax.set_title(
+            f"Monthly clearance volume  ·  {result['date_from']} → {result['date_to']}"
+        )
+        ax.set_ylabel("Workers cleared")
+        ax.set_xlabel("Month")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+        # Rotate ticks so YYYY-MM labels don't collide.
+        for tick in ax.get_xticklabels():
+            tick.set_rotation(45)
+            tick.set_ha("right")
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.oep_chart_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._oep_chart_canvas = canvas
+        self._oep_chart_figure = fig
+
+        self._oep_show_chart()
+        total = sum(sum(v) for v in series.values())
+        self.oep_status_label.configure(
+            text=(
+                f"{len(series)} countries  ·  {len(months)} months  ·  "
+                f"{total:,} total workers"
+            )
+        )
+
+    def _oep_render_cdtd(self, result: dict) -> None:
+        """Render the flat country×district×month table.
+
+        Same shape as the division-level view but each row carries a
+        Division + District pair. Many more rows; same column count.
+        """
+        months: list[str] = result["months"]
+        triples: list[tuple[str, str, str]] = result["triples"]
+        table: dict[tuple[str, str, str, str], int] = result["table"]
+
+        cols = (
+            [("Country", 140), ("Division", 110), ("District", 130)]
+            + [(ym, 70) for ym in months]
+            + [("Total", 90)]
+        )
+        self._oep_set_columns(cols)
+
+        col_totals = [0] * len(months)
+        grand_total = 0
+        for country, division, district in triples:
+            row_values = [country, division, district]
+            row_total = 0
+            for ci, ym in enumerate(months):
+                v = table.get((country, division, district, ym), 0)
+                row_total += v
+                col_totals[ci] += v
+                row_values.append(f"{v:,}" if v else "—")
+            row_values.append(f"{row_total:,}")
+            grand_total += row_total
+            self.oep_tree.insert("", "end", values=row_values)
+
+        totals_row = (
+            ["Total", "", ""]
+            + [f"{t:,}" for t in col_totals]
+            + [f"{grand_total:,}"]
+        )
+        self.oep_tree.insert("", "end", values=totals_row, tags=("total",))
+        self.oep_tree.tag_configure("total", font=("Segoe UI", 9, "bold"))
+
+        self.oep_status_label.configure(
+            text=(
+                f"{len(triples)} (country, division, district) rows × "
+                f"{len(months)} months  ·  {grand_total:,} workers"
+            )
+        )
+
+    def _oep_render_cdt(self, result: dict) -> None:
+        """Render the flat country×division×month table.
+
+        With many countries and months this is wide — the on-screen view
+        is the same shape as the exported Excel, so users can spot-check
+        before saving.
+        """
+        months: list[str] = result["months"]
+        pairs: list[tuple[str, str]] = result["pairs"]
+        table: dict[tuple[str, str, str], int] = result["table"]
+
+        cols = (
+            [("Country", 160), ("Division", 130)]
+            + [(ym, 70) for ym in months]
+            + [("Total", 90)]
+        )
+        self._oep_set_columns(cols)
+
+        col_totals = [0] * len(months)
+        grand_total = 0
+        for country, division in pairs:
+            row_values = [country, division]
+            row_total = 0
+            for ci, ym in enumerate(months):
+                v = table.get((country, division, ym), 0)
+                row_total += v
+                col_totals[ci] += v
+                row_values.append(f"{v:,}" if v else "—")
+            row_values.append(f"{row_total:,}")
+            grand_total += row_total
+            self.oep_tree.insert("", "end", values=row_values)
+
+        # Totals row
+        totals_row = ["Total", ""] + [f"{t:,}" for t in col_totals] + [f"{grand_total:,}"]
+        self.oep_tree.insert("", "end", values=totals_row, tags=("total",))
+        self.oep_tree.tag_configure("total", font=("Segoe UI", 9, "bold"))
+
+        self.oep_status_label.configure(
+            text=(
+                f"{len(pairs)} (country, division) pairs × {len(months)} months  ·  "
+                f"{grand_total:,} workers"
+            )
+        )
+
+    def _oep_render_full_report(self, result: dict) -> None:
+        """Show a summary of every section the export will contain.
+
+        The on-screen view is intentionally a compact index — the real
+        deliverable is the multi-sheet Excel produced by Export.
+        """
+        cols = [("Section", 280), ("Rows", 80), ("Total", 140)]
+        self._oep_set_columns(cols)
+
+        country_summary = result["country_summary"]
+        category_summary = result["category_summary"]
+        division_summary = result["division_summary"]
+        gender_summary = result["gender_summary"]
+        months = result["months"]
+        series = result["series"]
+        divisions = result["divisions"]
+        pivot_countries = result["pivot_countries"]
+        table = result["table"]
+
+        grand_total = sum(c.total_employee for c in country_summary)
+
+        cdt_months = result.get("cdt_months", [])
+        cdt_pairs = result.get("cdt_pairs", [])
+        cdt_table = result.get("cdt_table", {})
+        sections = [
+            (
+                "Cover (date range, headline totals)",
+                "—",
+                f"{grand_total:,} workers",
+            ),
+            (
+                "By Country (every destination)",
+                f"{len(country_summary)}",
+                f"{grand_total:,}",
+            ),
+            (
+                "By Division (Bangladesh source)",
+                f"{len(division_summary)}",
+                f"{sum(d.total_employee for d in division_summary):,}",
+            ),
+            (
+                "By Category (every job)",
+                f"{len(category_summary)}",
+                f"{sum(c.total_employee for c in category_summary):,}",
+            ),
+            (
+                "By Gender (per destination)",
+                f"{len(gender_summary)}",
+                f"{sum(g.total for g in gender_summary):,}",
+            ),
+            (
+                "Monthly Time Series (selected countries)",
+                f"{len(series)} × {len(months)} mo",
+                f"{sum(sum(v) for v in series.values()):,}",
+            ),
+            (
+                "Country × Division Pivot (selected countries)",
+                f"{len(divisions)} × {len(pivot_countries)}",
+                f"{sum(table.values()):,}",
+            ),
+            (
+                "Country × Division × Month (flat sheet)",
+                f"{len(cdt_pairs)} pairs × {len(cdt_months)} mo",
+                f"{sum(cdt_table.values()):,}",
+            ),
+        ]
+        for name, rows_count, total in sections:
+            self.oep_tree.insert("", "end", values=(name, rows_count, total))
+
+        self.oep_status_label.configure(
+            text=(
+                f"Full report ready — {grand_total:,} workers across "
+                f"{len(country_summary)} destinations. Click Export to save the workbook."
+            )
+        )
+
+    def _oep_render_pivot(self, result: dict) -> None:
+        divisions: list[str] = result["divisions"]
+        countries: list[str] = result["countries"]
+        table: dict[tuple[str, str], int] = result["table"]
+
+        # Trim long country labels for column headers so the grid fits.
+        def _short(name: str, n: int = 14) -> str:
+            return name if len(name) <= n else name[: n - 1] + "…"
+
+        cols = [("Division", 140)] + [(_short(c), 110) for c in countries] + [("Total", 110)]
+        self._oep_set_columns(cols)
+
+        grand_total = 0
+        for div in divisions:
+            row_values = [div]
+            row_total = 0
+            for country in countries:
+                v = table.get((div, country), 0)
+                row_total += v
+                row_values.append(f"{v:,}" if v else "—")
+            row_values.append(f"{row_total:,}")
+            grand_total += row_total
+            self.oep_tree.insert("", "end", values=row_values)
+
+        # Totals row
+        totals = ["Total"]
+        for country in countries:
+            t = sum(table.get((d, country), 0) for d in divisions)
+            totals.append(f"{t:,}")
+        totals.append(f"{grand_total:,}")
+        self.oep_tree.insert("", "end", values=totals, tags=("total",))
+        self.oep_tree.tag_configure("total", font=("Segoe UI", 9, "bold"))
+
+        self.oep_status_label.configure(
+            text=(
+                f"{len(divisions)} divisions × {len(countries)} destinations  ·  "
+                f"{grand_total:,} total workers"
+            )
+        )
+
+    def _oep_export(self) -> None:
+        if not self._oep_last_result:
+            return
+        result = self._oep_last_result
+        mode = result["mode"]
+        suggested_dir = Path(self.oep_output_dir.get()) if self.oep_output_dir.get() else Path.home()
+        target = filedialog.asksaveasfilename(
+            title="Save OEP report",
+            defaultextension=".xlsx",
+            initialdir=str(suggested_dir),
+            initialfile=excel_io.build_oep_output_path(suggested_dir, mode).name,
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+        )
+        if not target:
+            return
+        path = Path(target)
+        try:
+            if mode == "country":
+                excel_io.write_oep_country_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    summary=result["summary"], raw_rows=result["raw"],
+                )
+            elif mode == "division":
+                excel_io.write_oep_division_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    summary=result["summary"], raw_rows=result["raw"],
+                )
+            elif mode == "category":
+                excel_io.write_oep_category_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    summary=result["summary"], raw_rows=result["raw"],
+                )
+            elif mode == "gender":
+                excel_io.write_oep_gender_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    summary=result["summary"],
+                )
+            elif mode == "timeseries":
+                excel_io.write_oep_timeseries_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    months=result["months"], series=result["series"],
+                )
+            elif mode == "pivot":
+                excel_io.write_oep_pivot_report(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    divisions=result["divisions"], countries=result["countries"],
+                    table=result["table"],
+                )
+            elif mode == "cdt":
+                excel_io.write_oep_country_division_timeseries(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    months=result["months"], pairs=result["pairs"],
+                    table=result["table"],
+                )
+            elif mode == "cdtd":
+                excel_io.write_oep_country_district_timeseries(
+                    path,
+                    date_from=result["date_from"], date_to=result["date_to"],
+                    months=result["months"], triples=result["triples"],
+                    table=result["table"],
+                )
+            elif mode == "full":
+                excel_io.write_oep_full_report(
+                    path,
+                    date_from=result["date_from"],
+                    date_to=result["date_to"],
+                    gender_id=result.get("gender_id", ""),
+                    country_summary=result["country_summary"],
+                    category_summary=result["category_summary"],
+                    division_summary=result["division_summary"],
+                    gender_summary=result["gender_summary"],
+                    raw_country=result["raw_country"],
+                    raw_division=result["raw_division"],
+                    months=result["months"],
+                    series=result["series"],
+                    divisions=result["divisions"],
+                    pivot_countries=result["pivot_countries"],
+                    table=result["table"],
+                    country_labels=result["country_labels"],
+                    cdt_months=result.get("cdt_months"),
+                    cdt_pairs=result.get("cdt_pairs"),
+                    cdt_table=result.get("cdt_table"),
+                )
+        except Exception as exc:  # noqa: BLE001 — surface to user
+            messagebox.showerror("OEP export", f"Could not save:\n{exc}")
+            return
+        # Remember the folder for next time
+        self.oep_output_dir.set(str(path.parent))
+        messagebox.showinfo("OEP export", f"Saved:\n{path}")
 
     # ------------------------------------------------------------------
     # File pickers
@@ -763,6 +2104,21 @@ class App:
             self._bd_log(f"ERROR: {payload}")
             messagebox.showerror("BD Agency Lookup — Error", str(payload))
             self._bd_reset_buttons()
+        # ------ OEP messages ------
+        elif kind == MSG_OEP_BUSY:
+            self.oep_status_label.configure(text=str(payload))
+        elif kind == MSG_OEP_LOG:
+            self.oep_status_label.configure(text=str(payload))
+        elif kind == MSG_OEP_DONE:
+            self._oep_render_results(payload)  # type: ignore[arg-type]
+        elif kind == MSG_OEP_ERROR:
+            self.oep_tree.delete(*self.oep_tree.get_children())
+            self._oep_set_columns([("#", 40), ("Info", 600)])
+            self.oep_tree.insert("", "end", values=("✕", str(payload)))
+            self.oep_status_label.configure(text="Failed.")
+            self.btn_oep_run.configure(state="normal")
+            self.btn_oep_export.configure(state="disabled")
+            messagebox.showerror("OEP", str(payload))
         # ------ Update messages ------
         elif kind == MSG_UPDATE_FOUND:
             self._on_update_found(payload)  # type: ignore[arg-type]
@@ -1209,10 +2565,31 @@ class App:
         if self._signed_in_user:
             email = self._signed_in_user.get("email") or "(signed in)"
             self.status_user_label.configure(text=f"Signed in: {email}")
-            self.btn_sign_out.configure(state="normal")
+            self.btn_sign_in.pack_forget()
+            self.btn_sign_out.pack(
+                side="right", padx=4, pady=2, before=self.btn_check_updates,
+            )
         else:
-            self.status_user_label.configure(text="Not signed in")
-            self.btn_sign_out.configure(state="disabled")
+            self.btn_sign_out.pack_forget()
+            if auth.GOOGLE_CLIENT_ID:
+                # CI build with the client ID baked in — offer sign in.
+                self.status_user_label.configure(text="Not signed in")
+                self.btn_sign_in.pack(
+                    side="right", padx=4, pady=2, before=self.btn_check_updates,
+                )
+            else:
+                # Dev build / fork with no client ID — auth is unavailable.
+                # Don't offer a button that can't possibly succeed.
+                self.status_user_label.configure(text="Unauthenticated (dev build)")
+                self.btn_sign_in.pack_forget()
+
+    def _on_sign_in(self) -> None:
+        """Status-bar entry point for signing in after launch."""
+        if self._signed_in_user:
+            return
+        if self._show_login_dialog():
+            # _show_login_dialog already updates the label on success.
+            pass
 
     def _on_sign_out(self) -> None:
         if not messagebox.askyesno(
