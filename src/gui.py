@@ -34,9 +34,13 @@ import winsound
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, auth, config, excel_io, oep_client, oep_presets, updater
+from . import (
+    __version__, auth, config, excel_io, oep_client, oep_presets,
+    updater, zenith_client,
+)
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
+from .zenith_cache import ZenithCache
 from .bd_matcher import (
     FIELD_ADDRESS,
     FIELD_LICENSE,
@@ -75,6 +79,15 @@ MSG_OEP_LOG = "oep_log"
 MSG_OEP_DONE = "oep_done"         # payload: dict (see _oep_worker_run)
 MSG_OEP_ERROR = "oep_error"
 MSG_OEP_BUSY = "oep_busy"         # payload: str (status text)
+
+# Zenith worker → GUI message types
+MSG_ZENITH_LOG = "zenith_log"
+MSG_ZENITH_PROGRESS = "zenith_progress"   # payload: (done, total, ok, nf, err)
+MSG_ZENITH_RESULT = "zenith_result"        # payload: LookupResult
+MSG_ZENITH_DONE = "zenith_done"            # payload: str (output path)
+MSG_ZENITH_ERROR = "zenith_error"
+MSG_ZENITH_LOGGED_IN = "zenith_logged_in"  # payload: dict(state_values)
+MSG_ZENITH_LOGIN_FAILED = "zenith_login_failed"
 
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
@@ -147,6 +160,25 @@ class App:
         # Embedded matplotlib chart; instantiated lazily on first time-series view.
         self._oep_chart_canvas = None
         self._oep_chart_figure = None
+
+        # ----- Zenith tab state -----
+        self.zenith_input_path = tk.StringVar()
+        self.zenith_sheet_name = tk.StringVar()
+        self.zenith_column_name = tk.StringVar()
+        self.zenith_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.zenith_username = tk.StringVar()
+        self.zenith_company = tk.StringVar(value="usba")
+        self.zenith_concurrency = tk.IntVar(value=3)
+        self.zenith_delay_s = tk.DoubleVar(value=0.8)
+        self.zenith_skip_cached = tk.BooleanVar(value=True)
+        self.zenith_test_mode = tk.BooleanVar(value=False)
+
+        self._zenith_sheet_columns: list[str] = []
+        self._zenith_session: zenith_client.ZenithSession | None = None
+        self._zenith_worker: threading.Thread | None = None
+        self._zenith_stop_flag = threading.Event()
+        self._zenith_pause_flag = threading.Event()
+        self._zenith_cache = ZenithCache(config.ZENITH_CACHE_DB)
 
         # ----- Shared message queue -----
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -308,13 +340,16 @@ class App:
         iata_tab = ttk.Frame(notebook)
         bd_tab = ttk.Frame(notebook)
         oep_tab = ttk.Frame(notebook)
+        zenith_tab = ttk.Frame(notebook)
         notebook.add(iata_tab, text="IATA Code Validator")
         notebook.add(bd_tab, text="BD Travel Agency Lookup")
         notebook.add(oep_tab, text="BD Overseas Movement")
+        notebook.add(zenith_tab, text="Zenith Customer Lookup")
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
         self._build_oep_tab(oep_tab)
+        self._build_zenith_tab(zenith_tab)
 
     def _build_iata_tab(self, parent: ttk.Frame) -> None:
         # ----- Input -----
@@ -2143,6 +2178,62 @@ class App:
         elif kind == MSG_UPDATE_ERROR:
             self.btn_check_updates.configure(state="normal", text="Check for updates")
             messagebox.showerror("Update", str(payload))
+        # ------ Zenith tab messages ------
+        elif kind == MSG_ZENITH_LOGGED_IN:
+            sess = payload  # type: ignore[assignment]
+            self._zenith_session = sess
+            sv = sess.state_values
+            self.zenith_login_status.configure(
+                text=(
+                    f"Signed in · user={sv.get('ID_ADMIN')} · "
+                    f"company={sv.get('ID_SOCIETE')} · app={sv.get('ID_APPLICATION')}"
+                ),
+            )
+            self.btn_zenith_login.configure(state="normal", text="Re-sign in")
+            # Don't keep the password in the widget after success.
+            self.zenith_pwd_entry.delete(0, "end")
+            self._zenith_log("Signed in to Zenith.")
+        elif kind == MSG_ZENITH_LOGIN_FAILED:
+            self.btn_zenith_login.configure(state="normal", text="Sign in to Zenith")
+            self.zenith_login_status.configure(text="Not signed in")
+            messagebox.showerror("Zenith login failed", str(payload))
+        elif kind == MSG_ZENITH_PROGRESS:
+            completed, total_n, ok, nf, err = payload  # type: ignore[misc]
+            self.zenith_progress_bar.configure(maximum=total_n, value=completed)
+            pct = 100 * completed / total_n if total_n else 0
+            self.zenith_progress_label.configure(
+                text=(
+                    f"{completed:,} / {total_n:,} ({pct:.1f}%)  ·  "
+                    f"{ok:,} OK · {nf:,} not found · {err:,} errors"
+                ),
+            )
+        elif kind == MSG_ZENITH_RESULT:
+            r = payload  # type: ignore[assignment]
+            if r.status == zenith_client.STATUS_OK and r.record is not None:
+                self._zenith_log(
+                    f"{r.checked_at}  {r.customer_id}  OK   "
+                    f"{r.record.first_name} {r.record.last_name}  ·  {r.record.email}",
+                )
+            elif r.status == zenith_client.STATUS_NOT_FOUND:
+                self._zenith_log(
+                    f"{r.checked_at}  {r.customer_id}  NOT_FOUND",
+                )
+            else:
+                self._zenith_log(
+                    f"{r.checked_at}  {r.customer_id}  ERROR  {r.error}",
+                )
+        elif kind == MSG_ZENITH_DONE:
+            path = str(payload)
+            self._zenith_log(f"Done. Wrote {path}")
+            self._refresh_zenith_cache_label()
+            self._zenith_reset_buttons()
+            messagebox.showinfo(
+                "Zenith — Run Done", f"Finished.\n\nOutput:\n{path}",
+            )
+        elif kind == MSG_ZENITH_ERROR:
+            self._zenith_log(f"ERROR: {payload}")
+            self._zenith_reset_buttons()
+            messagebox.showerror("Zenith — Run Error", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -2670,6 +2761,496 @@ class App:
                 "Self-update is only supported in the bundled .exe. "
                 f"Your downloaded file is at:\n{staged_path}",
             )
+
+
+    # ==================================================================
+    # Zenith Customer Lookup tab — UI
+    # ==================================================================
+
+    def _build_zenith_tab(self, parent: ttk.Frame) -> None:
+        parent = self._make_scrollable(parent)
+
+        intro = self._section(
+            parent, "Zenith Customer Lookup  ·  asia.ttinteractive.com",
+        )
+        ttk.Label(
+            intro, style="Hint.TLabel",
+            text=(
+                "Bulk-extract customer details (name, email, phone, address) "
+                "for a list of Customer IDs. Read-only — never modifies "
+                "Zenith data. Resume-safe: a SQLite cache lets you stop and "
+                "restart without re-fetching."
+            ),
+            wraplength=900, justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+
+        # ----- Login -----
+        login_body = self._section(parent, "Sign in to Zenith")
+        login_row = ttk.Frame(login_body)
+        login_row.pack(fill="x", padx=2)
+        self.zenith_user_entry = ttk.Entry(
+            login_row, textvariable=self.zenith_username, width=24,
+        )
+        self.zenith_pwd_entry = ttk.Entry(
+            login_row, show="•", width=24,
+        )
+        self.zenith_company_entry = ttk.Entry(
+            login_row, textvariable=self.zenith_company, width=10,
+        )
+        ttk.Label(login_row, text="Username:").grid(
+            row=0, column=0, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_user_entry.grid(row=0, column=1, padx=(0, 12), pady=4)
+        ttk.Label(login_row, text="Password:").grid(
+            row=0, column=2, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_pwd_entry.grid(row=0, column=3, padx=(0, 12), pady=4)
+        ttk.Label(login_row, text="Company:").grid(
+            row=0, column=4, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_company_entry.grid(row=0, column=5, padx=(0, 12), pady=4)
+        self.btn_zenith_login = ttk.Button(
+            login_row, text="Sign in to Zenith",
+            command=self._zenith_login, width=18,
+        )
+        self.btn_zenith_login.grid(row=0, column=6, padx=(0, 4), pady=4)
+        self.zenith_login_status = ttk.Label(
+            login_body, text="Not signed in", style="Hint.TLabel",
+        )
+        self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
+
+        # ----- Input picker -----
+        body = self._section(parent, "Input Excel")
+        self.zenith_input_entry = ttk.Entry(
+            body, textvariable=self.zenith_input_path,
+        )
+        ttk.Label(body, text="File:", width=14, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(2, 4), pady=4,
+        )
+        self.zenith_input_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4), pady=4)
+        ttk.Button(body, text="Browse…", command=self._zenith_pick_input).grid(
+            row=0, column=2, padx=(4, 2), pady=4,
+        )
+        self.zenith_sheet_combo = ttk.Combobox(
+            body, textvariable=self.zenith_sheet_name, state="readonly",
+            postcommand=self._zenith_reload_columns,
+        )
+        ttk.Label(body, text="Sheet:", width=14, anchor="w").grid(
+            row=1, column=0, sticky="w", padx=(2, 4), pady=4,
+        )
+        self.zenith_sheet_combo.grid(row=1, column=1, sticky="ew", padx=(0, 4), pady=4)
+        self.zenith_col_combo = ttk.Combobox(
+            body, textvariable=self.zenith_column_name, state="readonly",
+        )
+        ttk.Label(body, text="ID column:", width=14, anchor="w").grid(
+            row=2, column=0, sticky="w", padx=(2, 4), pady=4,
+        )
+        self.zenith_col_combo.grid(row=2, column=1, sticky="ew", padx=(0, 4), pady=4)
+        body.columnconfigure(1, weight=1)
+
+        # ----- Throughput controls -----
+        speed_body = self._section(parent, "Throughput")
+        ttk.Label(
+            speed_body, style="Hint.TLabel",
+            text=(
+                "Concurrency = parallel HTTP connections (1 = polite, 10 = aggressive). "
+                "Delay = pause between calls per worker. Start at 3 / 0.8 s; "
+                "watch for any errors before increasing."
+            ),
+            wraplength=900, justify="left",
+        ).pack(anchor="w", padx=2, pady=(0, 6))
+        knobs = ttk.Frame(speed_body)
+        knobs.pack(fill="x", padx=2)
+        ttk.Label(knobs, text="Concurrency:").grid(
+            row=0, column=0, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_conc_scale = ttk.Scale(
+            knobs, from_=1, to=10, orient="horizontal",
+            variable=self.zenith_concurrency, length=200,
+            command=lambda _v: self.zenith_concurrency.set(
+                int(self.zenith_concurrency.get())
+            ),
+        )
+        self.zenith_conc_scale.grid(row=0, column=1, padx=(0, 8), pady=4)
+        self.zenith_conc_label = ttk.Label(knobs, text="3 workers")
+        self.zenith_conc_label.grid(row=0, column=2, padx=(0, 24), pady=4)
+        self.zenith_concurrency.trace_add(
+            "write",
+            lambda *_a: self.zenith_conc_label.configure(
+                text=f"{int(self.zenith_concurrency.get())} workers",
+            ),
+        )
+
+        ttk.Label(knobs, text="Delay (sec):").grid(
+            row=0, column=3, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_delay_scale = ttk.Scale(
+            knobs, from_=0.1, to=2.0, orient="horizontal",
+            variable=self.zenith_delay_s, length=200,
+        )
+        self.zenith_delay_scale.grid(row=0, column=4, padx=(0, 8), pady=4)
+        self.zenith_delay_label = ttk.Label(knobs, text="0.8 s")
+        self.zenith_delay_label.grid(row=0, column=5, padx=(0, 4), pady=4)
+        self.zenith_delay_s.trace_add(
+            "write",
+            lambda *_a: self.zenith_delay_label.configure(
+                text=f"{float(self.zenith_delay_s.get()):.1f} s",
+            ),
+        )
+
+        # Cache + safety options
+        opts = ttk.Frame(speed_body)
+        opts.pack(fill="x", padx=2, pady=(8, 0))
+        ttk.Checkbutton(
+            opts, text="Skip IDs already in local cache",
+            variable=self.zenith_skip_cached,
+        ).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(
+            opts, text="Test mode — first 100 IDs only",
+            variable=self.zenith_test_mode,
+        ).pack(side="left", padx=(0, 16))
+        ttk.Button(
+            opts, text="Reset cache…", command=self._zenith_reset_cache,
+        ).pack(side="right")
+        ttk.Button(
+            opts, text="Retry failures", command=self._zenith_clear_errors,
+        ).pack(side="right", padx=(0, 4))
+
+        # ----- Output -----
+        out_body = self._section(parent, "Output")
+        self.zenith_output_entry = ttk.Entry(
+            out_body, textvariable=self.zenith_output_dir,
+        )
+        ttk.Label(out_body, text="Folder:", width=14, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(2, 4), pady=4,
+        )
+        self.zenith_output_entry.grid(
+            row=0, column=1, sticky="ew", padx=(0, 4), pady=4,
+        )
+        ttk.Button(out_body, text="Browse…", command=self._zenith_pick_output).grid(
+            row=0, column=2, padx=(4, 2), pady=4,
+        )
+        out_body.columnconfigure(1, weight=1)
+
+        # ----- Run controls -----
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 0))
+        self.btn_zenith_run = ttk.Button(
+            ctl, text="Run", style="Primary.TButton",
+            command=self._zenith_run,
+        )
+        self.btn_zenith_run.pack(side="left")
+        self.btn_zenith_pause = ttk.Button(
+            ctl, text="Pause", command=self._zenith_pause, state="disabled",
+        )
+        self.btn_zenith_pause.pack(side="left", padx=(8, 0))
+        self.btn_zenith_resume = ttk.Button(
+            ctl, text="Resume", command=self._zenith_resume, state="disabled",
+        )
+        self.btn_zenith_resume.pack(side="left", padx=(4, 0))
+        self.btn_zenith_stop = ttk.Button(
+            ctl, text="Stop", command=self._zenith_stop, state="disabled",
+        )
+        self.btn_zenith_stop.pack(side="left", padx=(4, 0))
+        self.btn_zenith_export = ttk.Button(
+            ctl, text="Export cache to Excel", command=self._zenith_export_cache,
+        )
+        self.btn_zenith_export.pack(side="left", padx=(16, 0))
+
+        # ----- Progress -----
+        prog_body = self._section(parent, "Progress")
+        self.zenith_progress_bar = ttk.Progressbar(
+            prog_body, mode="determinate", length=200,
+        )
+        self.zenith_progress_bar.pack(fill="x", padx=2, pady=(0, 4))
+        self.zenith_progress_label = ttk.Label(
+            prog_body, text="Idle.", style="Hint.TLabel",
+        )
+        self.zenith_progress_label.pack(anchor="w", padx=2)
+
+        # ----- Log -----
+        log_body = self._section(parent, "Log")
+        log_frame = ttk.Frame(log_body)
+        log_frame.pack(fill="both", expand=True, padx=2)
+        self.zenith_log_text = tk.Text(
+            log_frame, height=10, wrap="none", state="disabled",
+            font=("Consolas", 9),
+        )
+        self.zenith_log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, command=self.zenith_log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.zenith_log_text.configure(yscrollcommand=log_scroll.set)
+
+        self._refresh_zenith_cache_label()
+
+    # ==================================================================
+    # Zenith Customer Lookup tab — actions
+    # ==================================================================
+
+    def _refresh_zenith_cache_label(self) -> None:
+        counts = self._zenith_cache.counts_by_status()
+        ok = counts.get(zenith_client.STATUS_OK, 0)
+        nf = counts.get(zenith_client.STATUS_NOT_FOUND, 0)
+        err = counts.get(zenith_client.STATUS_ERROR, 0)
+        total = ok + nf + err
+        if total == 0:
+            text = "Cache is empty."
+        else:
+            text = f"Cache: {ok:,} OK · {nf:,} not found · {err:,} errors  ({total:,} total)"
+        self.zenith_progress_label.configure(text=text)
+
+    def _zenith_pick_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Excel with Customer IDs",
+            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.zenith_input_path.set(path)
+        try:
+            sheets = excel_io.list_sheet_names(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Zenith", f"Could not read sheets: {exc}")
+            return
+        self.zenith_sheet_combo.configure(values=sheets)
+        if sheets:
+            self.zenith_sheet_name.set(sheets[0])
+            self._zenith_reload_columns()
+
+    def _zenith_pick_output(self) -> None:
+        folder = filedialog.askdirectory(title="Choose output folder")
+        if folder:
+            self.zenith_output_dir.set(folder)
+
+    def _zenith_reload_columns(self) -> None:
+        path = self.zenith_input_path.get().strip()
+        sheet = self.zenith_sheet_name.get().strip()
+        if not path or not sheet:
+            return
+        try:
+            cols = excel_io.list_columns(Path(path), sheet)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Zenith", f"Could not read columns: {exc}")
+            return
+        self._zenith_sheet_columns = cols
+        self.zenith_col_combo.configure(values=cols)
+        if cols and not self.zenith_column_name.get():
+            # Common defaults the user might have
+            for guess in ("Customer ID", "CustomerID", "ID", "id"):
+                if guess in cols:
+                    self.zenith_column_name.set(guess)
+                    break
+            else:
+                self.zenith_column_name.set(cols[0])
+
+    def _zenith_login(self) -> None:
+        user = self.zenith_username.get().strip()
+        pwd = self.zenith_pwd_entry.get()
+        company = self.zenith_company.get().strip() or "usba"
+        if not user or not pwd:
+            messagebox.showerror(
+                "Zenith", "Enter both username and password.",
+            )
+            return
+        self.btn_zenith_login.configure(state="disabled", text="Signing in…")
+        self.zenith_login_status.configure(text="Connecting…")
+
+        def worker() -> None:
+            try:
+                sess = zenith_client.ZenithSession.from_credentials(
+                    user, pwd, company_code=company,
+                )
+                self._post(MSG_ZENITH_LOGGED_IN, sess)
+            except zenith_client.LoginError as exc:
+                self._post(MSG_ZENITH_LOGIN_FAILED, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Zenith login crashed")
+                self._post(MSG_ZENITH_LOGIN_FAILED, f"{type(exc).__name__}: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _zenith_run(self) -> None:
+        if self._zenith_session is None:
+            messagebox.showerror(
+                "Zenith", "Sign in to Zenith first.",
+            )
+            return
+        in_path = self.zenith_input_path.get().strip()
+        sheet = self.zenith_sheet_name.get().strip()
+        col = self.zenith_column_name.get().strip()
+        if not in_path or not sheet or not col:
+            messagebox.showerror(
+                "Zenith", "Pick an input file, sheet, and ID column first.",
+            )
+            return
+        out_dir = Path(self.zenith_output_dir.get().strip() or str(Path.home()))
+
+        # Read IDs
+        try:
+            ids = excel_io.read_zenith_ids(Path(in_path), sheet, col)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Zenith", f"Could not read IDs: {exc}")
+            return
+        if not ids:
+            messagebox.showerror("Zenith", "No IDs found in that column.")
+            return
+        if self.zenith_test_mode.get():
+            ids = ids[:100]
+
+        # Optionally skip cached
+        if self.zenith_skip_cached.get():
+            cached = self._zenith_cache.cached_ids(only_ok=True)
+            skipped = len([i for i in ids if i in cached])
+            ids = [i for i in ids if i not in cached]
+            if skipped:
+                self._zenith_log(f"Skipping {skipped:,} IDs already in cache (OK).")
+            if not ids:
+                messagebox.showinfo(
+                    "Zenith",
+                    "All requested IDs are already cached. Nothing to fetch.\n\n"
+                    "Use 'Export cache to Excel' to write them out.",
+                )
+                return
+
+        # Big-run confirmation
+        if len(ids) > 5000 and not messagebox.askyesno(
+            "Zenith — large run",
+            f"About to fetch {len(ids):,} customer records.\n\n"
+            f"At concurrency={int(self.zenith_concurrency.get())} and "
+            f"delay={float(self.zenith_delay_s.get()):.1f}s, this could take "
+            f"a few hours. Continue?",
+        ):
+            return
+
+        # Worker setup
+        self._zenith_stop_flag.clear()
+        self._zenith_pause_flag.clear()
+        out_path = excel_io.build_zenith_output_path(out_dir)
+        cfg = {
+            "ids": ids,
+            "concurrency": int(self.zenith_concurrency.get()),
+            "delay_s": float(self.zenith_delay_s.get()),
+            "out_path": out_path,
+        }
+        self._zenith_worker = threading.Thread(
+            target=self._zenith_worker_run, args=(cfg,), daemon=True,
+        )
+        self._zenith_log(
+            f"Run starting — {len(ids):,} IDs · "
+            f"concurrency={cfg['concurrency']} · delay={cfg['delay_s']:.1f}s",
+        )
+        self.zenith_progress_bar.configure(value=0, maximum=len(ids))
+        self.btn_zenith_run.configure(state="disabled")
+        self.btn_zenith_pause.configure(state="normal")
+        self.btn_zenith_stop.configure(state="normal")
+        self._zenith_worker.start()
+
+    def _zenith_worker_run(self, cfg: dict) -> None:
+        ids = cfg["ids"]
+        total = len(ids)
+        ok = nf = err = 0
+
+        def progress_cb(result, completed: int, total_n: int) -> None:
+            nonlocal ok, nf, err
+            self._zenith_cache.save_result(result)
+            if result.status == zenith_client.STATUS_OK:
+                ok += 1
+            elif result.status == zenith_client.STATUS_NOT_FOUND:
+                nf += 1
+            else:
+                err += 1
+            self._post(MSG_ZENITH_PROGRESS, (completed, total_n, ok, nf, err))
+            self._post(MSG_ZENITH_RESULT, result)
+
+        try:
+            zenith_client.fetch_many(
+                self._zenith_session, ids,
+                concurrency=cfg["concurrency"],
+                delay_s=cfg["delay_s"],
+                progress_cb=progress_cb,
+                stop_event=self._zenith_stop_flag,
+                pause_event=self._zenith_pause_flag,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Zenith run crashed")
+            self._post(MSG_ZENITH_ERROR, f"{type(exc).__name__}: {exc}")
+            return
+
+        # Write everything cached to Excel
+        try:
+            excel_io.write_zenith_results(
+                cfg["out_path"], self._zenith_cache.iter_all(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Zenith Excel write failed")
+            self._post(MSG_ZENITH_ERROR, f"Excel write failed: {exc}")
+            return
+        self._post(MSG_ZENITH_DONE, str(cfg["out_path"]))
+
+    def _zenith_pause(self) -> None:
+        self._zenith_pause_flag.set()
+        self.btn_zenith_pause.configure(state="disabled")
+        self.btn_zenith_resume.configure(state="normal")
+        self._zenith_log("Paused.")
+
+    def _zenith_resume(self) -> None:
+        self._zenith_pause_flag.clear()
+        self.btn_zenith_resume.configure(state="disabled")
+        self.btn_zenith_pause.configure(state="normal")
+        self._zenith_log("Resumed.")
+
+    def _zenith_stop(self) -> None:
+        self._zenith_stop_flag.set()
+        self._zenith_pause_flag.clear()
+        self._zenith_log("Stopping after current batch finishes…")
+        self.btn_zenith_stop.configure(state="disabled")
+
+    def _zenith_reset_cache(self) -> None:
+        counts = self._zenith_cache.counts_by_status()
+        total = sum(counts.values())
+        if not total:
+            messagebox.showinfo("Zenith", "Cache already empty.")
+            return
+        if not messagebox.askyesno(
+            "Reset cache?",
+            f"Delete all {total:,} cached customer records?\n\n"
+            "Useful for starting fresh. The Excel files you've already "
+            "exported are NOT affected.",
+        ):
+            return
+        self._zenith_cache.reset()
+        self._refresh_zenith_cache_label()
+        self._zenith_log("Cache reset.")
+
+    def _zenith_clear_errors(self) -> None:
+        dropped = self._zenith_cache.clear_errors()
+        self._refresh_zenith_cache_label()
+        self._zenith_log(
+            f"Cleared {dropped:,} error rows — they'll be retried on the next run.",
+        )
+
+    def _zenith_export_cache(self) -> None:
+        out_dir = Path(self.zenith_output_dir.get().strip() or str(Path.home()))
+        path = excel_io.build_zenith_output_path(out_dir)
+        try:
+            excel_io.write_zenith_results(path, self._zenith_cache.iter_all())
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Zenith", f"Excel write failed: {exc}")
+            return
+        self._zenith_log(f"Exported cache to {path}")
+        messagebox.showinfo("Zenith — Export Done", f"Wrote:\n\n{path}")
+
+    def _zenith_log(self, text: str) -> None:
+        self.zenith_log_text.configure(state="normal")
+        self.zenith_log_text.insert("end", text + "\n")
+        self.zenith_log_text.see("end")
+        self.zenith_log_text.configure(state="disabled")
+
+    def _zenith_reset_buttons(self) -> None:
+        self.btn_zenith_run.configure(state="normal")
+        self.btn_zenith_pause.configure(state="disabled")
+        self.btn_zenith_resume.configure(state="disabled")
+        self.btn_zenith_stop.configure(state="disabled")
 
 
 def _fmt_dur(seconds: float) -> str:

@@ -135,3 +135,35 @@ OEP_OUTPUT_COLUMNS_GENDER_SUMMARY = [
     "Total",
     "Female %",
 ]
+
+# ---------------------------------------------------------------------------
+# Zenith Customer Lookup tab
+# ---------------------------------------------------------------------------
+
+ZENITH_OUTPUT_COLUMNS = [
+    "Customer ID",
+    "Status",
+    "Title",
+    "First Name",
+    "Middle Name",
+    "Last Name",
+    "Date of Birth",
+    "Email",
+    "Home Phone",
+    "Home Phone (Intl)",
+    "Mobile Phone",
+    "Mobile Phone (Intl)",
+    "Office Phone",
+    "Nationality",
+    "Language",
+    "Spoken Language",
+    "Address",
+    "City",
+    "Postal Code",
+    "Country",
+    "Registration Date",
+    "Error",
+    "Checked At",
+]
+
+ZENITH_CACHE_DB = APP_DIR / "zenith_cache.sqlite"

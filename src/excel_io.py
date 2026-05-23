@@ -19,6 +19,7 @@ from .config import (
     OEP_OUTPUT_COLUMNS_DIVISION_SUMMARY,
     OEP_OUTPUT_COLUMNS_GENDER_SUMMARY,
     OUTPUT_COLUMNS,
+    ZENITH_OUTPUT_COLUMNS,
 )
 from .parser import LookupResult
 
@@ -672,3 +673,99 @@ def build_oep_output_path(folder: Path, kind: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"oep_{kind}_{timestamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Zenith Customer Lookup IO
+# ---------------------------------------------------------------------------
+
+
+def read_zenith_ids(
+    path: Path,
+    sheet: str,
+    column_header: str,
+    *,
+    start_row: int = 2,
+    end_row: int | None = None,
+) -> list[str]:
+    """Read customer IDs from a column in an Excel file.
+
+    Same shape as `read_iata_numbers` but doesn't reject non-numeric
+    or short-length values — Zenith customer IDs are 8 digits but we
+    accept anything non-blank.
+    """
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb[sheet]
+        header_row = next(
+            ws.iter_rows(min_row=1, max_row=1, values_only=True), ()
+        )
+        try:
+            col_idx = list(header_row).index(column_header) + 1
+        except ValueError:
+            raise ValueError(
+                f"Column {column_header!r} not found in sheet {sheet!r}"
+            ) from None
+
+        ids: list[str] = []
+        for row in ws.iter_rows(
+            min_row=start_row, max_row=end_row,
+            min_col=col_idx, max_col=col_idx,
+            values_only=True,
+        ):
+            cell = row[0]
+            text = _normalize(cell)
+            if text:
+                ids.append(text)
+        return ids
+    finally:
+        wb.close()
+
+
+def write_zenith_results(path: Path, results: Iterable) -> None:
+    """Write a flat per-customer Excel from cached LookupResult rows.
+
+    `results` is an iterable of zenith_client.LookupResult — typically
+    yielded by ZenithCache.iter_all(). Fields are written in
+    ZENITH_OUTPUT_COLUMNS order.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Zenith Customers"
+    ws.append(ZENITH_OUTPUT_COLUMNS)
+    for r in results:
+        rec = r.record
+        ws.append([
+            r.customer_id,
+            r.status,
+            rec.title if rec else "",
+            rec.first_name if rec else "",
+            rec.middle_name if rec else "",
+            rec.last_name if rec else "",
+            rec.date_of_birth if rec else "",
+            rec.email if rec else "",
+            rec.home_phone if rec else "",
+            rec.home_phone_international if rec else "",
+            rec.mobile_phone if rec else "",
+            rec.mobile_phone_international if rec else "",
+            rec.office_phone if rec else "",
+            rec.nationality if rec else "",
+            rec.language if rec else "",
+            rec.spoken_language if rec else "",
+            rec.address if rec else "",
+            rec.city if rec else "",
+            rec.postal_code if rec else "",
+            rec.country if rec else "",
+            rec.registration_date if rec else "",
+            r.error,
+            r.checked_at,
+        ])
+    # Auto-size the Customer ID column for readability.
+    ws.column_dimensions[get_column_letter(1)].width = 14
+    wb.save(path)
+
+
+def build_zenith_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_customers_{timestamp}.xlsx"
