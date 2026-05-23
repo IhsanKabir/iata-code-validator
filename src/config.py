@@ -167,3 +167,27 @@ ZENITH_OUTPUT_COLUMNS = [
 ]
 
 ZENITH_CACHE_DB = APP_DIR / "zenith_cache.sqlite"
+
+# Zenith Flight Loads sub-tab
+ZENITH_FLIGHT_OUTPUT_COLUMNS = [
+    "Flight Number",
+    "Day",
+    "Flight Date",
+    "Departure Time",
+    "Aircraft",
+    "Registration",
+    "Total Tickets Issued",
+    "Leg Route",
+    "Origin",
+    "Destination",
+    "Leg Local Time",
+    "Cabin",
+    "Tickets Issued",
+    "Tickets WL",
+    "Seats Confirmed",
+    "Seats Options",
+    "Seats WL",
+    "Seats Available",
+    "Inventory Status",
+    "Comments",
+]

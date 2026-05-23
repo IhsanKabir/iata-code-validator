@@ -88,6 +88,11 @@ MSG_ZENITH_DONE = "zenith_done"            # payload: str (output path)
 MSG_ZENITH_ERROR = "zenith_error"
 MSG_ZENITH_LOGGED_IN = "zenith_logged_in"  # payload: dict(state_values)
 MSG_ZENITH_LOGIN_FAILED = "zenith_login_failed"
+# Zenith Flight Loads sub-tab
+MSG_ZENITH_FL_LOG = "zenith_fl_log"
+MSG_ZENITH_FL_PROGRESS = "zenith_fl_progress"  # (chunk_label, done_chunks, total_chunks, rows)
+MSG_ZENITH_FL_DONE = "zenith_fl_done"           # payload: str(output path)
+MSG_ZENITH_FL_ERROR = "zenith_fl_error"
 
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
@@ -2234,6 +2239,28 @@ class App:
             self._zenith_log(f"ERROR: {payload}")
             self._zenith_reset_buttons()
             messagebox.showerror("Zenith — Run Error", str(payload))
+        # ------ Zenith Flight Loads messages ------
+        elif kind == MSG_ZENITH_FL_PROGRESS:
+            chunk_label, done, total, rows = payload  # type: ignore[misc]
+            self.zenith_fl_progress_bar.configure(maximum=total, value=done)
+            self.zenith_fl_progress_label.configure(
+                text=f"Chunk {done}/{total}  ·  {chunk_label}  ·  {rows:,} rows so far",
+            )
+            self._zenith_fl_log(
+                f"Chunk {done}/{total} done: {chunk_label}  ({rows:,} rows total)",
+            )
+        elif kind == MSG_ZENITH_FL_DONE:
+            path = str(payload)
+            self._zenith_fl_log(f"Done. Wrote {path}")
+            self._zenith_fl_reset_buttons()
+            messagebox.showinfo(
+                "Zenith Flight Loads — Done",
+                f"Finished.\n\nOutput:\n{path}",
+            )
+        elif kind == MSG_ZENITH_FL_ERROR:
+            self._zenith_fl_log(f"ERROR: {payload}")
+            self._zenith_fl_reset_buttons()
+            messagebox.showerror("Zenith Flight Loads — Error", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -2819,6 +2846,20 @@ class App:
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
 
+        # ----- Inner notebook so Customer Lookup and Flight Loads each
+        # get their own canvas without polluting the other. Login above
+        # remains shared.
+        inner_nb = ttk.Notebook(parent)
+        inner_nb.pack(fill="both", expand=True, padx=4, pady=(8, 0))
+        customer_inner = ttk.Frame(inner_nb)
+        flight_inner = ttk.Frame(inner_nb)
+        inner_nb.add(customer_inner, text="Customer Lookup")
+        inner_nb.add(flight_inner, text="Flight Loads")
+
+        # From here, the existing Customer Lookup form goes into
+        # `customer_inner` instead of the outer scroll frame.
+        parent = customer_inner
+
         # ----- Input picker -----
         body = self._section(parent, "Input Excel")
         self.zenith_input_entry = ttk.Entry(
@@ -2982,6 +3023,160 @@ class App:
         self.zenith_log_text.configure(yscrollcommand=log_scroll.set)
 
         self._refresh_zenith_cache_label()
+
+        # ==============================================================
+        # Flight Loads inner tab
+        # ==============================================================
+        self._build_zenith_flight_subtab(flight_inner)
+
+    def _build_zenith_flight_subtab(self, parent: ttk.Frame) -> None:
+        """Inner tab — date range pull from the View PNLs report."""
+        # ----- Description -----
+        intro = self._section(
+            parent, "Flight Loads  ·  View PNLs",
+        )
+        ttk.Label(
+            intro, style="Hint.TLabel",
+            text=(
+                "Pull flight-load data (tickets, seats, load %, status) "
+                "for a date range. The server caps each search at 10 "
+                "pages; this tab auto-chunks longer ranges into smaller "
+                "windows so you can ask for up to ~12 months."
+            ),
+            wraplength=900, justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+
+        # ----- Range + page-size form -----
+        form = self._section(parent, "Range")
+        # State vars
+        from datetime import date, timedelta
+        today = date.today()
+        a_week_ago = today - timedelta(days=6)
+        self.zenith_fl_date_from = tk.StringVar(value=a_week_ago.strftime("%d/%m/%Y"))
+        self.zenith_fl_date_to = tk.StringVar(value=today.strftime("%d/%m/%Y"))
+        self.zenith_fl_page_size = tk.StringVar(value="100")
+        self.zenith_fl_chunk_days = tk.IntVar(value=10)
+        self.zenith_fl_delay_s = tk.DoubleVar(value=1.0)
+
+        row1 = ttk.Frame(form)
+        row1.pack(fill="x", padx=2)
+        ttk.Label(row1, text="From (DD/MM/YYYY):").grid(
+            row=0, column=0, padx=(0, 4), pady=4, sticky="w",
+        )
+        ttk.Entry(row1, textvariable=self.zenith_fl_date_from, width=14).grid(
+            row=0, column=1, padx=(0, 12), pady=4,
+        )
+        ttk.Label(row1, text="To:").grid(
+            row=0, column=2, padx=(0, 4), pady=4, sticky="w",
+        )
+        ttk.Entry(row1, textvariable=self.zenith_fl_date_to, width=14).grid(
+            row=0, column=3, padx=(0, 12), pady=4,
+        )
+        ttk.Label(row1, text="Page size:").grid(
+            row=0, column=4, padx=(0, 4), pady=4, sticky="w",
+        )
+        ttk.Combobox(
+            row1, textvariable=self.zenith_fl_page_size,
+            values=("20", "50", "100"), width=6, state="readonly",
+        ).grid(row=0, column=5, padx=(0, 12), pady=4)
+        ttk.Label(row1, text="Chunk (days):").grid(
+            row=0, column=6, padx=(0, 4), pady=4, sticky="w",
+        )
+        ttk.Spinbox(
+            row1, from_=1, to=30, textvariable=self.zenith_fl_chunk_days,
+            width=5,
+        ).grid(row=0, column=7, padx=(0, 12), pady=4)
+
+        # ----- Throughput -----
+        speed = self._section(parent, "Throughput")
+        ttk.Label(
+            speed, style="Hint.TLabel",
+            text=(
+                "Polite delay between paginated calls. The View PNLs page "
+                "is heavier than the Customer page (~360 KB per call); "
+                "1.0 s is a safe default."
+            ),
+            wraplength=900, justify="left",
+        ).pack(anchor="w", padx=2, pady=(0, 4))
+        knobs = ttk.Frame(speed)
+        knobs.pack(fill="x", padx=2)
+        ttk.Label(knobs, text="Delay (sec):").grid(
+            row=0, column=0, padx=(0, 4), pady=4, sticky="w",
+        )
+        self.zenith_fl_delay_scale = ttk.Scale(
+            knobs, from_=0.3, to=3.0, orient="horizontal",
+            variable=self.zenith_fl_delay_s, length=200,
+        )
+        self.zenith_fl_delay_scale.grid(row=0, column=1, padx=(0, 8), pady=4)
+        self.zenith_fl_delay_label = ttk.Label(knobs, text="1.0 s")
+        self.zenith_fl_delay_label.grid(row=0, column=2, padx=(0, 4), pady=4)
+        self.zenith_fl_delay_s.trace_add(
+            "write",
+            lambda *_a: self.zenith_fl_delay_label.configure(
+                text=f"{float(self.zenith_fl_delay_s.get()):.1f} s",
+            ),
+        )
+
+        # ----- Output -----
+        out_body = self._section(parent, "Output")
+        self.zenith_fl_output_dir = tk.StringVar(
+            value=str(Path.home() / "Documents"),
+        )
+        self.zenith_fl_output_entry = ttk.Entry(
+            out_body, textvariable=self.zenith_fl_output_dir,
+        )
+        ttk.Label(out_body, text="Folder:", width=14, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(2, 4), pady=4,
+        )
+        self.zenith_fl_output_entry.grid(
+            row=0, column=1, sticky="ew", padx=(0, 4), pady=4,
+        )
+        ttk.Button(
+            out_body, text="Browse…", command=self._zenith_fl_pick_output,
+        ).grid(row=0, column=2, padx=(4, 2), pady=4)
+        out_body.columnconfigure(1, weight=1)
+
+        # ----- Run controls -----
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 0))
+        self.btn_zenith_fl_run = ttk.Button(
+            ctl, text="Run", style="Primary.TButton",
+            command=self._zenith_fl_run,
+        )
+        self.btn_zenith_fl_run.pack(side="left")
+        self.btn_zenith_fl_stop = ttk.Button(
+            ctl, text="Stop", command=self._zenith_fl_stop, state="disabled",
+        )
+        self.btn_zenith_fl_stop.pack(side="left", padx=(8, 0))
+
+        # ----- Progress + log -----
+        prog_body = self._section(parent, "Progress")
+        self.zenith_fl_progress_bar = ttk.Progressbar(
+            prog_body, mode="determinate", length=200,
+        )
+        self.zenith_fl_progress_bar.pack(fill="x", padx=2, pady=(0, 4))
+        self.zenith_fl_progress_label = ttk.Label(
+            prog_body, text="Idle.", style="Hint.TLabel",
+        )
+        self.zenith_fl_progress_label.pack(anchor="w", padx=2)
+
+        log_body = self._section(parent, "Log")
+        log_frame = ttk.Frame(log_body)
+        log_frame.pack(fill="both", expand=True, padx=2)
+        self.zenith_fl_log_text = tk.Text(
+            log_frame, height=10, wrap="none", state="disabled",
+            font=("Consolas", 9),
+        )
+        self.zenith_fl_log_text.pack(side="left", fill="both", expand=True)
+        fl_scroll = ttk.Scrollbar(
+            log_frame, command=self.zenith_fl_log_text.yview,
+        )
+        fl_scroll.pack(side="right", fill="y")
+        self.zenith_fl_log_text.configure(yscrollcommand=fl_scroll.set)
+
+        # ----- Worker state -----
+        self._zenith_fl_worker: threading.Thread | None = None
+        self._zenith_fl_stop_flag = threading.Event()
 
     # ==================================================================
     # Zenith Customer Lookup tab — actions
@@ -3251,6 +3446,123 @@ class App:
         self.btn_zenith_pause.configure(state="disabled")
         self.btn_zenith_resume.configure(state="disabled")
         self.btn_zenith_stop.configure(state="disabled")
+
+    # ==================================================================
+    # Zenith Flight Loads sub-tab — actions
+    # ==================================================================
+
+    def _zenith_fl_log(self, text: str) -> None:
+        self.zenith_fl_log_text.configure(state="normal")
+        self.zenith_fl_log_text.insert("end", text + "\n")
+        self.zenith_fl_log_text.see("end")
+        self.zenith_fl_log_text.configure(state="disabled")
+
+    def _zenith_fl_pick_output(self) -> None:
+        folder = filedialog.askdirectory(title="Choose flight-loads output folder")
+        if folder:
+            self.zenith_fl_output_dir.set(folder)
+
+    def _zenith_fl_run(self) -> None:
+        if self._zenith_session is None:
+            messagebox.showerror(
+                "Zenith", "Sign in to Zenith first (top of this tab).",
+            )
+            return
+        date_from = self.zenith_fl_date_from.get().strip()
+        date_to = self.zenith_fl_date_to.get().strip()
+        if not date_from or not date_to:
+            messagebox.showerror(
+                "Zenith", "Enter both From and To dates (DD/MM/YYYY).",
+            )
+            return
+        try:
+            from datetime import datetime
+            datetime.strptime(date_from, "%d/%m/%Y")
+            datetime.strptime(date_to, "%d/%m/%Y")
+        except ValueError:
+            messagebox.showerror(
+                "Zenith", "Dates must be in DD/MM/YYYY format.",
+            )
+            return
+
+        try:
+            page_size = int(self.zenith_fl_page_size.get())
+        except ValueError:
+            page_size = 100
+        chunk_days = max(1, int(self.zenith_fl_chunk_days.get()))
+        delay_s = float(self.zenith_fl_delay_s.get())
+        out_dir = Path(
+            self.zenith_fl_output_dir.get().strip() or str(Path.home()),
+        )
+        out_path = excel_io.build_zenith_flight_output_path(out_dir)
+
+        self._zenith_fl_stop_flag.clear()
+        self.btn_zenith_fl_run.configure(state="disabled")
+        self.btn_zenith_fl_stop.configure(state="normal")
+        self.zenith_fl_progress_bar.configure(value=0, maximum=1)
+        self._zenith_fl_log(
+            f"Flight loads run starting: {date_from} → {date_to} · "
+            f"page_size={page_size} · chunk={chunk_days}d · delay={delay_s:.1f}s",
+        )
+
+        cfg = {
+            "date_from": date_from, "date_to": date_to,
+            "page_size": page_size, "chunk_days": chunk_days,
+            "delay_s": delay_s, "out_path": out_path,
+        }
+        self._zenith_fl_worker = threading.Thread(
+            target=self._zenith_fl_worker_run, args=(cfg,), daemon=True,
+        )
+        self._zenith_fl_worker.start()
+
+    def _zenith_fl_worker_run(self, cfg: dict) -> None:
+        def progress_cb(chunk_label, done, total, rows_so_far):
+            self._post(
+                MSG_ZENITH_FL_PROGRESS,
+                (chunk_label, done, total, rows_so_far),
+            )
+
+        try:
+            rows = zenith_client.fetch_flight_loads(
+                self._zenith_session,
+                cfg["date_from"], cfg["date_to"],
+                page_size=cfg["page_size"],
+                chunk_days=cfg["chunk_days"],
+                inter_call_delay_s=cfg["delay_s"],
+                progress_cb=progress_cb,
+                stop_event=self._zenith_fl_stop_flag,
+            )
+        except zenith_client.SessionExpiredError as exc:
+            self._post(MSG_ZENITH_FL_ERROR, f"Session expired — sign in again. ({exc})")
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Zenith flight-loads run crashed")
+            self._post(MSG_ZENITH_FL_ERROR, f"{type(exc).__name__}: {exc}")
+            return
+
+        if not rows:
+            self._post(
+                MSG_ZENITH_FL_ERROR,
+                "No flights found for that date range (or the run was stopped).",
+            )
+            return
+
+        try:
+            excel_io.write_zenith_flight_loads(cfg["out_path"], rows)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Flight-loads Excel write failed")
+            self._post(MSG_ZENITH_FL_ERROR, f"Excel write failed: {exc}")
+            return
+        self._post(MSG_ZENITH_FL_DONE, str(cfg["out_path"]))
+
+    def _zenith_fl_stop(self) -> None:
+        self._zenith_fl_stop_flag.set()
+        self._zenith_fl_log("Stopping after current page finishes…")
+        self.btn_zenith_fl_stop.configure(state="disabled")
+
+    def _zenith_fl_reset_buttons(self) -> None:
+        self.btn_zenith_fl_run.configure(state="normal")
+        self.btn_zenith_fl_stop.configure(state="disabled")
 
 
 def _fmt_dur(seconds: float) -> str:

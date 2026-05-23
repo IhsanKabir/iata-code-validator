@@ -19,6 +19,7 @@ from .config import (
     OEP_OUTPUT_COLUMNS_DIVISION_SUMMARY,
     OEP_OUTPUT_COLUMNS_GENDER_SUMMARY,
     OUTPUT_COLUMNS,
+    ZENITH_FLIGHT_OUTPUT_COLUMNS,
     ZENITH_OUTPUT_COLUMNS,
 )
 from .parser import LookupResult
@@ -769,3 +770,49 @@ def build_zenith_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"zenith_customers_{timestamp}.xlsx"
+
+
+def write_zenith_flight_loads(path: Path, rows: Iterable) -> None:
+    """Write flight-load rows to a single flat Excel sheet.
+
+    `rows` is an iterable of zenith_client.FlightLoadRow.
+    Schema is one row per (flight, leg, cabin).
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Flight Loads"
+    ws.append(ZENITH_FLIGHT_OUTPUT_COLUMNS)
+    for r in rows:
+        ws.append([
+            r.flight_number,
+            r.day_of_week,
+            r.flight_date,
+            r.departure_time,
+            r.aircraft,
+            r.registration,
+            r.total_tickets_issued,
+            r.leg_route,
+            r.leg_origin,
+            r.leg_destination,
+            r.leg_local_time_range,
+            r.leg_cabin,
+            r.tickets_issued,
+            r.tickets_wl,
+            r.seats_confirmed,
+            r.seats_options,
+            r.seats_wl,
+            r.seats_available,
+            r.inventory_status,
+            r.comments,
+        ])
+    # Reasonable widths for the most-used columns.
+    widths = {1: 12, 3: 12, 8: 12, 11: 22, 18: 16, 19: 22}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    wb.save(path)
+
+
+def build_zenith_flight_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_flight_loads_{timestamp}.xlsx"

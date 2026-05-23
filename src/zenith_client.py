@@ -52,6 +52,13 @@ INIT_CONTEXT_URL = (
 CUSTOMER_LOOKUP_URL = (
     f"{BASE_URL}/TTIDOTNET/TRANSPORT/TRANSPORTNETBO2/SALES2/CustomerViews/FinalCustomer.ashx"
 )
+FLIGHT_LOAD_URL = f"{BASE_URL}/newui/aerien/commercial/Sale_ListeVols_NewStock.asp"
+
+# Server-side limit: max 10 pages of results per single search.
+# Combined with NbReponse=100, that's 1000 records per search — so we
+# chunk the user's date range to keep each search under that cap.
+FLIGHT_LOAD_MAX_PAGES = 10
+FLIGHT_LOAD_DEFAULT_PAGE_SIZE = 100
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -493,3 +500,342 @@ def fetch_many(
                         remaining.cancel()
                 break
     return results
+
+
+# ---------------------------------------------------------------------------
+# Flight Load (PNL) — date-range bulk pull
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FlightLoadRow:
+    """One leg row from the View PNLs report.
+
+    The output Excel writes one row per (flight, leg, cabin). Numeric
+    fields stay as strings here — we don't try to parse "152(0)" into
+    components; the consumer can split if needed. The Excel exporter
+    does the splitting for convenience.
+    """
+
+    flight_number: str
+    day_of_week: str
+    flight_date: str          # DD/MM/YYYY
+    departure_time: str       # HH:MM (flight start, from header)
+    aircraft: str             # "Boeing 737-800" — type only
+    registration: str         # "S2-AJE" — tail number
+    total_tickets_issued: str
+
+    leg_id_vol: str           # leg-level id (per route segment)
+    leg_route: str            # "SHJ-DAC"
+    leg_origin: str           # "SHJ"
+    leg_destination: str      # "DAC"
+    leg_local_time_range: str # "24/05/2026 01:30 - 08:05"
+    leg_cabin: str            # "Economy"
+
+    tickets_issued: str       # "152(0)" — issued + (0 hidden)
+    tickets_wl: str           # "0(0)"
+    seats_confirmed: str      # "[152]"
+    seats_options: str        # "0(0)"
+    seats_wl: str             # "[0]"
+    seats_available: str      # "13/410 97%"
+
+    inventory_status: str     # "AS-Flight open" / "Closed the 22/05/2026"
+    comments: str = ""
+
+
+# ---- regexes — anchored on stable structural markers ----
+
+_FLIGHT_HEADER_RE = re.compile(
+    # `BS308` is sometimes rendered as `BS<spaces>308` in the legacy markup,
+    # so we tolerate whitespace between the airline code and the number.
+    r'<b>(?P<airline>BS)\s*(?P<number>\d+)\s*-\s*'
+    r'<font[^>]+>(?P<dow>[A-Z][a-z]{2})\s+(?P<date>\d{2}/\d{2}/\d{4})'
+    r'&nbsp;(?P<time>\d{2}:\d{2})'
+    r'<font[^>]+>&nbsp;(?P<aircraft>[^<]+?)</font></b>'
+    r'\s*-\s*<b>(?P<tickets>\d+) Tickets issued</b>'
+)
+
+# A `<table ... data-table-leg ... data-id-vol="N">` opens a leg sub-block.
+_LEG_TABLE_RE = re.compile(
+    r'<table[^>]*data-table-leg[^>]*data-id-vol\s*=\s*"(?P<id>\d+)"[^>]*>'
+    r'(?P<inner>.*?)</table>',
+    re.DOTALL,
+)
+_BILLETS_TABLE_RE = re.compile(
+    r'<table[^>]*data-table-billets[^>]*data-id-vol\s*=\s*"(?P<id>\d+)"[^>]*>'
+    r'(?P<inner>.*?)</table>',
+    re.DOTALL,
+)
+_SEATS_TABLE_RE = re.compile(
+    r'<table[^>]*data-table-zs[^>]*data-id-vol\s*=\s*"(?P<id>\d+)"[^>]*>'
+    r'(?P<inner>.*?)</table>',
+    re.DOTALL,
+)
+# Inventory cell sits inside a table that carries the same data-id-vol.
+_INVENTORY_RE = re.compile(
+    r'<table[^>]*data-id-vol\s*=\s*"(?P<id>\d+)"[^>]*>'
+    r'.{0,1500}?inventorystatus[^>]*title\s*=\s*(?P<title>[^>]+?)\s*>',
+    re.DOTALL,
+)
+
+_ROUTE_RE = re.compile(r"<u>([A-Z]{3})-([A-Z]{3})</u>")
+_LOCAL_TIME_RE = re.compile(
+    r'<font color="blue">(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*-\s*\d{2}:\d{2})</font>'
+)
+_CABIN_RE = re.compile(r"Cabin.*?<nobr>([^<]+?)</nobr>", re.DOTALL)
+_FNT_TEXT_RE = re.compile(r'<font class="FNTListRow">\s*([^<]+?)\s*</font>')
+
+
+_REGISTRATION_RE = re.compile(r"\bS2-[A-Z]{2,4}\b")
+
+
+def _split_aircraft(text: str) -> tuple[str, str]:
+    """Split "Boeing 737-800 - S2-AJE" → ("Boeing 737-800", "S2-AJE").
+
+    Registration is anchored on the `S2-` prefix (US-Bangla tail
+    numbers), so this handles "ATR 72 - 600 - S2-AKJ" correctly too.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    m = _REGISTRATION_RE.search(text)
+    if not m:
+        return text, ""
+    registration = m.group(0)
+    aircraft = text[: m.start()].rstrip(" -")
+    return aircraft, registration
+
+
+# Each metric cell carries a stable CSS class on its <td>. We anchor on
+# the class and grab whatever sits inside the rightmost FNTListRow font.
+# Tags are unclosed in this legacy markup, so we don't try to balance.
+def _extract_cell(html: str, class_name: str) -> str:
+    """Pull the value text out of `<td class="TDListRow {class_name}">...</td>`.
+
+    Tolerant to unclosed font/div tags — strips tags conservatively from
+    whatever text follows the FNTListRow anchor up to the next `<td` or
+    `</tr>`.
+    """
+    pat = (
+        r'<td[^>]*class\s*=\s*"TDListRow ' + re.escape(class_name) + r'(?:[^"]*)"[^>]*>'
+        r'(?P<body>.*?)(?=<td\b|</tr>)'
+    )
+    m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    body = m.group("body")
+    # Take the LAST font block — earlier fonts wrap the label divs.
+    fonts = re.findall(
+        r'<font[^>]*class="FNTListRow"[^>]*>([^<]+)', body, re.DOTALL,
+    )
+    if fonts:
+        return re.sub(r"\s+", " ", fonts[-1]).strip()
+    # Fallback: strip tags entirely and trim.
+    text = re.sub(r"<[^>]+>", " ", body)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_billets_numbers(inner: str) -> tuple[str, str]:
+    """Pull (Issued, IssuedWL) from a billets sub-table."""
+    return _extract_cell(inner, "emis"), _extract_cell(inner, "emis-wl")
+
+
+def _extract_seats_numbers(inner: str) -> tuple[str, str, str, str]:
+    """Pull (Confirmed, Options, WL, Available) from a seats sub-table.
+
+    Available's cell carries an extra `reste` class, sometimes with a
+    typo'd `td-dispored reste` instead of `td-dispo reste` — match
+    either by anchoring on `reste`.
+    """
+    confirmed = _extract_cell(inner, "confirm")
+    options = _extract_cell(inner, "options")
+    wl = _extract_cell(inner, "wl")
+    # Available — accept any class containing "reste"
+    avail_m = re.search(
+        r'<td[^>]*class\s*=\s*"[^"]*\breste\b[^"]*"[^>]*>(.*?)(?=<td\b|</tr>)',
+        inner, re.DOTALL,
+    )
+    available = ""
+    if avail_m:
+        body = avail_m.group(1)
+        # Available text is inside the rightmost <font>; tags often unclosed
+        f = re.findall(r'<font[^>]*>([^<]+)', body)
+        available = re.sub(r"\s+", " ", f[-1]).strip() if f else ""
+    return confirmed, options, wl, available
+
+
+def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
+    """Parse a Sale_ListeVols_NewStock.asp response into flat leg rows."""
+    rows: list[FlightLoadRow] = []
+    headers = list(_FLIGHT_HEADER_RE.finditer(html))
+    if not headers:
+        return rows
+    boundaries = [m.start() for m in headers] + [len(html)]
+
+    for i, hdr in enumerate(headers):
+        block = html[boundaries[i] : boundaries[i + 1]]
+        aircraft_full = hdr.group("aircraft")
+        aircraft_type, registration = _split_aircraft(aircraft_full)
+        flight_number = f"{hdr.group('airline')}{hdr.group('number')}"
+
+        # Build lookup tables keyed by id_vol for billets, seats, inventory.
+        billets = {m.group("id"): m.group("inner") for m in _BILLETS_TABLE_RE.finditer(block)}
+        seats = {m.group("id"): m.group("inner") for m in _SEATS_TABLE_RE.finditer(block)}
+        invs = {m.group("id"): m.group("title").strip() for m in _INVENTORY_RE.finditer(block)}
+
+        # Walk legs in markup order so the Excel preserves DAC-XXX before XXX-DAC etc.
+        for leg in _LEG_TABLE_RE.finditer(block):
+            id_vol = leg.group("id")
+            leg_inner = leg.group("inner")
+            route_m = _ROUTE_RE.search(leg_inner)
+            time_m = _LOCAL_TIME_RE.search(leg_inner)
+            cabin_m = _CABIN_RE.search(leg_inner)
+            route = f"{route_m.group(1)}-{route_m.group(2)}" if route_m else ""
+            origin = route_m.group(1) if route_m else ""
+            destination = route_m.group(2) if route_m else ""
+            local_time = time_m.group(1).strip() if time_m else ""
+            cabin = cabin_m.group(1).strip() if cabin_m else ""
+
+            issued, ticket_wl = _extract_billets_numbers(billets.get(id_vol, ""))
+            confirmed, options, seat_wl, available = _extract_seats_numbers(
+                seats.get(id_vol, "")
+            )
+            # Inventory title can be quoted "AS-Flight open" or bare AS-Flight open
+            inv = invs.get(id_vol, "").strip('"\'')
+
+            rows.append(FlightLoadRow(
+                flight_number=flight_number,
+                day_of_week=hdr.group("dow"),
+                flight_date=hdr.group("date"),
+                departure_time=hdr.group("time"),
+                aircraft=aircraft_type,
+                registration=registration,
+                total_tickets_issued=hdr.group("tickets"),
+                leg_id_vol=id_vol,
+                leg_route=route,
+                leg_origin=origin,
+                leg_destination=destination,
+                leg_local_time_range=local_time,
+                leg_cabin=cabin,
+                tickets_issued=issued,
+                tickets_wl=ticket_wl,
+                seats_confirmed=confirmed,
+                seats_options=options,
+                seats_wl=seat_wl,
+                seats_available=available,
+                inventory_status=inv,
+            ))
+    return rows
+
+
+def iter_date_chunks(
+    date_from: str, date_to: str, chunk_days: int,
+) -> Iterable[tuple[str, str]]:
+    """Yield (from, to) DD/MM/YYYY pairs covering [date_from, date_to].
+
+    Dates are inclusive on both ends. The chunking keeps each fetch under
+    the server's 10-page cap (page_size × 10 records per chunk maximum).
+    """
+    from datetime import datetime, timedelta
+    d_from = datetime.strptime(date_from, "%d/%m/%Y").date()
+    d_to = datetime.strptime(date_to, "%d/%m/%Y").date()
+    if d_to < d_from:
+        return
+    cursor = d_from
+    while cursor <= d_to:
+        end = min(cursor + timedelta(days=chunk_days - 1), d_to)
+        yield cursor.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
+        cursor = end + timedelta(days=1)
+
+
+def fetch_flight_loads(
+    session: ZenithSession,
+    date_from: str,
+    date_to: str,
+    *,
+    page_size: int = FLIGHT_LOAD_DEFAULT_PAGE_SIZE,
+    chunk_days: int = 10,
+    inter_call_delay_s: float = 1.0,
+    progress_cb: Callable[[str, int, int, int], None] | None = None,
+    stop_event: threading.Event | None = None,
+    timeout_s: float = 60.0,
+) -> list[FlightLoadRow]:
+    """Pull all flight-load rows in [date_from, date_to] (DD/MM/YYYY).
+
+    Auto-chunks the date range to stay under the server's 10-page cap.
+    Within each chunk, paginates until the page returns fewer than
+    page_size flight headers (= last page reached) or the cap is hit.
+
+    progress_cb signature: (chunk_label, completed_chunks, total_chunks, rows_so_far)
+    """
+    chunks = list(iter_date_chunks(date_from, date_to, chunk_days))
+    total_chunks = len(chunks)
+    all_rows: list[FlightLoadRow] = []
+
+    for chunk_idx, (cfrom, cto) in enumerate(chunks, start=1):
+        if stop_event is not None and stop_event.is_set():
+            break
+        chunk_label = f"{cfrom} → {cto}"
+        log.info("Zenith flight-loads chunk %s (page_size=%d)", chunk_label, page_size)
+
+        chunk_rows: list[FlightLoadRow] = []
+        for page in range(1, FLIGHT_LOAD_MAX_PAGES + 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            url = f"{FLIGHT_LOAD_URL}?Nav={page}"
+            data = {
+                "hidAction": "aff",
+                "idVol": "", "ID_Vol": "", "idLeg": "", "idProgVol": "",
+                "idvol_toggle": "", "toggleCodeStatusVolGDS": "",
+                "BoolAffCriteresGDS": "", "PrgVol_Numero": "",
+                "date_depart_vol": cfrom,
+                "date_fin_vol": cto,
+                "CodeISOAeroDep": "", "CodeISOAeroArr": "",
+                "HeureLocale": "HeureLocaleOK",
+                "DisplayOppositeLeg": "DisplayOppositeLeg",
+                "NbReponse": str(page_size),
+                "DayTime": "",
+                "VolsOuverts": "VolsOuverts",
+                "ID_ETATVOL": "",
+            }
+            try:
+                resp = session.session.post(
+                    url, data=data, timeout=timeout_s, allow_redirects=True,
+                )
+            except requests.RequestException as exc:
+                raise ZenithError(
+                    f"Network error on chunk {chunk_label} page {page}: {exc}"
+                ) from exc
+            if resp.status_code in (401, 403) or "/otds/" in resp.url:
+                raise SessionExpiredError(
+                    f"Zenith returned {resp.status_code} on flight-loads — "
+                    "session expired, please re-login."
+                )
+            if resp.status_code in (429, 503):
+                log.warning("Zenith rate limited on page %d — sleeping 10s", page)
+                time.sleep(10.0)
+                continue
+            resp.raise_for_status()
+
+            page_rows = parse_flight_loads_html(resp.text)
+            chunk_rows.extend(page_rows)
+            # If fewer flight HEADERS than page_size, we're on the last page.
+            # Count distinct flight headers because each flight can have multiple legs.
+            distinct_flights = len({(r.flight_number, r.flight_date) for r in page_rows})
+            log.info(
+                "  page %d: %d rows, %d distinct flights",
+                page, len(page_rows), distinct_flights,
+            )
+            if distinct_flights < page_size:
+                break
+            if inter_call_delay_s > 0 and page < FLIGHT_LOAD_MAX_PAGES:
+                time.sleep(inter_call_delay_s)
+
+        all_rows.extend(chunk_rows)
+        if progress_cb:
+            try:
+                progress_cb(chunk_label, chunk_idx, total_chunks, len(all_rows))
+            except Exception:  # noqa: BLE001 — never let callback kill the run
+                log.exception("flight-load progress callback raised")
+        # Polite gap between chunks
+        if inter_call_delay_s > 0 and chunk_idx < total_chunks:
+            time.sleep(inter_call_delay_s)
+    return all_rows
