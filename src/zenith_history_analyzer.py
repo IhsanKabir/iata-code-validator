@@ -32,6 +32,11 @@ from .zenith_history_parser import (
     downgrade_severity,
     is_downgrade,
 )
+from .zenith_loads_index import (
+    VERDICT_UNKNOWN,
+    LoadLookup,
+    load_verdict,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +124,32 @@ class SuspiciousFlag:
     severity: str                           # 'low' / 'medium' / 'high'
 
 
+@dataclass(frozen=True)
+class DowngradeJustification:
+    """A downgrade event + the flight's load% at the time → verdict.
+
+    Only emitted when a Flight Loads Excel is supplied to the audit.
+    `load_pct = None` means we had loads data but couldn't match this
+    flight (so the verdict is UNKNOWN).
+    """
+
+    timestamp: datetime | None
+    agent_user_id: str
+    agent_display_name: str
+    pnr: str
+    passenger: str
+    flight_number: str
+    flight_date: str
+    route: str                              # 'DAC-DXB'
+    old_class: str
+    new_class: str
+    severity: int                           # number of fare tiers dropped
+    load_pct: float | None                  # None = no matching load row
+    seats_capacity: int | None
+    inventory_status: str
+    verdict: str                            # QUESTIONABLE / SITUATIONAL / JUSTIFIED / UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # Combined report container
 # ---------------------------------------------------------------------------
@@ -142,6 +173,8 @@ class HistoryAuditReport:
     agent_activity: list[AgentActivityRow]
     revenue_mgmt_changes: list[RevenueMgmtChange]
     suspicious_flags: list[SuspiciousFlag]
+    # Empty unless a Flight Loads Excel was provided to run_history_audit.
+    downgrade_justifications: list[DowngradeJustification] = field(default_factory=list)
 
     # Pass-throughs that the Excel writer wants for the Raw Events sheet.
     # We keep this last because it can be huge.
@@ -434,6 +467,69 @@ def audit_suspicious(
     return flags
 
 
+def audit_downgrade_justification(
+    events: Iterable[HistoryEvent],
+    load_lookup: LoadLookup,
+) -> list[DowngradeJustification]:
+    """For every class downgrade, join the flight's load% + verdict.
+
+    A downgrade on a 95%-full flight is hard to justify on revenue
+    grounds; on a 30%-full flight it's a reasonable load-management
+    move. This audit surfaces the imbalance.
+    """
+    out: list[DowngradeJustification] = []
+    by_pnr: dict[str, list[HistoryEvent]] = defaultdict(list)
+    for e in events:
+        if e.pnr and e.rbd_class:
+            by_pnr[e.pnr].append(e)
+
+    for pnr, evs in by_pnr.items():
+        evs_sorted = sorted(evs, key=lambda e: e.timestamp or datetime.min)
+        for prev, curr in zip(evs_sorted, evs_sorted[1:]):
+            if not is_downgrade(prev.rbd_class, curr.rbd_class):
+                continue
+            entry = load_lookup.find(
+                curr.flight.flight_number,
+                curr.flight.flight_date,
+                curr.flight.origin,
+                curr.flight.destination,
+            )
+            load_pct = entry.load_pct if entry else None
+            verdict = load_verdict(load_pct)
+            route = (
+                f"{curr.flight.origin}-{curr.flight.destination}"
+                if curr.flight.origin and curr.flight.destination else ""
+            )
+            out.append(DowngradeJustification(
+                timestamp=curr.timestamp,
+                agent_user_id=curr.agent.user_id,
+                agent_display_name=curr.agent.display_name,
+                pnr=pnr,
+                passenger=curr.passenger,
+                flight_number=curr.flight.flight_number,
+                flight_date=curr.flight.flight_date,
+                route=route,
+                old_class=prev.rbd_class,
+                new_class=curr.rbd_class,
+                severity=downgrade_severity(prev.rbd_class, curr.rbd_class),
+                load_pct=load_pct,
+                seats_capacity=entry.seats_capacity if entry else None,
+                inventory_status=entry.inventory_status if entry else "",
+                verdict=verdict,
+            ))
+    # Most questionable first (high load + steep severity).
+    verdict_rank = {
+        "QUESTIONABLE": 0, "SITUATIONAL": 1,
+        "JUSTIFIED": 2, "UNKNOWN": 3,
+    }
+    out.sort(key=lambda d: (
+        verdict_rank.get(d.verdict, 9),
+        -(d.load_pct if d.load_pct is not None else -1),
+        -d.severity,
+    ))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Top-level audit composer
 # ---------------------------------------------------------------------------
@@ -443,6 +539,7 @@ def run_history_audit(
     events: Iterable[HistoryEvent],
     *,
     include_raw: bool = True,
+    load_lookup: LoadLookup | None = None,
 ) -> HistoryAuditReport:
     """Run every audit in one pass and return the bundled report."""
     events = list(events)
@@ -475,6 +572,15 @@ def run_history_audit(
     activity = audit_agent_activity(events)
     rm_changes = audit_revenue_mgmt(events)
     flags = audit_suspicious(events, trajectories)
+    justifications: list[DowngradeJustification] = []
+    if load_lookup is not None:
+        justifications = audit_downgrade_justification(events, load_lookup)
+        log.info(
+            "Downgrade justification: %d rows; verdicts=%s",
+            len(justifications),
+            {v: sum(1 for d in justifications if d.verdict == v)
+             for v in ("QUESTIONABLE", "SITUATIONAL", "JUSTIFIED", "UNKNOWN")},
+        )
 
     return HistoryAuditReport(
         file_count=len(files),
@@ -488,5 +594,6 @@ def run_history_audit(
         agent_activity=activity,
         revenue_mgmt_changes=rm_changes,
         suspicious_flags=flags,
+        downgrade_justifications=justifications,
         raw_events=events if include_raw else [],
     )

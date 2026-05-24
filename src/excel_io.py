@@ -961,6 +961,32 @@ def write_zenith_history_audit(path: Path, report) -> None:
             f.pnr, f.passenger, f.flight_number, f.event_type, f.reason,
         ])
 
+    # ----- Downgrade Justification -----
+    # Only created when a Flight Loads Excel was passed in. Lets the
+    # auditor answer: "was the fare reduction logical given the load?"
+    if report.downgrade_justifications:
+        ws = wb.create_sheet("Downgrade Justification")
+        ws.append([
+            "Verdict", "Load %", "Capacity",
+            "Timestamp", "Agent User ID", "Display Name",
+            "PNR", "Passenger",
+            "Flight", "Flight Date", "Route",
+            "Old Class", "New Class", "Severity",
+            "Inventory Status",
+        ])
+        for j in report.downgrade_justifications:
+            ws.append([
+                j.verdict,
+                j.load_pct if j.load_pct is not None else "",
+                j.seats_capacity if j.seats_capacity is not None else "",
+                j.timestamp.strftime("%Y-%m-%d %H:%M") if j.timestamp else "",
+                j.agent_user_id, j.agent_display_name,
+                j.pnr, j.passenger,
+                j.flight_number, j.flight_date, j.route,
+                j.old_class, j.new_class, j.severity,
+                j.inventory_status,
+            ])
+
     # ----- Raw Events (always last; can be enormous) -----
     ws = wb.create_sheet("Raw Events")
     ws.append([

@@ -37,7 +37,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import (
     __version__, auth, config, excel_io, oep_client, oep_presets,
     updater, zenith_client, zenith_history_analyzer, zenith_history_downloader,
-    zenith_history_parser,
+    zenith_history_parser, zenith_loads_index,
 )
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
@@ -3309,6 +3309,18 @@ class App:
         )
         self._form_row(io_body, 1, "Output folder:", output_entry, suffix=output_btn)
 
+        # Optional Flight Loads Excel — when provided, enriches the audit
+        # with a "Downgrade Justification" sheet (was the fare cut justified
+        # by low load, or was it on an already-full flight?).
+        self.zenith_fh_loads_path = tk.StringVar(value="")
+        loads_entry = ttk.Entry(io_body, textvariable=self.zenith_fh_loads_path)
+        loads_btn = ttk.Button(
+            io_body, text="Browse…", command=self._zenith_fh_pick_loads,
+        )
+        self._form_row(
+            io_body, 2, "Flight Loads (optional):", loads_entry, suffix=loads_btn,
+        )
+
         # ----- Controls -----
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -3368,6 +3380,15 @@ class App:
         if d:
             self.zenith_fh_input_dir.set(d)
 
+    def _zenith_fh_pick_loads(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Pick a Flight Loads Excel exported by this app",
+            initialdir=str(Path.home() / "Documents"),
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+        )
+        if f:
+            self.zenith_fh_loads_path.set(f)
+
     def _zenith_fh_pick_output(self) -> None:
         d = filedialog.askdirectory(
             title="Pick the output folder",
@@ -3398,6 +3419,8 @@ class App:
         self.zenith_fh_status_label.configure(text="Parsing files…")
         self.zenith_fh_progress.configure(value=0, maximum=1)
 
+        loads_path = self.zenith_fh_loads_path.get().strip()
+
         def worker() -> None:
             try:
                 events: list = []
@@ -3409,8 +3432,16 @@ class App:
                     folder, progress_cb=progress,
                 ))
                 self._post(MSG_ZENITH_FH_PARSED, len(events))
+
+                load_lookup = None
+                if loads_path:
+                    self._post(MSG_ZENITH_FH_PROGRESS,
+                               (1, 1, f"Loading {Path(loads_path).name}…"))
+                    entries = zenith_loads_index.read_flight_loads_excel(loads_path)
+                    load_lookup = zenith_loads_index.LoadLookup.from_entries(entries)
+
                 report = zenith_history_analyzer.run_history_audit(
-                    events, include_raw=True,
+                    events, include_raw=True, load_lookup=load_lookup,
                 )
                 self._post(MSG_ZENITH_FH_DONE, report)
             except Exception as exc:  # noqa: BLE001 — surface to UI
@@ -3459,6 +3490,14 @@ class App:
                     label[:80],
                     f"{d.total_severity} sev / {d.downgrade_event_count} events",
                 ))
+        if report.downgrade_justifications:
+            from collections import Counter
+            counts = Counter(j.verdict for j in report.downgrade_justifications)
+            tree.insert("", "end", values=("", ""))
+            tree.insert("", "end", values=("Downgrade verdicts (load-aware)", ""))
+            for v in ("QUESTIONABLE", "SITUATIONAL", "JUSTIFIED", "UNKNOWN"):
+                if counts.get(v):
+                    tree.insert("", "end", values=(f"  · {v}", f"{counts[v]:,}"))
 
     def _zenith_fh_export(self) -> None:
         if self._zenith_fh_last_report is None:
