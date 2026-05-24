@@ -614,9 +614,12 @@ def _extract_cell(html: str, class_name: str) -> str:
     whatever text follows the FNTListRow anchor up to the next `<td` or
     `</tr>`.
     """
+    # Allow end-of-string as a cell boundary too — the per-stop TR
+    # captures used in multi-stop flights don't include the closing
+    # `</tr>`, so the LAST cell in a row had no terminator before.
     pat = (
         r'<td[^>]*class\s*=\s*"TDListRow ' + re.escape(class_name) + r'(?:[^"]*)"[^>]*>'
-        r'(?P<body>.*?)(?=<td\b|</tr>)'
+        r'(?P<body>.*?)(?=<td\b|</tr>|\Z)'
     )
     m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
     if not m:
@@ -648,9 +651,10 @@ def _extract_seats_numbers(inner: str) -> tuple[str, str, str, str]:
     confirmed = _extract_cell(inner, "confirm")
     options = _extract_cell(inner, "options")
     wl = _extract_cell(inner, "wl")
-    # Available — accept any class containing "reste"
+    # Available — accept any class containing "reste". End-of-string is
+    # a valid cell terminator for the same reason as `_extract_cell`.
     avail_m = re.search(
-        r'<td[^>]*class\s*=\s*"[^"]*\breste\b[^"]*"[^>]*>(.*?)(?=<td\b|</tr>)',
+        r'<td[^>]*class\s*=\s*"[^"]*\breste\b[^"]*"[^>]*>(.*?)(?=<td\b|</tr>|\Z)',
         inner, re.DOTALL,
     )
     available = ""
@@ -662,8 +666,39 @@ def _extract_seats_numbers(inner: str) -> tuple[str, str, str, str]:
     return confirmed, options, wl, available
 
 
+_INFO_TR_RE = re.compile(
+    r'<tr\s+class\s*=\s*"info"[^>]*>(?P<inner>.*?)</tr>',
+    re.DOTALL | re.IGNORECASE,
+)
+_BILLETS_TR_RE = re.compile(
+    r'<tr\s+class\s*=\s*"billets"[^>]*>(?P<inner>.*?)</tr>',
+    re.DOTALL | re.IGNORECASE,
+)
+_SIEGES_TR_RE = re.compile(
+    r'<tr\s+class\s*=\s*"sieges"[^>]*>(?P<inner>.*?)</tr>',
+    re.DOTALL | re.IGNORECASE,
+)
+# Inventory CELL (vs the wider _INVENTORY_RE that anchors on the parent
+# table). Match each cell directly so multi-stop flights with multiple
+# inventory cells in the same parent table all surface. The marker
+# `inventorystatus` shows up either as an attribute (`inventorystatus="AS"`)
+# in real Zenith markup or as a class (`class="inventorystatus"`) in test
+# fixtures — match both by anchoring loosely.
+_INVENTORY_CELL_RE = re.compile(
+    r'inventorystatus[^>]{0,500}?title\s*=\s*(?P<title>[^>]+?)\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
-    """Parse a Sale_ListeVols_NewStock.asp response into flat leg rows."""
+    """Parse a Sale_ListeVols_NewStock.asp response into flat leg rows.
+
+    Multi-stop flights emit one row per stop. The legacy markup uses a
+    single `data-table-leg` table per flight that contains N
+    `<tr class="info">` rows (one per stop), with matching `<tr
+    class="billets">` and `<tr class="sieges">` rows in the sibling
+    tables. We walk these row-by-row and pair them up by position.
+    """
     rows: list[FlightLoadRow] = []
     headers = list(_FLIGHT_HEADER_RE.finditer(html))
     if not headers:
@@ -676,30 +711,55 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
         aircraft_type, registration = _split_aircraft(aircraft_full)
         flight_number = f"{hdr.group('airline')}{hdr.group('number')}"
 
-        # Build lookup tables keyed by id_vol for billets, seats, inventory.
-        billets = {m.group("id"): m.group("inner") for m in _BILLETS_TABLE_RE.finditer(block)}
-        seats = {m.group("id"): m.group("inner") for m in _SEATS_TABLE_RE.finditer(block)}
-        invs = {m.group("id"): m.group("title").strip() for m in _INVENTORY_RE.finditer(block)}
+        # Capture each table's inner content (single per flight even for
+        # multi-stop), then split into per-stop rows.
+        leg_inner = _first_inner(_LEG_TABLE_RE, block)
+        billets_inner = _first_inner(_BILLETS_TABLE_RE, block)
+        seats_inner = _first_inner(_SEATS_TABLE_RE, block)
 
-        # Walk legs in markup order so the Excel preserves DAC-XXX before XXX-DAC etc.
-        for leg in _LEG_TABLE_RE.finditer(block):
-            id_vol = leg.group("id")
-            leg_inner = leg.group("inner")
-            route_m = _ROUTE_RE.search(leg_inner)
-            time_m = _LOCAL_TIME_RE.search(leg_inner)
-            cabin_m = _CABIN_RE.search(leg_inner)
+        # The `<tr class="info">` rows in the leg table drive the count.
+        # Skip the leg-table HEADER row (no <u>route</u>, no time data).
+        info_rows = [m.group("inner") for m in _INFO_TR_RE.finditer(leg_inner)]
+        if not info_rows:
+            # Fallback to the old single-leg shape (no <tr class="info"> wrapper).
+            info_rows = [leg_inner]
+
+        billets_rows = [m.group("inner") for m in _BILLETS_TR_RE.finditer(billets_inner)]
+        sieges_rows = [m.group("inner") for m in _SIEGES_TR_RE.finditer(seats_inner)]
+        # Inventory cells repeat once per stop and live in their own
+        # mini-tables. They share the parent's data-id-vol so we can't
+        # match by id_vol — walk them in source order and pair by index.
+        inv_cells = [
+            _strip_inv_title(m.group("title"))
+            for m in _INVENTORY_CELL_RE.finditer(block)
+        ]
+
+        # The id_vol still comes from the leg-table tag (used as the
+        # row's stable key in the cache and across re-runs).
+        leg_table_match = _LEG_TABLE_RE.search(block)
+        flight_id_vol = leg_table_match.group("id") if leg_table_match else ""
+
+        for stop_idx, leg_row in enumerate(info_rows):
+            route_m = _ROUTE_RE.search(leg_row)
+            time_m = _LOCAL_TIME_RE.search(leg_row)
+            cabin_m = _CABIN_RE.search(leg_row)
             route = f"{route_m.group(1)}-{route_m.group(2)}" if route_m else ""
             origin = route_m.group(1) if route_m else ""
             destination = route_m.group(2) if route_m else ""
             local_time = time_m.group(1).strip() if time_m else ""
             cabin = cabin_m.group(1).strip() if cabin_m else ""
 
-            issued, ticket_wl = _extract_billets_numbers(billets.get(id_vol, ""))
-            confirmed, options, seat_wl, available = _extract_seats_numbers(
-                seats.get(id_vol, "")
-            )
-            # Inventory title can be quoted "AS-Flight open" or bare AS-Flight open
-            inv = invs.get(id_vol, "").strip('"\'')
+            # Skip header rows that have no extractable data — happens when
+            # Zenith puts a label-only row at the top of the leg table.
+            if not route and not local_time:
+                continue
+
+            billets_row = billets_rows[stop_idx] if stop_idx < len(billets_rows) else ""
+            sieges_row = sieges_rows[stop_idx] if stop_idx < len(sieges_rows) else ""
+            issued, ticket_wl = _extract_billets_numbers(billets_row)
+            confirmed, options, seat_wl, available = _extract_seats_numbers(sieges_row)
+
+            inv_title = inv_cells[stop_idx] if stop_idx < len(inv_cells) else ""
 
             rows.append(FlightLoadRow(
                 flight_number=flight_number,
@@ -709,7 +769,7 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
                 aircraft=aircraft_type,
                 registration=registration,
                 total_tickets_issued=hdr.group("tickets"),
-                leg_id_vol=id_vol,
+                leg_id_vol=flight_id_vol,
                 leg_route=route,
                 leg_origin=origin,
                 leg_destination=destination,
@@ -721,9 +781,20 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
                 seats_options=options,
                 seats_wl=seat_wl,
                 seats_available=available,
-                inventory_status=inv,
+                inventory_status=inv_title,
             ))
     return rows
+
+
+def _first_inner(table_re: re.Pattern, block: str) -> str:
+    """Return the inner content of the first table matching `table_re`."""
+    m = table_re.search(block)
+    return m.group("inner") if m else ""
+
+
+def _strip_inv_title(raw: str) -> str:
+    """Inventory cell title can be quoted or bare. Normalise to bare text."""
+    return raw.strip().strip('"\'').strip()
 
 
 def iter_date_chunks(

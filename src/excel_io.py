@@ -987,6 +987,28 @@ def write_zenith_history_audit(path: Path, report) -> None:
                 j.inventory_status,
             ])
 
+    # ----- PNR Routes (only when PNR enrichment was run) -----
+    if report.pnr_routes:
+        ws = wb.create_sheet("PNR Routes")
+        ws.append([
+            "PNR", "Customer", "Traveler Surname", "Phone",
+            "PNR Status", "Pax", "Payment Method",
+            "Booked Route", "Flown Route",
+            "Segments", "Flown", "Refunded", "Voided", "Other",
+            "Total Amount", "Currency",
+            "Segments Detail",
+        ])
+        for r in report.pnr_routes:
+            ws.append([
+                r.pnr_code, r.customer_name, r.traveler_surname, r.phone,
+                r.pnr_status, r.pax_count, r.payment_method,
+                r.booked_route, r.flown_route,
+                r.segment_count, r.flown_count, r.refunded_count,
+                r.voided_count, r.other_status_count,
+                r.total_amount, r.currency,
+                r.segments_summary,
+            ])
+
     # ----- Raw Events (always last; can be enormous) -----
     ws = wb.create_sheet("Raw Events")
     ws.append([
@@ -1015,3 +1037,168 @@ def build_zenith_history_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"zenith_history_audit_{timestamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Zenith Bulk PNR Lookup
+# ---------------------------------------------------------------------------
+
+
+# Header layout for the standalone PNR-lookup Excel output. The
+# segments column is a compact human-scannable summary; the per-segment
+# detail rows are in a second sheet for power users.
+ZENITH_PNR_BULK_COLUMNS = [
+    "PNR", "Status", "Customer", "Traveler Surname", "Phone",
+    "Payment Method", "Pax",
+    "Booked Route", "Flown Route",
+    "Segments", "Flown", "Refunded", "Voided",
+    "Total Amount", "Currency",
+    "Segments Detail", "Lookup Status", "Error",
+]
+
+
+def read_pnr_codes_from_excel(
+    path: Path,
+    *,
+    sheet_name: str | None = None,
+    column_name: str | None = None,
+) -> list[str]:
+    """Read a column of PNR codes from a user-provided Excel.
+
+    If `column_name` is given we look it up by header; otherwise we take
+    the first non-empty column. Empty rows and the header itself are
+    skipped. PNR codes are upper-cased.
+    """
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+    rows = ws.iter_rows(values_only=True)
+    try:
+        header = list(next(rows))
+    except StopIteration:
+        wb.close()
+        return []
+
+    col_idx: int | None = None
+    if column_name:
+        for i, h in enumerate(header):
+            if h is not None and str(h).strip().lower() == column_name.strip().lower():
+                col_idx = i
+                break
+    if col_idx is None:
+        col_idx = 0
+
+    out: list[str] = []
+    for row in rows:
+        if col_idx >= len(row):
+            continue
+        val = row[col_idx]
+        if val is None:
+            continue
+        code = str(val).strip().upper()
+        if code:
+            out.append(code)
+    wb.close()
+    return out
+
+
+def write_zenith_pnr_bulk(
+    path: Path,
+    results: list,
+    *,
+    errors: dict[str, str] | None = None,
+) -> None:
+    """Write the bulk PNR lookup output workbook.
+
+    `results` is a list of (pnr_code, PNRDetails or None) tuples in the
+    user's input order. `errors` maps PNR → human-readable failure when
+    the lookup didn't return details.
+
+    Sheets:
+      "PNR Lookup"      — one row per PNR (summary view)
+      "Segments"        — one row per segment (PNR repeated; pivot-ready)
+    """
+    errors = errors or {}
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "PNR Lookup"
+    ws.append(ZENITH_PNR_BULK_COLUMNS)
+
+    seg_ws = wb.create_sheet("Segments")
+    seg_ws.append([
+        "PNR", "Direction", "Leg", "RBD Class", "Fare Basis",
+        "Coupon Status", "Departure", "Arrival", "Aircraft",
+        "Price Ex-Tax", "Price All-Tax", "Ticket Number", "Passenger",
+    ])
+
+    for code, details in results:
+        if details is None:
+            ws.append([
+                code, "", "", "", "", "", "",
+                "", "",
+                "", "", "", "",
+                "", "",
+                "",
+                "NOT_FOUND" if code not in errors else "ERROR",
+                errors.get(code, "PNR not resolved"),
+            ])
+            continue
+        not_flown_keys = {"voided", "refunded", "cancelled", "canceled", "no show"}
+        flown = sum(
+            1 for s in details.segments
+            if s.coupon_status and s.coupon_status.lower() not in not_flown_keys
+        )
+        refunded = sum(1 for s in details.segments if s.coupon_status.lower() == "refunded")
+        voided = sum(1 for s in details.segments if s.coupon_status.lower() == "voided")
+        seg_summary = " ; ".join(
+            f"{s.leg_route or '?'}/{s.rbd_class or '?'}/"
+            f"{s.coupon_status or '?'}/{s.price_ttc or '?'}"
+            for s in details.segments
+        )
+        ws.append([
+            details.pnr_code,
+            details.pnr_status,
+            details.customer_name,
+            details.traveler_surname,
+            details.phone,
+            details.payment_method,
+            details.pax_count,
+            details.booked_route,
+            details.flown_route,
+            len(details.segments),
+            flown,
+            refunded,
+            voided,
+            details.total_amount,
+            details.currency,
+            seg_summary,
+            "OK",
+            "",
+        ])
+        for s in details.segments:
+            seg_ws.append([
+                details.pnr_code,
+                s.leg_direction,
+                s.leg_route,
+                s.rbd_class,
+                s.fare_basis,
+                s.coupon_status,
+                s.departure_text,
+                s.arrival_text,
+                s.aircraft,
+                s.price_ht,
+                s.price_ttc,
+                s.ticket_number,
+                s.passenger,
+            ])
+
+    # Column widths tuned for the headline columns.
+    widths = {1: 10, 3: 22, 4: 18, 5: 16, 8: 18, 9: 18, 14: 14, 16: 40}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    wb.save(path)
+
+
+def build_zenith_pnr_bulk_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_pnr_lookup_{timestamp}.xlsx"

@@ -37,6 +37,7 @@ from .zenith_loads_index import (
     LoadLookup,
     load_verdict,
 )
+from .zenith_pnr_client import PNRDetails, PNRSegment
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +126,36 @@ class SuspiciousFlag:
 
 
 @dataclass(frozen=True)
+class PNRRouteRow:
+    """One PNR's full booking — used for the 'correct route' audit.
+
+    Replaces the per-leg row that the History file gives us with the
+    PNR's complete route plus per-segment status, so the auditor can
+    see "DAC-SIN-DAC booked, only DAC-SIN flown, SIN-DAC refunded".
+    """
+
+    pnr_code: str
+    customer_name: str
+    traveler_surname: str
+    phone: str
+    pnr_status: str
+    pax_count: int
+    booked_route: str        # 'DAC-SIN-DAC'
+    flown_route: str         # 'DAC-SIN' if return refunded; '' if all voided
+    segment_count: int
+    flown_count: int
+    refunded_count: int
+    voided_count: int
+    other_status_count: int
+    total_amount: str        # raw '99,325 BDT'
+    currency: str
+    payment_method: str
+    # Compact per-segment summary for human scanning. Each entry shaped
+    # like 'DAC-SIN/S/Flown/29,884 BDT'.
+    segments_summary: str
+
+
+@dataclass(frozen=True)
 class DowngradeJustification:
     """A downgrade event + the flight's load% at the time → verdict.
 
@@ -175,6 +206,10 @@ class HistoryAuditReport:
     suspicious_flags: list[SuspiciousFlag]
     # Empty unless a Flight Loads Excel was provided to run_history_audit.
     downgrade_justifications: list[DowngradeJustification] = field(default_factory=list)
+
+    # Empty unless PNR enrichment was run after the initial audit.
+    # Use `apply_pnr_enrichment` to populate.
+    pnr_routes: list[PNRRouteRow] = field(default_factory=list)
 
     # Pass-throughs that the Excel writer wants for the Raw Events sheet.
     # We keep this last because it can be huge.
@@ -465,6 +500,129 @@ def audit_suspicious(
         )
     )
     return flags
+
+
+def build_pnr_routes(
+    pnr_details: dict[str, PNRDetails],
+) -> list[PNRRouteRow]:
+    """Roll up enriched PNR data into route-audit rows.
+
+    One row per PNR. Sorted so PNRs with the most refund/void activity
+    surface first (those are the ones whose route reporting from the
+    raw history is most misleading).
+    """
+    from collections import Counter
+
+    not_flown = {"voided", "refunded", "cancelled", "canceled", "no show"}
+    rows: list[PNRRouteRow] = []
+    for code, d in pnr_details.items():
+        statuses = Counter(s.coupon_status for s in d.segments)
+        flown = sum(
+            c for st, c in statuses.items()
+            if st.lower() not in not_flown and st != ""
+        )
+        refunded = sum(c for st, c in statuses.items() if st.lower() == "refunded")
+        voided = sum(c for st, c in statuses.items() if st.lower() == "voided")
+        cancelled_other = sum(
+            c for st, c in statuses.items()
+            if st.lower() in {"cancelled", "canceled", "no show"}
+        )
+        other_status_count = cancelled_other
+        # Compact summary: 'DAC-SIN/S/Flown/29,884 BDT ; SIN-DAC/M/Refunded/69,441 BDT'
+        parts = [
+            f"{s.leg_route or '?'}/{s.rbd_class or '?'}/"
+            f"{s.coupon_status or '?'}/{s.price_ttc or '?'}"
+            for s in d.segments
+        ]
+        rows.append(PNRRouteRow(
+            pnr_code=code,
+            customer_name=d.customer_name,
+            traveler_surname=d.traveler_surname,
+            phone=d.phone,
+            pnr_status=d.pnr_status,
+            pax_count=d.pax_count,
+            booked_route=d.booked_route,
+            flown_route=d.flown_route,
+            segment_count=len(d.segments),
+            flown_count=flown,
+            refunded_count=refunded,
+            voided_count=voided,
+            other_status_count=other_status_count,
+            total_amount=d.total_amount,
+            currency=d.currency,
+            payment_method=d.payment_method,
+            segments_summary=" ; ".join(parts),
+        ))
+    # Sort: most-disrupted PNRs first (refunds + voids), then by segment count.
+    rows.sort(
+        key=lambda r: (-(r.refunded_count + r.voided_count), -r.segment_count),
+    )
+    return rows
+
+
+def apply_pnr_enrichment(
+    report: HistoryAuditReport,
+    pnr_details: dict[str, PNRDetails],
+) -> HistoryAuditReport:
+    """Return a new report with PNR-derived customer names attached.
+
+    Walks every existing audit row that carries a `customer_name` slot
+    (G-class events, class trajectories) and fills it from the enriched
+    PNR data when available. Adds the PNR Routes audit.
+    """
+    # Index PNR → customer (the agency in CustomerName) + surname.
+    def cust_for(pnr: str) -> str:
+        d = pnr_details.get(pnr)
+        if d is None:
+            return ""
+        # Prefer customer_name; fall back to traveler_surname for direct bookings.
+        return d.customer_name or d.traveler_surname
+
+    enriched_trajs = [
+        ClassTrajectory(
+            pnr=t.pnr, passenger=t.passenger,
+            flight_number=t.flight_number, flight_date=t.flight_date,
+            classes_seen=t.classes_seen,
+            starting_class=t.starting_class, ending_class=t.ending_class,
+            total_downgrade_severity=t.total_downgrade_severity,
+            downgrade_steps=t.downgrade_steps,
+            last_changed_by=t.last_changed_by,
+            last_changed_at=t.last_changed_at,
+            customer_name=cust_for(t.pnr) or t.customer_name,
+        )
+        for t in report.class_trajectories
+    ]
+    enriched_g = [
+        GClassEvent(
+            timestamp=g.timestamp,
+            agent_user_id=g.agent_user_id,
+            agent_display_name=g.agent_display_name,
+            agent_department=g.agent_department,
+            pnr=g.pnr, passenger=g.passenger,
+            flight_number=g.flight_number, flight_date=g.flight_date,
+            event_type=g.event_type, ticket_number=g.ticket_number,
+            customer_name=cust_for(g.pnr) or g.customer_name,
+        )
+        for g in report.g_class_events
+    ]
+    routes = build_pnr_routes(pnr_details)
+
+    return HistoryAuditReport(
+        file_count=report.file_count,
+        event_count=report.event_count,
+        date_range=report.date_range,
+        top_agents=report.top_agents,
+        top_rbds=report.top_rbds,
+        class_trajectories=enriched_trajs,
+        downgrade_leaders=report.downgrade_leaders,
+        g_class_events=enriched_g,
+        agent_activity=report.agent_activity,
+        revenue_mgmt_changes=report.revenue_mgmt_changes,
+        suspicious_flags=report.suspicious_flags,
+        downgrade_justifications=report.downgrade_justifications,
+        pnr_routes=routes,
+        raw_events=report.raw_events,
+    )
 
 
 def audit_downgrade_justification(

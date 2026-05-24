@@ -37,8 +37,9 @@ from tkinter import filedialog, messagebox, ttk
 from . import (
     __version__, auth, config, excel_io, oep_client, oep_presets,
     updater, zenith_client, zenith_history_analyzer, zenith_history_downloader,
-    zenith_history_parser, zenith_loads_index,
+    zenith_history_parser, zenith_loads_index, zenith_pnr_client,
 )
+from .zenith_pnr_cache import ZenithPNRCache
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
 from .zenith_cache import ZenithCache
@@ -104,6 +105,14 @@ MSG_ZENITH_DL_STATUS = "zenith_dl_status"      # payload: str (status line)
 MSG_ZENITH_DL_PROGRESS = "zenith_dl_progress"  # (i, total, label, status_code)
 MSG_ZENITH_DL_DONE = "zenith_dl_done"          # payload: dict (counts + folder)
 MSG_ZENITH_DL_ERROR = "zenith_dl_error"
+# Zenith PNR enrichment (Phase A — Phase 2)
+MSG_ZENITH_PNR_PROGRESS = "zenith_pnr_progress"  # (i, total, code, status)
+MSG_ZENITH_PNR_DONE = "zenith_pnr_done"          # payload: HistoryAuditReport (enriched)
+MSG_ZENITH_PNR_ERROR = "zenith_pnr_error"
+# Zenith bulk PNR lookup (standalone)
+MSG_ZENITH_BULK_PROGRESS = "zenith_bulk_progress"  # (i, total, code, status)
+MSG_ZENITH_BULK_DONE = "zenith_bulk_done"          # payload: dict (path, counts)
+MSG_ZENITH_BULK_ERROR = "zenith_bulk_error"
 
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
@@ -2290,6 +2299,7 @@ class App:
             self._zenith_fh_render(report)
             self.btn_zenith_fh_run.configure(state="normal")
             self.btn_zenith_fh_export.configure(state="normal")
+            self.btn_zenith_fh_pnr.configure(state="normal")
             self.zenith_fh_status_label.configure(
                 text=(
                     f"Done — {report.event_count:,} events / "
@@ -2338,6 +2348,62 @@ class App:
             self.btn_zenith_fh_download.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ Download: {payload}")
             messagebox.showerror("Download from Zenith — Error", str(payload))
+        # ----- PNR enrichment (Phase 2) -----
+        elif kind == MSG_ZENITH_PNR_PROGRESS:
+            idx, total, code, status_code = payload  # type: ignore[misc]
+            self.zenith_fh_progress.configure(maximum=total, value=idx)
+            self.zenith_fh_status_label.configure(
+                text=f"PNR {idx}/{total}  ·  {code}  [{status_code}]",
+            )
+        elif kind == MSG_ZENITH_PNR_DONE:
+            enriched = payload
+            self._zenith_fh_last_report = enriched
+            self._zenith_fh_render(enriched)
+            self.btn_zenith_fh_run.configure(state="normal")
+            self.btn_zenith_fh_pnr.configure(state="normal")
+            self.zenith_fh_status_label.configure(
+                text=(
+                    f"PNR enrichment done — {len(enriched.pnr_routes)} PNRs "
+                    f"in the route audit. Click Export to save."
+                )
+            )
+        elif kind == MSG_ZENITH_PNR_ERROR:
+            self.btn_zenith_fh_run.configure(state="normal")
+            self.btn_zenith_fh_pnr.configure(state="normal")
+            self.zenith_fh_status_label.configure(text=f"⚠ PNR enrich: {payload}")
+            messagebox.showerror("PNR enrichment — Error", str(payload))
+        # ----- PNR Bulk Lookup -----
+        elif kind == MSG_ZENITH_BULK_PROGRESS:
+            idx, total, code, status_code = payload  # type: ignore[misc]
+            self.zenith_bulk_progress.configure(maximum=total, value=idx)
+            self.zenith_bulk_status_label.configure(
+                text=f"{idx}/{total}  ·  {code}  [{status_code}]",
+            )
+            self._zenith_bulk_log_line(f"  {idx}/{total} {code}: {status_code}")
+        elif kind == MSG_ZENITH_BULK_DONE:
+            info = payload  # type: ignore[assignment]
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            self.zenith_bulk_status_label.configure(
+                text=(
+                    f"Done — {info['ok']}/{info['total']} resolved, "
+                    f"{info['errors']} errors"
+                )
+            )
+            self._zenith_bulk_log_line(f"Wrote: {info['path']}")
+            messagebox.showinfo(
+                "PNR Bulk Lookup — Done",
+                f"Saved to: {info['path']}\n\n"
+                f"  Total:    {info['total']}\n"
+                f"  Resolved: {info['ok']}\n"
+                f"  Errors:   {info['errors']}",
+            )
+        elif kind == MSG_ZENITH_BULK_ERROR:
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            self.zenith_bulk_status_label.configure(text=f"⚠ {payload}")
+            self._zenith_bulk_log_line(f"ERROR: {payload}")
+            messagebox.showerror("PNR Bulk Lookup — Error", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -2923,18 +2989,21 @@ class App:
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
 
-        # ----- Inner notebook so Customer Lookup, Flight Loads, and
-        # Flight History Analyzer each get their own canvas without
-        # polluting the others. Login above remains shared.
+        # ----- Inner notebook so each Zenith feature gets its own
+        # canvas without polluting the others. Login above remains
+        # shared across all sub-tabs.
         inner_nb = ttk.Notebook(parent)
         inner_nb.pack(fill="both", expand=True, padx=4, pady=(8, 0))
         customer_inner = ttk.Frame(inner_nb)
         flight_inner = ttk.Frame(inner_nb)
         history_inner = ttk.Frame(inner_nb)
+        pnr_bulk_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
         inner_nb.add(history_inner, text="Flight History Analyzer")
+        inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
         self._build_zenith_history_tab(history_inner)
+        self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
 
         # From here, the existing Customer Lookup form goes into
         # `customer_inner` instead of the outer scroll frame.
@@ -3368,6 +3437,13 @@ class App:
             command=self._zenith_fh_download_dialog,
         )
         self.btn_zenith_fh_download.pack(side="left", padx=(8, 0))
+        # Enrich the most-recent audit by fetching each PNR from Zenith.
+        self.btn_zenith_fh_pnr = ttk.Button(
+            ctl, text="Enrich with PNR details",
+            command=self._zenith_fh_enrich_pnrs,
+            state="disabled",
+        )
+        self.btn_zenith_fh_pnr.pack(side="left", padx=(8, 0))
         self.zenith_fh_status_label = ttk.Label(
             ctl, text="Idle.", style="Hint.TLabel",
         )
@@ -3400,6 +3476,266 @@ class App:
         self._zenith_fh_last_report = None
         self._zenith_dl_worker: threading.Thread | None = None
         self._zenith_dl_stop_flag = threading.Event()
+        self._zenith_pnr_worker: threading.Thread | None = None
+        # SQLite cache shared by all PNR-enrichment runs.
+        self._zenith_pnr_cache = ZenithPNRCache(config.APP_DIR / "zenith_pnr.sqlite")
+
+    # ==================================================================
+    # Zenith PNR Bulk Lookup sub-tab — UI
+    # ==================================================================
+
+    def _build_zenith_pnr_bulk_tab(self, parent: ttk.Frame) -> None:
+        """Standalone bulk lookup: Excel of PNRs in → Excel with route/customer out."""
+        parent = self._make_scrollable(parent)
+
+        intro = self._section(
+            parent, "PNR Bulk Lookup  ·  paste a list, get every detail",
+        )
+        ttk.Label(
+            intro,
+            text=(
+                "Reads a column of PNR codes from an Excel file, looks up "
+                "each one against Zenith, and writes the route, customer, "
+                "status, fares, and per-segment breakdown back to a new "
+                "workbook. Cached locally so re-runs are instant."
+            ),
+            style="Hint.TLabel", wraplength=820, justify="left",
+        ).pack(anchor="w", padx=2, pady=(0, 4))
+
+        # ----- Files -----
+        io_body = self._section(parent, "Files")
+        self.zenith_bulk_input_path = tk.StringVar(value="")
+        self.zenith_bulk_sheet_name = tk.StringVar(value="")
+        self.zenith_bulk_column_name = tk.StringVar(value="PNR")
+        self.zenith_bulk_output_dir = tk.StringVar(
+            value=str(Path.home() / "Documents"),
+        )
+
+        input_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_input_path)
+        input_btn = ttk.Button(
+            io_body, text="Browse…",
+            command=self._zenith_bulk_pick_input,
+        )
+        self._form_row(io_body, 0, "Input Excel:", input_entry, suffix=input_btn)
+
+        sheet_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_sheet_name)
+        self._form_row(io_body, 1, "Sheet (blank = first):", sheet_entry)
+
+        col_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_column_name)
+        self._form_row(io_body, 2, "PNR column name:", col_entry)
+
+        out_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_output_dir)
+        out_btn = ttk.Button(
+            io_body, text="Browse…",
+            command=self._zenith_bulk_pick_output,
+        )
+        self._form_row(io_body, 3, "Output folder:", out_entry, suffix=out_btn)
+
+        # ----- Controls -----
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 4))
+        self.btn_zenith_bulk_run = ttk.Button(
+            ctl, text="Run Lookup", style="Primary.TButton",
+            command=self._zenith_bulk_run,
+        )
+        self.btn_zenith_bulk_run.pack(side="left")
+        self.btn_zenith_bulk_stop = ttk.Button(
+            ctl, text="Stop", command=self._zenith_bulk_stop, state="disabled",
+        )
+        self.btn_zenith_bulk_stop.pack(side="left", padx=(8, 0))
+        self.zenith_bulk_status_label = ttk.Label(
+            ctl, text="Idle.", style="Hint.TLabel",
+        )
+        self.zenith_bulk_status_label.pack(side="left", padx=(12, 0))
+
+        # ----- Progress -----
+        prog_body = self._section(parent, "Progress")
+        self.zenith_bulk_progress = ttk.Progressbar(
+            prog_body, mode="determinate", maximum=1, value=0,
+        )
+        self.zenith_bulk_progress.pack(fill="x", padx=2, pady=2)
+
+        log_body = self._section(parent, "Log")
+        self.zenith_bulk_log = tk.Text(
+            log_body, height=12, wrap="none", state="disabled",
+        )
+        self.zenith_bulk_log.pack(side="left", fill="both", expand=True, padx=2)
+        sb = ttk.Scrollbar(log_body, command=self.zenith_bulk_log.yview)
+        sb.pack(side="left", fill="y")
+        self.zenith_bulk_log.configure(yscrollcommand=sb.set)
+
+        # ----- Worker state -----
+        self._zenith_bulk_worker: threading.Thread | None = None
+        self._zenith_bulk_stop_flag = threading.Event()
+
+    def _zenith_bulk_pick_input(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Pick the Excel with your PNR list",
+            filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
+        )
+        if f:
+            self.zenith_bulk_input_path.set(f)
+
+    def _zenith_bulk_pick_output(self) -> None:
+        d = filedialog.askdirectory(
+            title="Pick the output folder",
+            initialdir=self.zenith_bulk_output_dir.get() or str(Path.home()),
+        )
+        if d:
+            self.zenith_bulk_output_dir.set(d)
+
+    def _zenith_bulk_log_line(self, line: str) -> None:
+        self.zenith_bulk_log.configure(state="normal")
+        self.zenith_bulk_log.insert("end", line + "\n")
+        self.zenith_bulk_log.see("end")
+        self.zenith_bulk_log.configure(state="disabled")
+
+    def _zenith_bulk_stop(self) -> None:
+        self._zenith_bulk_stop_flag.set()
+        self.zenith_bulk_status_label.configure(text="Stopping…")
+
+    def _zenith_bulk_run(self) -> None:
+        if not getattr(self, "_zenith_session", None):
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                "Sign in to Zenith first (top of this tab).",
+            )
+            return
+        if self._zenith_bulk_worker and self._zenith_bulk_worker.is_alive():
+            messagebox.showinfo(
+                "PNR Bulk Lookup", "A lookup is already running.",
+            )
+            return
+        input_path = self.zenith_bulk_input_path.get().strip()
+        if not input_path or not Path(input_path).is_file():
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                f"Pick a valid Excel file first.\nCurrent: {input_path!r}",
+            )
+            return
+        out_folder = Path(self.zenith_bulk_output_dir.get().strip() or str(Path.home()))
+        sheet = self.zenith_bulk_sheet_name.get().strip() or None
+        column = self.zenith_bulk_column_name.get().strip() or None
+
+        try:
+            codes = excel_io.read_pnr_codes_from_excel(
+                Path(input_path),
+                sheet_name=sheet,
+                column_name=column,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                f"Couldn't read the input Excel:\n{type(exc).__name__}: {exc}",
+            )
+            return
+        if not codes:
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                f"No PNRs found in column {column!r} of {Path(input_path).name}.",
+            )
+            return
+
+        cache_hits = sum(
+            1 for c in codes if self._zenith_pnr_cache.get(c) is not None
+        )
+        misses = len(codes) - cache_hits
+        est_min = max(1, misses // 60)
+        if misses > 200:
+            proceed = messagebox.askyesno(
+                "PNR Bulk Lookup",
+                f"{len(codes)} PNRs in input.\n"
+                f"  · {cache_hits} already cached\n"
+                f"  · {misses} need fetching from Zenith\n\n"
+                f"Estimated time: ~{est_min} min.\n\nContinue?",
+            )
+            if not proceed:
+                return
+
+        self.zenith_bulk_log.configure(state="normal")
+        self.zenith_bulk_log.delete("1.0", "end")
+        self.zenith_bulk_log.configure(state="disabled")
+        self._zenith_bulk_log_line(
+            f"Reading {len(codes)} PNRs ({cache_hits} cached, {misses} to fetch)…",
+        )
+        self._zenith_bulk_stop_flag.clear()
+        self.btn_zenith_bulk_run.configure(state="disabled")
+        self.btn_zenith_bulk_stop.configure(state="normal")
+        self.zenith_bulk_progress.configure(value=0, maximum=len(codes))
+        self.zenith_bulk_status_label.configure(
+            text=f"Looking up {len(codes)} PNRs…",
+        )
+
+        cache = self._zenith_pnr_cache
+        sess = self._zenith_session
+        stop = self._zenith_bulk_stop_flag
+
+        def worker() -> None:
+            try:
+                results: list = []
+                errors: dict[str, str] = {}
+                for idx, code in enumerate(codes, start=1):
+                    if stop.is_set():
+                        self._post(
+                            MSG_ZENITH_BULK_PROGRESS,
+                            (idx, len(codes), code, "CANCELLED"),
+                        )
+                        break
+                    cached = cache.get(code)
+                    if cached is not None:
+                        results.append((code, cached))
+                        self._post(
+                            MSG_ZENITH_BULK_PROGRESS,
+                            (idx, len(codes), code, "CACHED"),
+                        )
+                        continue
+                    try:
+                        details = zenith_pnr_client.lookup_pnr(sess, code)
+                        cache.put(details)
+                        results.append((code, details))
+                        self._post(
+                            MSG_ZENITH_BULK_PROGRESS,
+                            (idx, len(codes), code, "OK"),
+                        )
+                    except zenith_pnr_client.PNRNotFoundError:
+                        # Keep this distinct from real errors so the
+                        # output sheet flags it as NOT_FOUND, not ERROR.
+                        results.append((code, None))
+                        self._post(
+                            MSG_ZENITH_BULK_PROGRESS,
+                            (idx, len(codes), code, "NOT_FOUND"),
+                        )
+                    except zenith_client.SessionExpiredError as exc:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("PNR bulk lookup %s failed: %s", code, exc)
+                        results.append((code, None))
+                        errors[code] = f"{type(exc).__name__}: {exc}"
+                        self._post(
+                            MSG_ZENITH_BULK_PROGRESS,
+                            (idx, len(codes), code, f"ERROR: {exc}"),
+                        )
+                    # Polite delay — only when we actually hit Zenith.
+                    import time
+                    time.sleep(0.5)
+
+                out_path = excel_io.build_zenith_pnr_bulk_output_path(out_folder)
+                excel_io.write_zenith_pnr_bulk(out_path, results, errors=errors)
+                summary = {
+                    "path": str(out_path),
+                    "total": len(results),
+                    "ok": sum(1 for _, d in results if d is not None),
+                    "errors": len(errors),
+                }
+                self._post(MSG_ZENITH_BULK_DONE, summary)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("PNR bulk lookup failed")
+                self._post(
+                    MSG_ZENITH_BULK_ERROR, f"{type(exc).__name__}: {exc}",
+                )
+
+        self._zenith_bulk_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_bulk_worker.start()
 
     def _zenith_fh_pick_input(self) -> None:
         d = filedialog.askdirectory(
@@ -3552,6 +3888,24 @@ class App:
             for v in ("QUESTIONABLE", "SITUATIONAL", "JUSTIFIED", "UNKNOWN"):
                 if counts.get(v):
                     tree.insert("", "end", values=(f"  · {v}", f"{counts[v]:,}"))
+        if report.pnr_routes:
+            tree.insert("", "end", values=("", ""))
+            tree.insert("", "end", values=("PNR Routes (enriched)", ""))
+            disrupted = sum(
+                1 for r in report.pnr_routes
+                if r.refunded_count + r.voided_count > 0
+            )
+            tree.insert(
+                "", "end",
+                values=("  · Total PNRs", f"{len(report.pnr_routes):,}"),
+            )
+            tree.insert(
+                "", "end",
+                values=(
+                    "  · With refunds/voids",
+                    f"{disrupted:,}",
+                ),
+            )
 
     def _zenith_fh_export(self) -> None:
         if self._zenith_fh_last_report is None:
@@ -3704,6 +4058,124 @@ class App:
 
         self._zenith_dl_worker = threading.Thread(target=worker, daemon=True)
         self._zenith_dl_worker.start()
+
+    # ------------------------------------------------------------------
+    # Phase 2/A — PNR enrichment (customer name + full route)
+    # ------------------------------------------------------------------
+
+    def _zenith_fh_enrich_pnrs(self) -> None:
+        """Walk every PNR in the last audit + fetch its Dossier from Zenith."""
+        if self._zenith_fh_last_report is None:
+            messagebox.showinfo(
+                "PNR enrichment",
+                "Run the audit first — then I'll know which PNRs to fetch.",
+            )
+            return
+        if not getattr(self, "_zenith_session", None):
+            messagebox.showerror(
+                "PNR enrichment",
+                "Sign in to Zenith first (top of this tab).",
+            )
+            return
+        if self._zenith_pnr_worker and self._zenith_pnr_worker.is_alive():
+            messagebox.showinfo(
+                "PNR enrichment", "Enrichment is already running.",
+            )
+            return
+
+        # Distinct PNRs across every audit row that carries one.
+        report = self._zenith_fh_last_report
+        unique_pnrs: list[str] = []
+        seen: set[str] = set()
+        for t in report.class_trajectories:
+            if t.pnr and t.pnr not in seen:
+                seen.add(t.pnr)
+                unique_pnrs.append(t.pnr)
+        for g in report.g_class_events:
+            if g.pnr and g.pnr not in seen:
+                seen.add(g.pnr)
+                unique_pnrs.append(g.pnr)
+        # Also pull raw events' PNRs — many bookings only appear here.
+        for e in report.raw_events:
+            if e.pnr and e.pnr not in seen:
+                seen.add(e.pnr)
+                unique_pnrs.append(e.pnr)
+        if not unique_pnrs:
+            messagebox.showinfo(
+                "PNR enrichment",
+                "No PNRs found in this audit — nothing to enrich.",
+            )
+            return
+
+        # Estimate runtime so the user can decide.
+        cache_hits = sum(
+            1 for p in unique_pnrs if self._zenith_pnr_cache.get(p) is not None
+        )
+        misses = len(unique_pnrs) - cache_hits
+        est_secs = misses * 1   # ~0.5s fetch + 0.5s delay per miss
+        est_min = max(1, est_secs // 60)
+        if misses > 50:
+            proceed = messagebox.askyesno(
+                "PNR enrichment",
+                f"This audit has {len(unique_pnrs)} unique PNRs.\n"
+                f"  · {cache_hits} already cached locally\n"
+                f"  · {misses} need fetching from Zenith\n\n"
+                f"Estimated time: ~{est_min} min.\n\n"
+                f"Continue?",
+            )
+            if not proceed:
+                return
+
+        self.btn_zenith_fh_pnr.configure(state="disabled")
+        self.btn_zenith_fh_run.configure(state="disabled")
+        self.zenith_fh_status_label.configure(
+            text=f"Enriching {len(unique_pnrs)} PNRs (using local cache for {cache_hits})…",
+        )
+        self.zenith_fh_progress.configure(value=0, maximum=len(unique_pnrs))
+
+        cache = self._zenith_pnr_cache
+        sess = self._zenith_session
+
+        def worker() -> None:
+            try:
+                def progress(idx: int, total: int, code: str, status: str) -> None:
+                    self._post(MSG_ZENITH_PNR_PROGRESS, (idx, total, code, status))
+
+                def skip_cached(code: str):
+                    return cache.get(code)
+
+                fresh = zenith_pnr_client.lookup_many(
+                    sess, unique_pnrs,
+                    delay_s=0.5,
+                    skip_cached=skip_cached,
+                    progress_cb=progress,
+                )
+                # Persist any new entries to the cache.
+                new_entries = [
+                    d for code, d in fresh.items()
+                    if cache.get(code) is None
+                ]
+                if new_entries:
+                    cache.put_many(new_entries)
+
+                # Apply enrichment using the union of fresh + cached.
+                merged: dict = {}
+                for code in unique_pnrs:
+                    cached = cache.get(code)
+                    if cached is not None:
+                        merged[code] = cached
+                enriched = zenith_history_analyzer.apply_pnr_enrichment(
+                    report, merged,
+                )
+                self._post(MSG_ZENITH_PNR_DONE, enriched)
+            except Exception as exc:  # noqa: BLE001 — surface
+                log.exception("PNR enrichment failed")
+                self._post(
+                    MSG_ZENITH_PNR_ERROR, f"{type(exc).__name__}: {exc}",
+                )
+
+        self._zenith_pnr_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_pnr_worker.start()
 
     # ==================================================================
     # Zenith Customer Lookup tab — actions

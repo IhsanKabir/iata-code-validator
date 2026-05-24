@@ -25,34 +25,34 @@ def _flight_header(flight: str = "BS346", dow: str = "Sun",
     )
 
 
-def _leg_table(id_vol: str, route: str, time_range: str,
-               cabin: str = "Economy") -> str:
+def _leg_info_row(route: str, time_range: str, cabin: str = "Economy") -> str:
+    """One `<tr class="info">` row inside the leg table."""
     return (
-        f'<table data-table-leg data-id-vol="{id_vol}">'
         f'<tr class="info">'
         f'<td><u>{route}</u></td>'
         f'<td class="TDListRow trajet">leg</td>'
         f'<td class="TDListRow heure"><font color="blue">{time_range}</font></td>'
         f'<td class="TDListRow stock">Cabin<nobr>{cabin}</nobr></td>'
-        f'</tr></table>'
+        f'</tr>'
     )
 
 
-def _billets_table(id_vol: str, issued: str, wl: str) -> str:
+def _billets_info_row(issued: str, wl: str) -> str:
+    """One `<tr class="billets">` row inside the billets table."""
     return (
-        f'<table data-table-billets data-id-vol="{id_vol}"><tr class="billets">'
+        f'<tr class="billets">'
         f'<td class="TDListRow emis"><div>Issued</div>'
         f'<font class="FNTListRow">{issued}</font></td>'
         f'<td class="TDListRow emis-wl"><div>Issued WL</div>'
         f'<font class="FNTListRow">{wl}</font></td>'
-        f'</tr></table>'
+        f'</tr>'
     )
 
 
-def _seats_table(id_vol: str, confirmed: str, options: str,
-                 wl: str, available: str) -> str:
+def _sieges_info_row(confirmed: str, options: str, wl: str, available: str) -> str:
+    """One `<TR class="sieges">` row inside the seats table."""
     return (
-        f'<table data-table-zs data-id-vol="{id_vol}"><tr class="sieges">'
+        f'<tr class="sieges">'
         f'<td class="TDListRow confirm"><div>Confirmed</div>'
         f'<font class="FNTListRow">{confirmed}</font></td>'
         f'<td class="TDListRow options"><div>Options</div>'
@@ -61,7 +61,7 @@ def _seats_table(id_vol: str, confirmed: str, options: str,
         f'<font class="FNTListRow">{wl}</font></td>'
         f'<td class="TDListRow td-dispo reste"><div>Available</div>'
         f'<font class="FNTListRow"><font color="red">{available}</font></td>'
-        f'</tr></table>'
+        f'</tr>'
     )
 
 
@@ -73,15 +73,38 @@ def _inventory_table(id_vol: str, title: str) -> str:
 
 
 def _build_flight_block(flight: str, legs: list[tuple]) -> str:
-    """legs: list of (id_vol, route, time_range, cabin, issued, wl, confirmed, options, swl, avail, inv)."""
+    """Build a multi-stop flight block matching real Zenith markup.
+
+    Real Zenith wraps every stop in ONE leg-table + ONE billets-table +
+    ONE seats-table, each containing N sub-rows (one per stop). Earlier
+    fixture versions created separate tables per leg which never
+    matched what the server actually emits.
+
+    `legs` is a list of:
+      (id_vol, route, time_range, cabin, issued, wl, confirmed, options,
+       seats_wl, avail, inv_title)
+    """
+    # All stops on a flight share the same parent id_vol.
+    id_vol = legs[0][0]
     parts = [_flight_header(flight=flight)]
-    # Inventory tables FIRST (matching real ASP rendering order)
+    # Inventory cells (one per stop) come first in real markup.
     for leg in legs:
-        parts.append(_inventory_table(leg[0], leg[10]))
+        parts.append(_inventory_table(id_vol, leg[10]))
+    # Single leg-table containing all stops' info rows.
+    parts.append(f'<table data-table-leg data-id-vol="{id_vol}">')
     for leg in legs:
-        parts.append(_leg_table(leg[0], leg[1], leg[2], leg[3]))
-        parts.append(_billets_table(leg[0], leg[4], leg[5]))
-        parts.append(_seats_table(leg[0], leg[6], leg[7], leg[8], leg[9]))
+        parts.append(_leg_info_row(leg[1], leg[2], leg[3]))
+    parts.append("</table>")
+    # Single billets-table containing all stops' billets rows.
+    parts.append(f'<table data-table-billets data-id-vol="{id_vol}">')
+    for leg in legs:
+        parts.append(_billets_info_row(leg[4], leg[5]))
+    parts.append("</table>")
+    # Single seats-table containing all stops' sieges rows.
+    parts.append(f'<table data-table-zs data-id-vol="{id_vol}">')
+    for leg in legs:
+        parts.append(_sieges_info_row(leg[6], leg[7], leg[8], leg[9]))
+    parts.append("</table>")
     return "".join(parts)
 
 
@@ -161,6 +184,33 @@ def test_aircraft_split_handles_atr_dash_prefix():
 def test_parse_empty_page():
     rows = parse_flight_loads_html("<html><body>no flights</body></html>")
     assert rows == []
+
+
+def test_multi_stop_flight_emits_one_row_per_stop():
+    """Regression: BS342 on 24/05 has 3 stops (DXB-CGP, CGP-DAC, DXB-DAC)
+    sharing one id_vol — earlier code only emitted the first stop because
+    it walked `data-table-leg` blocks instead of `<tr class="info">` rows
+    inside the single leg table.
+    """
+    block = _build_flight_block("BS342", legs=[
+        ("999", "DXB-CGP", "26/05/2026 02:55 - 09:40", "Economy",
+         "117(35)", "0(0)", "[152]", "0(0)", "[0]", "0/152 100%", "AS-open"),
+        ("999", "CGP-DAC", "26/05/2026 10:30 - 11:25", "Economy",
+         "38(35)", "0(0)", "[73]", "0(0)", "[0]", "79/152 48%", "AS-open"),
+        ("999", "DXB-DAC", "26/05/2026 02:55 - 11:25", "Economy",
+         "35(0)", "0(0)", "[35]", "0(0)", "[0]", "0/35 100%", "AS-open"),
+    ])
+    rows = parse_flight_loads_html(block)
+    routes = [r.leg_route for r in rows]
+    assert routes == ["DXB-CGP", "CGP-DAC", "DXB-DAC"], (
+        f"multi-stop should yield 3 rows, got: {routes}"
+    )
+    # Per-row metrics must come from the matching sub-rows, not the first.
+    assert rows[1].tickets_issued == "38(35)"
+    assert rows[1].seats_available == "79/152 48%"
+    assert rows[2].tickets_issued == "35(0)"
+    # Inventory cells must pair by position too.
+    assert all(r.inventory_status == "AS-open" for r in rows)
 
 
 def test_flight_header_whitespace_tolerant():

@@ -1,3 +1,3 @@
 """IATA Code Validator + BD Travel Agency + BD Overseas Movement + Zenith Customer + Flight Loads + Flight History (Analyzer + Auto-downloader)."""
 
-__version__ = "1.10.1"
+__version__ = "1.11.0"
