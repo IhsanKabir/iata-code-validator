@@ -816,3 +816,176 @@ def build_zenith_flight_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"zenith_flight_loads_{timestamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Zenith Flight History audit
+# ---------------------------------------------------------------------------
+
+
+def write_zenith_history_audit(path: Path, report) -> None:
+    """Multi-sheet workbook for the Flight History Analyzer.
+
+    Sheets (left → right, so the file opens to the most-skimmed view):
+      Cover | Class Downgrades | Downgrade Leaders | G-Class Issuance
+            | Agent Activity   | Revenue Mgmt      | Suspicious Activity
+            | Raw Events
+
+    The Raw Events sheet is last (largest) so the user lands on the
+    summaries first.
+    """
+    wb = Workbook()
+
+    # ----- Cover -----
+    cover = wb.active
+    cover.title = "Cover"
+    cover.append(["Zenith Flight History Audit"])
+    cover.append([])
+    start, end = report.date_range
+    cover.append(["Files parsed", report.file_count])
+    cover.append(["Total events", report.event_count])
+    cover.append([
+        "Date range",
+        f"{start.strftime('%Y-%m-%d') if start else '—'}"
+        f"  →  {end.strftime('%Y-%m-%d') if end else '—'}",
+    ])
+    cover.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    cover.append([])
+    cover.append(["Top agents (by event count)"])
+    cover.append(["Rank", "Agent user ID", "Events"])
+    for rank, (uid, count) in enumerate(report.top_agents, start=1):
+        cover.append([rank, uid, count])
+    cover.append([])
+    cover.append(["Top RBD classes touched"])
+    cover.append(["Rank", "Class", "Events"])
+    for rank, (rbd, count) in enumerate(report.top_rbds, start=1):
+        cover.append([rank, rbd, count])
+
+    # ----- Class Downgrades -----
+    ws = wb.create_sheet("Class Downgrades")
+    ws.append([
+        "Severity", "Steps", "PNR", "Customer", "Passenger",
+        "Flight", "Flight Date",
+        "Start Class", "End Class", "Trajectory",
+        "Last Changed By", "Last Changed At",
+    ])
+    for t in report.class_trajectories:
+        # Skip rows with no downgrade activity — keep the sheet focused.
+        if t.total_downgrade_severity == 0:
+            continue
+        ws.append([
+            t.total_downgrade_severity,
+            t.downgrade_steps,
+            t.pnr,
+            t.customer_name,
+            t.passenger,
+            t.flight_number,
+            t.flight_date,
+            t.starting_class,
+            t.ending_class,
+            " → ".join(t.classes_seen),
+            t.last_changed_by,
+            t.last_changed_at.strftime("%Y-%m-%d %H:%M") if t.last_changed_at else "",
+        ])
+
+    # ----- Downgrade Leaders -----
+    ws = wb.create_sheet("Downgrade Leaders")
+    ws.append([
+        "Rank", "Agent User ID", "Display Name", "Department",
+        "Downgrade Events", "Total Severity", "Distinct PNRs",
+    ])
+    for rank, d in enumerate(report.downgrade_leaders, start=1):
+        ws.append([
+            rank, d.agent_user_id, d.agent_display_name, d.agent_department,
+            d.downgrade_event_count, d.total_severity, d.distinct_pnrs,
+        ])
+
+    # ----- G-Class Issuance -----
+    ws = wb.create_sheet("G-Class Issuance")
+    ws.append([
+        "Timestamp", "Agent User ID", "Display Name", "Department",
+        "PNR", "Customer", "Passenger",
+        "Flight", "Flight Date", "Event Type", "Ticket Number",
+    ])
+    for g in report.g_class_events:
+        ws.append([
+            g.timestamp.strftime("%Y-%m-%d %H:%M") if g.timestamp else "",
+            g.agent_user_id, g.agent_display_name, g.agent_department,
+            g.pnr, g.customer_name, g.passenger,
+            g.flight_number, g.flight_date, g.event_type, g.ticket_number,
+        ])
+
+    # ----- Agent Activity -----
+    ws = wb.create_sheet("Agent Activity")
+    # Pre-compute the union of event types so columns are stable.
+    all_types: list[str] = sorted({
+        t for row in report.agent_activity for t in row.by_type
+    })
+    ws.append([
+        "Rank", "Agent User ID", "Display Name", "Department",
+        "Total Events", *all_types,
+    ])
+    for rank, row in enumerate(report.agent_activity, start=1):
+        type_cells = [row.by_type.get(t, 0) for t in all_types]
+        ws.append([
+            rank, row.agent_user_id, row.agent_display_name,
+            row.agent_department, row.total_events, *type_cells,
+        ])
+
+    # ----- Revenue Mgmt -----
+    ws = wb.create_sheet("Revenue Mgmt")
+    ws.append([
+        "Timestamp", "Agent User ID", "Display Name",
+        "Flight", "Flight Date", "Route",
+        "Booking Class", "Seats Before", "Seats After", "Delta",
+    ])
+    for r in report.revenue_mgmt_changes:
+        ws.append([
+            r.timestamp.strftime("%Y-%m-%d %H:%M") if r.timestamp else "",
+            r.agent_user_id, r.agent_display_name,
+            r.flight_number, r.flight_date, r.route,
+            r.booking_class, r.seats_before, r.seats_after, r.delta,
+        ])
+
+    # ----- Suspicious Activity -----
+    ws = wb.create_sheet("Suspicious Activity")
+    ws.append([
+        "Severity", "Timestamp", "Agent User ID",
+        "PNR", "Passenger", "Flight", "Event Type", "Reason",
+    ])
+    for f in report.suspicious_flags:
+        ws.append([
+            f.severity,
+            f.timestamp.strftime("%Y-%m-%d %H:%M") if f.timestamp else "",
+            f.agent_user_id,
+            f.pnr, f.passenger, f.flight_number, f.event_type, f.reason,
+        ])
+
+    # ----- Raw Events (always last; can be enormous) -----
+    ws = wb.create_sheet("Raw Events")
+    ws.append([
+        "Source File", "Row", "Timestamp", "Agent User ID", "Department",
+        "Event Type", "PNR", "Passenger", "Flight", "Flight Date",
+        "RBD Class", "Old Status", "New Status",
+        "Capacity Class", "Seats Before", "Seats After",
+        "Ticket Number", "Description",
+    ])
+    for e in report.raw_events:
+        ws.append([
+            e.source_file, e.row_index,
+            e.timestamp.strftime("%Y-%m-%d %H:%M") if e.timestamp else "",
+            e.agent.user_id, e.agent.department,
+            e.event_type, e.pnr, e.passenger,
+            e.flight.flight_number, e.flight.flight_date,
+            e.rbd_class, e.old_status, e.new_status,
+            e.capacity_class, e.capacity_before, e.capacity_after,
+            e.ticket_number, e.raw_description,
+        ])
+
+    wb.save(path)
+
+
+def build_zenith_history_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_history_audit_{timestamp}.xlsx"

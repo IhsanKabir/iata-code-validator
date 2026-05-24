@@ -36,7 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import (
     __version__, auth, config, excel_io, oep_client, oep_presets,
-    updater, zenith_client,
+    updater, zenith_client, zenith_history_analyzer, zenith_history_parser,
 )
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
@@ -93,6 +93,11 @@ MSG_ZENITH_FL_LOG = "zenith_fl_log"
 MSG_ZENITH_FL_PROGRESS = "zenith_fl_progress"  # (chunk_label, done_chunks, total_chunks, rows)
 MSG_ZENITH_FL_DONE = "zenith_fl_done"           # payload: str(output path)
 MSG_ZENITH_FL_ERROR = "zenith_fl_error"
+# Zenith Flight History Analyzer sub-tab
+MSG_ZENITH_FH_PROGRESS = "zenith_fh_progress"  # (i, total, current_file)
+MSG_ZENITH_FH_PARSED = "zenith_fh_parsed"      # payload: int (event count)
+MSG_ZENITH_FH_DONE = "zenith_fh_done"          # payload: HistoryAuditReport
+MSG_ZENITH_FH_ERROR = "zenith_fh_error"
 
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
@@ -349,7 +354,7 @@ class App:
         notebook.add(iata_tab, text="IATA Code Validator")
         notebook.add(bd_tab, text="BD Travel Agency Lookup")
         notebook.add(oep_tab, text="BD Overseas Movement")
-        notebook.add(zenith_tab, text="Zenith Customer Lookup")
+        notebook.add(zenith_tab, text="Zenith")
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
@@ -2261,6 +2266,34 @@ class App:
             self._zenith_fl_log(f"ERROR: {payload}")
             self._zenith_fl_reset_buttons()
             messagebox.showerror("Zenith Flight Loads — Error", str(payload))
+        # ----- Flight History Analyzer -----
+        elif kind == MSG_ZENITH_FH_PROGRESS:
+            i, total, name = payload  # type: ignore[misc]
+            self.zenith_fh_progress.configure(maximum=total, value=i)
+            self.zenith_fh_status_label.configure(
+                text=f"Parsing {i}/{total}: {name}",
+            )
+        elif kind == MSG_ZENITH_FH_PARSED:
+            count = int(payload)  # type: ignore[arg-type]
+            self.zenith_fh_status_label.configure(
+                text=f"Parsed {count:,} events. Running audit…",
+            )
+        elif kind == MSG_ZENITH_FH_DONE:
+            report = payload
+            self._zenith_fh_last_report = report
+            self._zenith_fh_render(report)
+            self.btn_zenith_fh_run.configure(state="normal")
+            self.btn_zenith_fh_export.configure(state="normal")
+            self.zenith_fh_status_label.configure(
+                text=(
+                    f"Done — {report.event_count:,} events / "
+                    f"{report.file_count} files. Click Export to save."
+                )
+            )
+        elif kind == MSG_ZENITH_FH_ERROR:
+            self.btn_zenith_fh_run.configure(state="normal")
+            self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
+            messagebox.showerror("Flight History Analyzer — Error", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -2846,15 +2879,18 @@ class App:
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
 
-        # ----- Inner notebook so Customer Lookup and Flight Loads each
-        # get their own canvas without polluting the other. Login above
-        # remains shared.
+        # ----- Inner notebook so Customer Lookup, Flight Loads, and
+        # Flight History Analyzer each get their own canvas without
+        # polluting the others. Login above remains shared.
         inner_nb = ttk.Notebook(parent)
         inner_nb.pack(fill="both", expand=True, padx=4, pady=(8, 0))
         customer_inner = ttk.Frame(inner_nb)
         flight_inner = ttk.Frame(inner_nb)
+        history_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
+        inner_nb.add(history_inner, text="Flight History Analyzer")
+        self._build_zenith_history_tab(history_inner)
 
         # From here, the existing Customer Lookup form goes into
         # `customer_inner` instead of the outer scroll frame.
@@ -3177,6 +3213,223 @@ class App:
         # ----- Worker state -----
         self._zenith_fl_worker: threading.Thread | None = None
         self._zenith_fl_stop_flag = threading.Event()
+
+    # ==================================================================
+    # Zenith Flight History Analyzer sub-tab — UI
+    # ==================================================================
+
+    def _build_zenith_history_tab(self, parent: ttk.Frame) -> None:
+        """Wire up the Flight History Analyzer inner tab.
+
+        Reads downloaded ModificationHistory*.xls files from a folder
+        and produces a multi-sheet audit Excel. No network calls — all
+        work is local, so this sub-tab is usable even when Zenith is
+        unreachable.
+        """
+        parent = self._make_scrollable(parent)
+
+        intro = self._section(
+            parent, "Flight History Analyzer  ·  audits downloaded .xls logs",
+        )
+        ttk.Label(
+            intro,
+            text=(
+                "Reads the ModificationHistory .xls files exported from "
+                "Zenith's Inventory → Flight List → History view. "
+                "Builds a 7-sheet audit: class downgrades, downgrade leaders, "
+                "G-class issuance, agent activity, revenue mgmt, suspicious "
+                "activity, and raw events."
+            ),
+            style="Hint.TLabel", wraplength=820, justify="left",
+        ).pack(anchor="w", padx=2, pady=(0, 4))
+
+        # ----- Input folder + output -----
+        io_body = self._section(parent, "Folders")
+        default_input = Path(r"E:\US Bangla\Flight History Logs")
+        self.zenith_fh_input_dir = tk.StringVar(
+            value=str(default_input) if default_input.exists() else "",
+        )
+        self.zenith_fh_output_dir = tk.StringVar(
+            value=str(Path.home() / "Documents"),
+        )
+
+        input_entry = ttk.Entry(io_body, textvariable=self.zenith_fh_input_dir)
+        input_btn = ttk.Button(
+            io_body, text="Browse…", command=self._zenith_fh_pick_input,
+        )
+        self._form_row(io_body, 0, "Logs folder:", input_entry, suffix=input_btn)
+
+        output_entry = ttk.Entry(io_body, textvariable=self.zenith_fh_output_dir)
+        output_btn = ttk.Button(
+            io_body, text="Browse…", command=self._zenith_fh_pick_output,
+        )
+        self._form_row(io_body, 1, "Output folder:", output_entry, suffix=output_btn)
+
+        # ----- Controls -----
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 4))
+        self.btn_zenith_fh_run = ttk.Button(
+            ctl, text="Run Audit", style="Primary.TButton",
+            command=self._zenith_fh_run,
+        )
+        self.btn_zenith_fh_run.pack(side="left")
+        self.btn_zenith_fh_export = ttk.Button(
+            ctl, text="Export to Excel…",
+            command=self._zenith_fh_export, state="disabled",
+        )
+        self.btn_zenith_fh_export.pack(side="left", padx=(8, 0))
+        self.zenith_fh_status_label = ttk.Label(
+            ctl, text="Idle.", style="Hint.TLabel",
+        )
+        self.zenith_fh_status_label.pack(side="left", padx=(12, 0))
+
+        # ----- Progress + results summary -----
+        prog_body = self._section(parent, "Progress")
+        self.zenith_fh_progress = ttk.Progressbar(
+            prog_body, mode="determinate", maximum=1, value=0,
+        )
+        self.zenith_fh_progress.pack(fill="x", padx=2, pady=2)
+
+        summary_body = self._section(parent, "Audit summary")
+        cols = (
+            ("metric", "Metric", 280),
+            ("value", "Value", 200),
+        )
+        self.zenith_fh_tree = ttk.Treeview(
+            summary_body,
+            columns=[c[0] for c in cols],
+            show="headings", height=14,
+        )
+        for cid, label, width in cols:
+            self.zenith_fh_tree.heading(cid, text=label)
+            self.zenith_fh_tree.column(cid, width=width, anchor="w")
+        self.zenith_fh_tree.pack(fill="both", expand=True, padx=2, pady=4)
+
+        # ----- Worker state -----
+        self._zenith_fh_worker: threading.Thread | None = None
+        self._zenith_fh_last_report = None
+
+    def _zenith_fh_pick_input(self) -> None:
+        d = filedialog.askdirectory(
+            title="Pick the Flight History Logs folder",
+            initialdir=self.zenith_fh_input_dir.get() or str(Path.home()),
+        )
+        if d:
+            self.zenith_fh_input_dir.set(d)
+
+    def _zenith_fh_pick_output(self) -> None:
+        d = filedialog.askdirectory(
+            title="Pick the output folder",
+            initialdir=self.zenith_fh_output_dir.get() or str(Path.home()),
+        )
+        if d:
+            self.zenith_fh_output_dir.set(d)
+
+    def _zenith_fh_run(self) -> None:
+        folder = self.zenith_fh_input_dir.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror(
+                "Flight History Analyzer",
+                f"Pick a valid logs folder first.\n\nCurrent: {folder!r}",
+            )
+            return
+        if self._zenith_fh_worker and self._zenith_fh_worker.is_alive():
+            messagebox.showinfo(
+                "Flight History Analyzer", "An audit is already running.",
+            )
+            return
+        # Clear previous results
+        for child in self.zenith_fh_tree.get_children():
+            self.zenith_fh_tree.delete(child)
+        self._zenith_fh_last_report = None
+        self.btn_zenith_fh_export.configure(state="disabled")
+        self.btn_zenith_fh_run.configure(state="disabled")
+        self.zenith_fh_status_label.configure(text="Parsing files…")
+        self.zenith_fh_progress.configure(value=0, maximum=1)
+
+        def worker() -> None:
+            try:
+                events: list = []
+
+                def progress(i: int, total: int, name: str) -> None:
+                    self._post(MSG_ZENITH_FH_PROGRESS, (i, total, name))
+
+                events.extend(zenith_history_parser.collect_history(
+                    folder, progress_cb=progress,
+                ))
+                self._post(MSG_ZENITH_FH_PARSED, len(events))
+                report = zenith_history_analyzer.run_history_audit(
+                    events, include_raw=True,
+                )
+                self._post(MSG_ZENITH_FH_DONE, report)
+            except Exception as exc:  # noqa: BLE001 — surface to UI
+                log.exception("Flight History audit failed")
+                self._post(MSG_ZENITH_FH_ERROR, f"{type(exc).__name__}: {exc}")
+
+        self._zenith_fh_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_fh_worker.start()
+
+    def _zenith_fh_render(self, report) -> None:
+        """Drop the audit headlines into the on-screen summary tree."""
+        tree = self.zenith_fh_tree
+        for child in tree.get_children():
+            tree.delete(child)
+        start, end = report.date_range
+        rng = (
+            f"{start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}"
+            if start and end else "—"
+        )
+        rows = [
+            ("Files parsed", f"{report.file_count}"),
+            ("Total events", f"{report.event_count:,}"),
+            ("Date range", rng),
+            ("PNRs with class history", f"{len(report.class_trajectories):,}"),
+            (
+                "  · with downgrades",
+                f"{sum(1 for t in report.class_trajectories if t.total_downgrade_severity > 0):,}",
+            ),
+            ("Downgrade leaders (agents)", f"{len(report.downgrade_leaders):,}"),
+            ("G-class events", f"{len(report.g_class_events):,}"),
+            ("Distinct agents", f"{len(report.agent_activity):,}"),
+            ("Revenue Mgmt changes", f"{len(report.revenue_mgmt_changes):,}"),
+            ("Suspicious flags (high)",
+             f"{sum(1 for f in report.suspicious_flags if f.severity == 'high'):,}"),
+            ("Suspicious flags (medium)",
+             f"{sum(1 for f in report.suspicious_flags if f.severity == 'medium'):,}"),
+        ]
+        for metric, value in rows:
+            tree.insert("", "end", values=(metric, value))
+        if report.downgrade_leaders:
+            tree.insert("", "end", values=("", ""))
+            tree.insert("", "end", values=("Top downgrade leaders", ""))
+            for d in report.downgrade_leaders[:5]:
+                label = f"  · {d.agent_display_name or d.agent_user_id}"
+                tree.insert("", "end", values=(
+                    label[:80],
+                    f"{d.total_severity} sev / {d.downgrade_event_count} events",
+                ))
+
+    def _zenith_fh_export(self) -> None:
+        if self._zenith_fh_last_report is None:
+            messagebox.showerror(
+                "Flight History Analyzer", "Run an audit first.",
+            )
+            return
+        folder = Path(self.zenith_fh_output_dir.get().strip() or str(Path.home()))
+        try:
+            out_path = excel_io.build_zenith_history_output_path(folder)
+            excel_io.write_zenith_history_audit(out_path, self._zenith_fh_last_report)
+        except Exception as exc:  # noqa: BLE001 — surface
+            log.exception("Flight History export failed")
+            messagebox.showerror(
+                "Flight History Analyzer",
+                f"Export failed: {type(exc).__name__}: {exc}",
+            )
+            return
+        messagebox.showinfo(
+            "Flight History Analyzer — Done",
+            f"Wrote audit workbook to:\n\n{out_path}",
+        )
 
     # ==================================================================
     # Zenith Customer Lookup tab — actions
