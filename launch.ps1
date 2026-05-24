@@ -25,7 +25,10 @@ $system313 = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
 
 function Test-PythonHasDeps([string]$pythonPath) {
     if (-not (Test-Path $pythonPath)) { return $false }
-    & $pythonPath -c "import matplotlib, openpyxl, requests, keyring, rapidfuzz" 2>$null
+    # PS 5.1 wraps native-cmd stderr in ErrorRecord objects when you use
+    # `2>$null`, leaking the import traceback to the user. Assigning the
+    # merged output stream to $null is the clean way to fully suppress.
+    $null = & $pythonPath -c "import matplotlib, openpyxl, requests, keyring, rapidfuzz" 2>&1
     return ($LASTEXITCODE -eq 0)
 }
 
