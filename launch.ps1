@@ -25,10 +25,13 @@ $system313 = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
 
 function Test-PythonHasDeps([string]$pythonPath) {
     if (-not (Test-Path $pythonPath)) { return $false }
-    # PS 5.1 wraps native-cmd stderr in ErrorRecord objects when you use
-    # `2>$null`, leaking the import traceback to the user. Assigning the
-    # merged output stream to $null is the clean way to fully suppress.
-    $null = & $pythonPath -c "import matplotlib, openpyxl, requests, keyring, rapidfuzz" 2>&1
+    # PS 5.1 wraps native-cmd stderr in ErrorRecord objects, so any
+    # variant of `2>...` inside PowerShell still surfaces the traceback.
+    # Redirecting at the cmd.exe level fully suppresses stderr before
+    # PowerShell sees the stream.
+    $py = "`"$pythonPath`""
+    $code = '"import matplotlib, openpyxl, requests, keyring, rapidfuzz"'
+    & cmd /c "$py -c $code 1>nul 2>nul"
     return ($LASTEXITCODE -eq 0)
 }
 
