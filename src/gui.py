@@ -36,7 +36,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import (
     __version__, auth, config, excel_io, oep_client, oep_presets,
-    updater, zenith_client, zenith_history_analyzer, zenith_history_parser,
+    updater, zenith_client, zenith_history_analyzer, zenith_history_downloader,
+    zenith_history_parser,
 )
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
@@ -98,6 +99,11 @@ MSG_ZENITH_FH_PROGRESS = "zenith_fh_progress"  # (i, total, current_file)
 MSG_ZENITH_FH_PARSED = "zenith_fh_parsed"      # payload: int (event count)
 MSG_ZENITH_FH_DONE = "zenith_fh_done"          # payload: HistoryAuditReport
 MSG_ZENITH_FH_ERROR = "zenith_fh_error"
+# Zenith Flight History downloader (Phase 3)
+MSG_ZENITH_DL_STATUS = "zenith_dl_status"      # payload: str (status line)
+MSG_ZENITH_DL_PROGRESS = "zenith_dl_progress"  # (i, total, label, status_code)
+MSG_ZENITH_DL_DONE = "zenith_dl_done"          # payload: dict (counts + folder)
+MSG_ZENITH_DL_ERROR = "zenith_dl_error"
 
 # Updater worker → GUI message types
 MSG_UPDATE_LOG = "update_log"
@@ -2294,6 +2300,44 @@ class App:
             self.btn_zenith_fh_run.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("Flight History Analyzer — Error", str(payload))
+        # ----- Flight History downloader (Phase 3) -----
+        elif kind == MSG_ZENITH_DL_STATUS:
+            self.zenith_fh_status_label.configure(text=str(payload))
+        elif kind == MSG_ZENITH_DL_PROGRESS:
+            idx, total, label, status_code = payload  # type: ignore[misc]
+            self.zenith_fh_progress.configure(maximum=total, value=idx)
+            self.zenith_fh_status_label.configure(
+                text=f"Downloading {idx}/{total}  ·  {label}  [{status_code}]",
+            )
+        elif kind == MSG_ZENITH_DL_DONE:
+            info = payload  # type: ignore[assignment]
+            folder = info["folder"]
+            summary = info["summary"]
+            total = info["total"]
+            self.btn_zenith_fh_download.configure(state="normal")
+            ok = summary.get("OK", 0)
+            skipped = summary.get("SKIP_EXISTS", 0)
+            empty = summary.get("EMPTY", 0)
+            errors = summary.get("ERROR", 0)
+            self.zenith_fh_status_label.configure(
+                text=(
+                    f"Download done — {ok} new, {skipped} skipped, "
+                    f"{empty} empty, {errors} errors / {total} flights"
+                )
+            )
+            messagebox.showinfo(
+                "Download from Zenith — Done",
+                f"Saved to: {folder}\n\n"
+                f"  OK:      {ok}\n"
+                f"  Skipped: {skipped}\n"
+                f"  Empty:   {empty}\n"
+                f"  Errors:  {errors}\n"
+                f"  Total:   {total}",
+            )
+        elif kind == MSG_ZENITH_DL_ERROR:
+            self.btn_zenith_fh_download.configure(state="normal")
+            self.zenith_fh_status_label.configure(text=f"⚠ Download: {payload}")
+            messagebox.showerror("Download from Zenith — Error", str(payload))
 
     def _on_captcha_alert(self, message: str) -> None:
         self._log(f"CAPTCHA: {message}")
@@ -3278,6 +3322,11 @@ class App:
             command=self._zenith_fh_export, state="disabled",
         )
         self.btn_zenith_fh_export.pack(side="left", padx=(8, 0))
+        self.btn_zenith_fh_download = ttk.Button(
+            ctl, text="Download from Zenith…",
+            command=self._zenith_fh_download_dialog,
+        )
+        self.btn_zenith_fh_download.pack(side="left", padx=(8, 0))
         self.zenith_fh_status_label = ttk.Label(
             ctl, text="Idle.", style="Hint.TLabel",
         )
@@ -3308,6 +3357,8 @@ class App:
         # ----- Worker state -----
         self._zenith_fh_worker: threading.Thread | None = None
         self._zenith_fh_last_report = None
+        self._zenith_dl_worker: threading.Thread | None = None
+        self._zenith_dl_stop_flag = threading.Event()
 
     def _zenith_fh_pick_input(self) -> None:
         d = filedialog.askdirectory(
@@ -3430,6 +3481,136 @@ class App:
             "Flight History Analyzer — Done",
             f"Wrote audit workbook to:\n\n{out_path}",
         )
+
+    # ------------------------------------------------------------------
+    # Phase 3 — download fresh history files from Zenith
+    # ------------------------------------------------------------------
+
+    def _zenith_fh_download_dialog(self) -> None:
+        """Modal prompt for date range, then kick off the downloader."""
+        if not getattr(self, "_zenith_session", None):
+            messagebox.showerror(
+                "Download from Zenith",
+                "Sign in to Zenith first (top of this tab).",
+            )
+            return
+        if self._zenith_dl_worker and self._zenith_dl_worker.is_alive():
+            messagebox.showinfo(
+                "Download from Zenith", "A download is already running.",
+            )
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Download flight history from Zenith")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        # Pre-fill with the last week.
+        from datetime import date, timedelta
+        today = date.today()
+        last_week = today - timedelta(days=7)
+        from_var = tk.StringVar(value=last_week.strftime("%d/%m/%Y"))
+        to_var = tk.StringVar(value=today.strftime("%d/%m/%Y"))
+        folder_var = tk.StringVar(value=self.zenith_fh_input_dir.get())
+        skip_var = tk.BooleanVar(value=True)
+
+        frm = ttk.Frame(dlg, padding=12)
+        frm.grid(row=0, column=0)
+        ttk.Label(frm, text="From (DD/MM/YYYY):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=from_var, width=14).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(frm, text="To (DD/MM/YYYY):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=to_var, width=14).grid(row=1, column=1, padx=(8, 0), pady=(6, 0))
+        ttk.Label(frm, text="Save to folder:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        folder_entry = ttk.Entry(frm, textvariable=folder_var, width=50)
+        folder_entry.grid(row=2, column=1, padx=(8, 0), pady=(6, 0))
+        ttk.Button(
+            frm, text="…",
+            command=lambda: folder_var.set(
+                filedialog.askdirectory(initialdir=folder_var.get()) or folder_var.get(),
+            ),
+        ).grid(row=2, column=2, padx=(4, 0), pady=(6, 0))
+        ttk.Checkbutton(
+            frm, text="Skip files that already exist (recommended)",
+            variable=skip_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, pady=(12, 0), sticky="e")
+
+        def on_start() -> None:
+            try:
+                date_from = from_var.get().strip()
+                date_to = to_var.get().strip()
+                folder = Path(folder_var.get().strip())
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 — surface to user
+                messagebox.showerror("Download from Zenith", f"Bad inputs: {exc}")
+                return
+            dlg.destroy()
+            self._zenith_fh_start_download(
+                date_from, date_to, folder, skip_var.get(),
+            )
+
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(
+            btns, text="Start download", command=on_start, style="Primary.TButton",
+        ).pack(side="right", padx=(0, 8))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+
+    def _zenith_fh_start_download(
+        self, date_from: str, date_to: str, folder: Path, skip_existing: bool,
+    ) -> None:
+        """Worker driver — lists flights, then downloads each into `folder`."""
+        self._zenith_dl_stop_flag.clear()
+        self.zenith_fh_status_label.configure(
+            text=f"Downloading from Zenith ({date_from} → {date_to})…",
+        )
+        self.zenith_fh_progress.configure(value=0, maximum=1)
+        self.btn_zenith_fh_download.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                self._post(MSG_ZENITH_DL_STATUS, "Listing flights from Zenith…")
+                flights = zenith_history_downloader.list_flights(
+                    self._zenith_session, date_from, date_to,
+                )
+                self._post(
+                    MSG_ZENITH_DL_STATUS,
+                    f"Found {len(flights)} flights — starting downloads",
+                )
+
+                def per_progress(result, idx: int, total: int) -> None:
+                    label = (
+                        f"{result.flight.flight_number} "
+                        f"{result.flight.origin}-{result.flight.destination}"
+                    )
+                    self._post(
+                        MSG_ZENITH_DL_PROGRESS,
+                        (idx, total, label, result.status),
+                    )
+
+                results = zenith_history_downloader.download_history_batch(
+                    self._zenith_session, flights, folder,
+                    skip_if_exists=skip_existing,
+                    progress_cb=per_progress,
+                    stop_event=self._zenith_dl_stop_flag,
+                )
+                summary: dict[str, int] = {}
+                for r in results:
+                    summary[r.status] = summary.get(r.status, 0) + 1
+                self._post(MSG_ZENITH_DL_DONE, {
+                    "folder": str(folder),
+                    "summary": summary,
+                    "total": len(results),
+                })
+            except Exception as exc:  # noqa: BLE001 — surface
+                log.exception("Zenith history download failed")
+                self._post(
+                    MSG_ZENITH_DL_ERROR, f"{type(exc).__name__}: {exc}",
+                )
+
+        self._zenith_dl_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_dl_worker.start()
 
     # ==================================================================
     # Zenith Customer Lookup tab — actions
