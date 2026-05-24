@@ -3321,6 +3321,35 @@ class App:
             io_body, 2, "Flight Loads (optional):", loads_entry, suffix=loads_btn,
         )
 
+        # Tunable verdict thresholds. Only used when a Flight Loads file
+        # is supplied. Defaults match zenith_loads_index module constants.
+        self.zenith_fh_high_threshold = tk.DoubleVar(
+            value=zenith_loads_index.HIGH_LOAD_THRESHOLD,
+        )
+        self.zenith_fh_low_threshold = tk.DoubleVar(
+            value=zenith_loads_index.LOW_LOAD_THRESHOLD,
+        )
+        thresh_row = ttk.Frame(io_body)
+        ttk.Label(thresh_row, text="QUESTIONABLE at ≥").pack(side="left")
+        ttk.Spinbox(
+            thresh_row, from_=50.0, to=100.0, increment=1.0,
+            textvariable=self.zenith_fh_high_threshold, width=6,
+            format="%.1f",
+        ).pack(side="left", padx=(4, 2))
+        ttk.Label(thresh_row, text="%   JUSTIFIED below").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(
+            thresh_row, from_=20.0, to=90.0, increment=1.0,
+            textvariable=self.zenith_fh_low_threshold, width=6,
+            format="%.1f",
+        ).pack(side="left", padx=(4, 2))
+        ttk.Label(thresh_row, text="%").pack(side="left")
+        ttk.Label(
+            thresh_row,
+            text=" (in between = SITUATIONAL)",
+            style="Hint.TLabel",
+        ).pack(side="left", padx=(8, 0))
+        self._form_row(io_body, 3, "Load verdict thresholds:", thresh_row)
+
         # ----- Controls -----
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -3420,6 +3449,30 @@ class App:
         self.zenith_fh_progress.configure(value=0, maximum=1)
 
         loads_path = self.zenith_fh_loads_path.get().strip()
+        try:
+            high_thresh = float(self.zenith_fh_high_threshold.get())
+            low_thresh = float(self.zenith_fh_low_threshold.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror(
+                "Flight History Analyzer",
+                "Verdict thresholds must be numbers. Resetting to defaults.",
+            )
+            self.zenith_fh_high_threshold.set(
+                zenith_loads_index.HIGH_LOAD_THRESHOLD,
+            )
+            self.zenith_fh_low_threshold.set(
+                zenith_loads_index.LOW_LOAD_THRESHOLD,
+            )
+            self.btn_zenith_fh_run.configure(state="normal")
+            return
+        if high_thresh <= low_thresh:
+            messagebox.showerror(
+                "Flight History Analyzer",
+                f"QUESTIONABLE threshold ({high_thresh}) must be greater than "
+                f"JUSTIFIED threshold ({low_thresh}).",
+            )
+            self.btn_zenith_fh_run.configure(state="normal")
+            return
 
         def worker() -> None:
             try:
@@ -3442,6 +3495,7 @@ class App:
 
                 report = zenith_history_analyzer.run_history_audit(
                     events, include_raw=True, load_lookup=load_lookup,
+                    high_threshold=high_thresh, low_threshold=low_thresh,
                 )
                 self._post(MSG_ZENITH_FH_DONE, report)
             except Exception as exc:  # noqa: BLE001 — surface to UI

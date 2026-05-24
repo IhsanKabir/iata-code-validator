@@ -470,6 +470,9 @@ def audit_suspicious(
 def audit_downgrade_justification(
     events: Iterable[HistoryEvent],
     load_lookup: LoadLookup,
+    *,
+    high_threshold: float | None = None,
+    low_threshold: float | None = None,
 ) -> list[DowngradeJustification]:
     """For every class downgrade, join the flight's load% + verdict.
 
@@ -495,7 +498,12 @@ def audit_downgrade_justification(
                 curr.flight.destination,
             )
             load_pct = entry.load_pct if entry else None
-            verdict = load_verdict(load_pct)
+            verdict_kwargs = {}
+            if high_threshold is not None:
+                verdict_kwargs["high_threshold"] = high_threshold
+            if low_threshold is not None:
+                verdict_kwargs["low_threshold"] = low_threshold
+            verdict = load_verdict(load_pct, **verdict_kwargs)
             route = (
                 f"{curr.flight.origin}-{curr.flight.destination}"
                 if curr.flight.origin and curr.flight.destination else ""
@@ -540,6 +548,8 @@ def run_history_audit(
     *,
     include_raw: bool = True,
     load_lookup: LoadLookup | None = None,
+    high_threshold: float | None = None,
+    low_threshold: float | None = None,
 ) -> HistoryAuditReport:
     """Run every audit in one pass and return the bundled report."""
     events = list(events)
@@ -574,7 +584,11 @@ def run_history_audit(
     flags = audit_suspicious(events, trajectories)
     justifications: list[DowngradeJustification] = []
     if load_lookup is not None:
-        justifications = audit_downgrade_justification(events, load_lookup)
+        justifications = audit_downgrade_justification(
+            events, load_lookup,
+            high_threshold=high_threshold,
+            low_threshold=low_threshold,
+        )
         log.info(
             "Downgrade justification: %d rows; verdicts=%s",
             len(justifications),

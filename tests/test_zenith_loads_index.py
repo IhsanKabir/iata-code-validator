@@ -68,6 +68,51 @@ def test_verdict_buckets():
     assert load_verdict(None) == VERDICT_UNKNOWN
 
 
+def test_verdict_buckets_with_custom_thresholds():
+    """Caller-supplied thresholds (e.g. from the GUI sliders) override defaults."""
+    # Tighter standards: questionable above 80%, justified below 50%
+    assert load_verdict(85.0, high_threshold=80.0, low_threshold=50.0) == VERDICT_QUESTIONABLE
+    assert load_verdict(65.0, high_threshold=80.0, low_threshold=50.0) == VERDICT_SITUATIONAL
+    assert load_verdict(40.0, high_threshold=80.0, low_threshold=50.0) == VERDICT_JUSTIFIED
+    # Looser standards: questionable only above 99%, justified below 30%
+    assert load_verdict(95.0, high_threshold=99.0, low_threshold=30.0) == VERDICT_SITUATIONAL
+
+
+def test_audit_uses_caller_thresholds():
+    """audit_downgrade_justification respects per-call thresholds."""
+    from datetime import datetime
+    from src.zenith_history_analyzer import audit_downgrade_justification
+    from src.zenith_history_parser import Agent, FlightRef, HistoryEvent
+
+    def _e(pnr, ts, rbd):
+        return HistoryEvent(
+            source_file="t.xls", row_index=0,
+            raw_date=ts, raw_created_by="A (a)",
+            raw_description="", event_type="Ticket Modification",
+            pnr=pnr, customer="",
+            raw_flight="BS341 DAC DXB 01/01/2026 00:00", passenger="X",
+            timestamp=datetime.strptime(ts, "%d/%m/%Y %H:%M"),
+            agent=Agent(raw="A (a)", display_name="A", user_id="a", department=""),
+            flight=FlightRef(raw="", flight_number="BS341",
+                            origin="DAC", destination="DXB",
+                            flight_date="01/01/2026", departure_time="00:00"),
+            rbd_class=rbd,
+        )
+
+    events = [_e("P1", "01/01/2026 10:00", "Y"), _e("P1", "01/01/2026 14:00", "G")]
+    lookup = LoadLookup.from_entries([_entry("BS341", "01/01/2026", "DAC", "DXB", 85)])
+
+    # Default thresholds (90/70): 85% → SITUATIONAL
+    default = audit_downgrade_justification(events, lookup)
+    assert default[0].verdict == VERDICT_SITUATIONAL
+
+    # Stricter high threshold (80): same 85% → QUESTIONABLE
+    strict = audit_downgrade_justification(
+        events, lookup, high_threshold=80.0, low_threshold=50.0,
+    )
+    assert strict[0].verdict == VERDICT_QUESTIONABLE
+
+
 # ---------------------------------------------------------------------------
 # Excel reader
 # ---------------------------------------------------------------------------

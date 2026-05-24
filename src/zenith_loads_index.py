@@ -243,12 +243,22 @@ class LoadLookup:
 # ---------------------------------------------------------------------------
 
 
-def load_verdict(load_pct: float | None) -> str:
-    """Bucket a load% into a justification verdict for audit reports."""
+def load_verdict(
+    load_pct: float | None,
+    *,
+    high_threshold: float = HIGH_LOAD_THRESHOLD,
+    low_threshold: float = LOW_LOAD_THRESHOLD,
+) -> str:
+    """Bucket a load% into a justification verdict for audit reports.
+
+    Thresholds default to the module-level constants but callers
+    (notably the GUI) can override them at audit time without
+    editing this file.
+    """
     if load_pct is None:
         return VERDICT_UNKNOWN
-    if load_pct >= HIGH_LOAD_THRESHOLD:
+    if load_pct >= high_threshold:
         return VERDICT_QUESTIONABLE
-    if load_pct < LOW_LOAD_THRESHOLD:
+    if load_pct < low_threshold:
         return VERDICT_JUSTIFIED
     return VERDICT_SITUATIONAL
