@@ -126,7 +126,7 @@ MSG_UPDATE_ERROR = "update_error"
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("IATA Code Validator")
+        self.root.title("Travel Ops Console")
         self.root.geometry("1080x820")
         self.root.minsize(900, 640)
 
@@ -415,7 +415,8 @@ class App:
         ctrl = ttk.Frame(parent)
         ctrl.pack(fill="x", pady=(8, 4), padx=4)
         self.btn_start = ttk.Button(
-            ctrl, text="Start", command=self._start, style="Primary.TButton"
+            ctrl, text="Validate IATA codes", command=self._start,
+            style="Primary.TButton",
         )
         self.btn_start.pack(side="left", padx=(0, 8))
         self.btn_pause = ttk.Button(ctrl, text="Pause", command=self._pause, state="disabled")
@@ -535,7 +536,8 @@ class App:
         ctrl = ttk.Frame(parent)
         ctrl.pack(fill="x", pady=(8, 4), padx=4)
         self.btn_bd_run = ttk.Button(
-            ctrl, text="Run", command=self._bd_run, style="Primary.TButton",
+            ctrl, text="Run agency lookup",
+            command=self._bd_run, style="Primary.TButton",
         )
         self.btn_bd_run.pack(side="left")
 
@@ -689,7 +691,8 @@ class App:
         ctrl = ttk.Frame(parent)
         ctrl.pack(fill="x", pady=(8, 4), padx=4)
         self.btn_oep_run = ttk.Button(
-            ctrl, text="Run", command=self._oep_run, style="Primary.TButton",
+            ctrl, text="Run overseas-movement report",
+            command=self._oep_run, style="Primary.TButton",
         )
         self.btn_oep_run.pack(side="left")
         self.btn_oep_export = ttk.Button(
@@ -2214,7 +2217,7 @@ class App:
                     f"company={sv.get('ID_SOCIETE')} · app={sv.get('ID_APPLICATION')}"
                 ),
             )
-            self.btn_zenith_login.configure(state="normal", text="Re-sign in")
+            self.btn_zenith_login.configure(state="normal", text="Sign in again")
             # Don't keep the password in the widget after success.
             self.zenith_pwd_entry.delete(0, "end")
             self._zenith_log("Signed in to Zenith.")
@@ -3423,7 +3426,7 @@ class App:
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
         self.btn_zenith_fh_run = ttk.Button(
-            ctl, text="Run Audit", style="Primary.TButton",
+            ctl, text="Run history audit", style="Primary.TButton",
             command=self._zenith_fh_run,
         )
         self.btn_zenith_fh_run.pack(side="left")
@@ -3518,11 +3521,21 @@ class App:
         )
         self._form_row(io_body, 0, "Input Excel:", input_entry, suffix=input_btn)
 
-        sheet_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_sheet_name)
-        self._form_row(io_body, 1, "Sheet (blank = first):", sheet_entry)
+        # Sheet + column drop into Comboboxes the moment a workbook is picked.
+        # User can still type, but the lists keep them from guessing.
+        self.zenith_bulk_sheet_combo = ttk.Combobox(
+            io_body, textvariable=self.zenith_bulk_sheet_name, state="readonly",
+        )
+        self.zenith_bulk_sheet_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._zenith_bulk_reload_columns(),
+        )
+        self._form_row(io_body, 1, "Sheet:", self.zenith_bulk_sheet_combo)
 
-        col_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_column_name)
-        self._form_row(io_body, 2, "PNR column name:", col_entry)
+        self.zenith_bulk_column_combo = ttk.Combobox(
+            io_body, textvariable=self.zenith_bulk_column_name, state="readonly",
+        )
+        self._form_row(io_body, 2, "PNR column:", self.zenith_bulk_column_combo)
 
         out_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_output_dir)
         out_btn = ttk.Button(
@@ -3535,7 +3548,7 @@ class App:
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
         self.btn_zenith_bulk_run = ttk.Button(
-            ctl, text="Run Lookup", style="Primary.TButton",
+            ctl, text="Look up PNRs", style="Primary.TButton",
             command=self._zenith_bulk_run,
         )
         self.btn_zenith_bulk_run.pack(side="left")
@@ -3573,8 +3586,64 @@ class App:
             title="Pick the Excel with your PNR list",
             filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
         )
-        if f:
-            self.zenith_bulk_input_path.set(f)
+        if not f:
+            return
+        self.zenith_bulk_input_path.set(f)
+        self._zenith_bulk_reload_sheets()
+
+    def _zenith_bulk_reload_sheets(self) -> None:
+        """Fill the sheet dropdown from the picked workbook."""
+        path = self.zenith_bulk_input_path.get().strip()
+        if not path or not Path(path).is_file():
+            self.zenith_bulk_sheet_combo["values"] = ()
+            self.zenith_bulk_column_combo["values"] = ()
+            return
+        try:
+            sheets = excel_io.list_sheet_names(Path(path))
+        except Exception as exc:  # noqa: BLE001 — surface to UI
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                f"Couldn't read sheet names:\n{type(exc).__name__}: {exc}",
+            )
+            return
+        self.zenith_bulk_sheet_combo["values"] = sheets
+        if sheets:
+            self.zenith_bulk_sheet_combo.current(0)
+        self._zenith_bulk_reload_columns()
+
+    def _zenith_bulk_reload_columns(self) -> None:
+        """Fill the PNR-column dropdown from the chosen sheet's header row.
+
+        Auto-selects a column whose header starts with "PNR" (case-insensitive)
+        when the user hasn't already picked one — so 90% of the time the
+        defaults are right and no manual fiddling is needed.
+        """
+        path = self.zenith_bulk_input_path.get().strip()
+        sheet = self.zenith_bulk_sheet_name.get().strip()
+        if not path or not sheet:
+            self.zenith_bulk_column_combo["values"] = ()
+            return
+        try:
+            cols = excel_io.list_columns(Path(path), sheet)
+        except Exception as exc:  # noqa: BLE001 — surface to UI
+            messagebox.showerror(
+                "PNR Bulk Lookup",
+                f"Couldn't read columns from sheet {sheet!r}:\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self.zenith_bulk_column_combo["values"] = cols
+        current = self.zenith_bulk_column_name.get().strip()
+        if current in cols:
+            return
+        # Prefer a header that looks like a PNR column.
+        pnr_like = next(
+            (c for c in cols if c.strip().lower().startswith("pnr")), None,
+        )
+        if pnr_like:
+            self.zenith_bulk_column_name.set(pnr_like)
+        elif cols:
+            self.zenith_bulk_column_combo.current(0)
 
     def _zenith_bulk_pick_output(self) -> None:
         d = filedialog.askdirectory(
