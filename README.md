@@ -11,7 +11,7 @@ no Python or admin required.
 
 | Tab | One-liner | Source |
 | --- | --- | --- |
-| **IATA Code Validator** | Bulk-validate IATA Numeric Codes; reCAPTCHA handled | IATA CheckACode |
+| **IATA Code Validator** | Validate IATA Numeric Codes from an Excel column | IATA CheckACode |
 | **BD Travel Agency Lookup** | Resolve / export Bangladesh travel-agency records | regtravelagency.gov.bd |
 | **BD Overseas Movement** | 8 views of BD outflow (destinations, divisions, time series, pivots…) | oep.gov.bd |
 | **Zenith** | 4 sub-tabs against US-Bangla Zenith — *login required* | asia.ttinteractive.com |
