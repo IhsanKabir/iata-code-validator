@@ -140,4 +140,4 @@ Zenith tabs
   a valid Zenith account.
 - Auto-updater checks GitHub Releases on launch.
 
-**License:** internal/private use. Not for redistribution.
+**License:** © 2025-2026 A K M Ihsan Kabir. All Rights Reserved. See [LICENSE](LICENSE).
