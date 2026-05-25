@@ -5,4 +5,5 @@ requests==2.33.1
 rapidfuzz==3.14.5
 keyring==25.7.0
 matplotlib==3.10.0
+sv-ttk==2.6.1
 pyinstaller==6.20.0

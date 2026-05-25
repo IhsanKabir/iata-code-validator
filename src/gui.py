@@ -219,29 +219,299 @@ class App:
         # before `ensure_signed_in` runs.
         self._refresh_user_label()
         self.root.after(100, self._poll_queue)
+        # Live tab-label refresh — appends "●" while a worker is running
+        # and "(N cached)" once an idle tab has cache to show off.
+        self.root.after(500, self._refresh_tab_labels)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _refresh_tab_labels(self) -> None:
+        """Annotate outer-notebook tabs with live worker / cache state.
+
+        Re-runs on a 2-second tick. Keeps the labels short — a single
+        glyph plus an optional count, so the user can see "Zenith ●"
+        means a worker is busy without leaving their current tab.
+        """
+        try:
+            running = {
+                "iata": self._worker is not None and self._worker.is_alive(),
+                "bd": self._bd_worker is not None and self._bd_worker.is_alive(),
+                "oep": self._oep_worker is not None and self._oep_worker.is_alive(),
+                "zenith": any(
+                    w is not None and w.is_alive() for w in (
+                        getattr(self, "_zenith_worker", None),
+                        getattr(self, "_zenith_fl_worker", None),
+                        getattr(self, "_zenith_fh_worker", None),
+                        getattr(self, "_zenith_pnr_worker", None),
+                        getattr(self, "_zenith_bulk_worker", None),
+                        getattr(self, "_zenith_dl_worker", None),
+                    )
+                ),
+            }
+            cache_counts = {
+                "iata": self._cache.count() if hasattr(self, "_cache") and self._cache else 0,
+                "bd": (
+                    self._bd_cache.count()
+                    if hasattr(self, "_bd_cache") and self._bd_cache else 0
+                ),
+                "zenith": (
+                    self._zenith_pnr_cache.count()
+                    if hasattr(self, "_zenith_pnr_cache") and self._zenith_pnr_cache else 0
+                ),
+            }
+            for key, widget in self._tab_widgets.items():
+                base = self._tab_base_labels[widget]
+                pieces = [base]
+                if running.get(key):
+                    pieces.append("●")
+                count = cache_counts.get(key)
+                if count:
+                    pieces.append(f"({count:,} cached)")
+                label = " ".join(pieces)
+                try:
+                    self.outer_notebook.tab(widget, text=label)
+                except tk.TclError:
+                    pass
+        except Exception:  # noqa: BLE001 — never let the timer kill the app
+            log.exception("tab-label refresh failed")
+        finally:
+            try:
+                self.root.after(2000, self._refresh_tab_labels)
+            except tk.TclError:
+                return
 
     # ------------------------------------------------------------------
     # Theme + custom widget styles
     # ------------------------------------------------------------------
 
+    # Semantic palette — single source of truth for every coloured
+    # widget. If a future user requests dark mode this is the spot to
+    # branch on `sv_ttk.get_theme()` and emit alternate hexes.
+    _COLOR_PRIMARY = "#0078D4"   # Microsoft accent blue
+    _COLOR_PRIMARY_HOVER = "#106EBE"
+    _COLOR_DANGER = "#C42B1C"    # WinUI red for Stop / errors
+    _COLOR_SUCCESS = "#107C10"   # WinUI green for "Signed in"
+    _COLOR_WARNING = "#9D5D00"   # warm amber for partial states
+    _COLOR_MUTED = "#64748b"     # slate-500 for hints / metadata
+    _COLOR_SECTION = "#1f2937"   # slate-800 for section titles
+    _COLOR_ROW_BAD = "#FDE7E9"   # soft red row tint (e.g. QUESTIONABLE verdicts)
+    _COLOR_ROW_GOOD = "#DFF6DD"  # soft green row tint
+    _COLOR_ROW_WARN = "#FFF4CE"  # soft amber row tint
+
     def _setup_styles(self) -> None:
-        """Pick a modern theme and define our reusable styles."""
+        """Apply the Sun Valley (Windows-11) base theme + semantic styles.
+
+        sv_ttk takes over the ttk look entirely; we layer our named
+        styles on top *after* `set_theme` so they win. If sv_ttk fails
+        to import (e.g. unbundled dev environment) we fall back to the
+        previous vista/winnative chain — the app still works, just
+        looks plainer.
+        """
         style = ttk.Style()
-        # Vista is Windows-native and looks much better than the default
-        # 'default' theme. Fall through to clam on non-Windows / older Tk.
-        for name in ("vista", "winnative", "clam"):
-            if name in style.theme_names():
-                style.theme_use(name)
-                break
-        # Reusable named styles
-        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"))
-        style.configure("Hint.TLabel", foreground="#64748b", font=("Segoe UI", 9))
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(18, 8))
+        try:
+            import sv_ttk
+            # Respect the in-memory dark/light preference so a toggle
+            # → _setup_styles round-trip doesn't snap back to light.
+            mode = "dark" if getattr(self, "_theme_is_dark", False) else "light"
+            sv_ttk.set_theme(mode)
+        except Exception:  # noqa: BLE001 — degrade gracefully
+            log.warning("sv_ttk unavailable; using fallback ttk theme")
+            for name in ("vista", "winnative", "clam"):
+                if name in style.theme_names():
+                    style.theme_use(name)
+                    break
+
+        # Typography hierarchy
+        style.configure(
+            "Section.TLabel",
+            font=("Segoe UI Semibold", 11),
+            foreground=self._COLOR_SECTION,
+        )
+        style.configure(
+            "SectionLg.TLabel",
+            font=("Segoe UI Semibold", 13),
+            foreground=self._COLOR_SECTION,
+        )
+        style.configure(
+            "Hint.TLabel",
+            foreground=self._COLOR_MUTED,
+            font=("Segoe UI", 9),
+        )
+
+        # Primary action — accent blue.
+        # sv_ttk ships "Accent.TButton" already; we expose it under our
+        # historical name so existing code keeps working without churn.
+        style.configure("Primary.TButton", font=("Segoe UI Semibold", 10))
+        try:
+            style.map("Primary.TButton",
+                background=[("active", self._COLOR_PRIMARY_HOVER)])
+        except tk.TclError:
+            pass
+
+        # Danger — used for Stop / destructive controls.
+        style.configure(
+            "Danger.TButton",
+            font=("Segoe UI Semibold", 10),
+            foreground="white",
+            background=self._COLOR_DANGER,
+        )
+        try:
+            style.map("Danger.TButton",
+                background=[
+                    ("active", "#A82A1C"),
+                    ("disabled", "#E0A6A0"),
+                ],
+                foreground=[("disabled", "#F5DDDA")])
+        except tk.TclError:
+            pass
+
+        # Status chips
+        style.configure(
+            "Success.TLabel",
+            foreground=self._COLOR_SUCCESS,
+            font=("Segoe UI Semibold", 10),
+        )
+        style.configure(
+            "Warning.TLabel",
+            foreground=self._COLOR_WARNING,
+            font=("Segoe UI Semibold", 10),
+        )
+        style.configure(
+            "Error.TLabel",
+            foreground=self._COLOR_DANGER,
+            font=("Segoe UI Semibold", 10),
+        )
 
     # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
+
+    class _Tooltip:
+        """Lightweight hover tooltip for any widget.
+
+        Shows after a short delay so accidental cursor passes don't
+        flash the popup; hides on leave or click. The popup is a
+        borderless `Toplevel` so it floats above the main window
+        without altering layout.
+        """
+
+        DELAY_MS = 350
+        WRAP_WIDTH = 320
+
+        def __init__(
+            self,
+            widget: tk.Widget,
+            text: str,
+            *,
+            background: str = "#1f2937",   # slate-800
+            foreground: str = "#f8fafc",   # slate-50
+        ) -> None:
+            self.widget = widget
+            self.text = text
+            self.background = background
+            self.foreground = foreground
+            self._tip: tk.Toplevel | None = None
+            self._after_id: str | None = None
+            widget.bind("<Enter>", self._on_enter, add="+")
+            widget.bind("<Leave>", self._on_leave, add="+")
+            widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+        def _on_enter(self, _event=None) -> None:
+            self._cancel_pending()
+            try:
+                self._after_id = self.widget.after(self.DELAY_MS, self._show)
+            except tk.TclError:
+                pass
+
+        def _on_leave(self, _event=None) -> None:
+            self._cancel_pending()
+            self._hide()
+
+        def _cancel_pending(self) -> None:
+            if self._after_id is not None:
+                try:
+                    self.widget.after_cancel(self._after_id)
+                except tk.TclError:
+                    pass
+                self._after_id = None
+
+        def _show(self) -> None:
+            if self._tip is not None:
+                return
+            try:
+                x = self.widget.winfo_rootx() + 18
+                y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            except tk.TclError:
+                return
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.configure(background=self.background)
+            frame = tk.Frame(
+                tip, background=self.background,
+                padx=10, pady=6, borderwidth=0,
+            )
+            frame.pack()
+            label = tk.Label(
+                frame, text=self.text, justify="left",
+                background=self.background, foreground=self.foreground,
+                font=("Segoe UI", 9), wraplength=self.WRAP_WIDTH,
+            )
+            label.pack()
+            self._tip = tip
+
+        def _hide(self) -> None:
+            if self._tip is not None:
+                try:
+                    self._tip.destroy()
+                except tk.TclError:
+                    pass
+                self._tip = None
+
+    def _attach_tooltip(self, widget: tk.Widget, text: str) -> None:
+        """Public sugar — attach a tooltip without managing the instance."""
+        App._Tooltip(widget, text)
+
+    def _attach_log_placeholder(self, text_widget: tk.Text, hint: str) -> None:
+        """Render ghost text in an empty log widget; vanish on first real line.
+
+        Tk's `Text` has no native placeholder, so we paint the hint with
+        a muted tag at insert-position 1.0 and listen for any user-driven
+        insertion to clear it. The widget's normal callers (which all
+        unlock state="normal" before .insert("end", ...)) blow this away
+        the moment the run actually starts.
+        """
+        text_widget.tag_configure(
+            "placeholder", foreground=self._COLOR_MUTED,
+            font=("Segoe UI", 9, "italic"),
+        )
+        text_widget.configure(state="normal")
+        text_widget.insert("1.0", hint, ("placeholder",))
+        text_widget.configure(state="disabled")
+
+        def _clear_on_first_real_write(*_args) -> None:
+            content = text_widget.get("1.0", "end-1c").strip()
+            if content == hint.strip():
+                return
+            # Remove the placeholder line if it's still the first line.
+            first_line = text_widget.get("1.0", "1.end")
+            if first_line.strip() == hint.split("\n", 1)[0].strip():
+                text_widget.configure(state="normal")
+                text_widget.delete("1.0", "2.0")
+                text_widget.configure(state="disabled")
+            try:
+                text_widget.event_remove("<<TextChanged>>")
+            except tk.TclError:
+                pass
+
+        # The standard `<<Modified>>` virtual event fires on every edit.
+        def _on_modified(_event) -> None:
+            try:
+                text_widget.edit_modified(False)
+            except tk.TclError:
+                return
+            _clear_on_first_real_write()
+
+        text_widget.bind("<<Modified>>", _on_modified)
 
     @staticmethod
     def _make_scrollable(parent: ttk.Frame) -> ttk.Frame:
@@ -290,9 +560,18 @@ class App:
 
         return inner
 
-    @staticmethod
-    def _section(parent: tk.Widget, title: str) -> ttk.Frame:
+    def _section(
+        self,
+        parent: tk.Widget,
+        title: str,
+        help_text: str = "",
+    ) -> ttk.Frame:
         """Section heading + separator + inner content frame.
+
+        When `help_text` is non-empty, an ⓘ icon is rendered next to the
+        title; hovering it shows the help text as a tooltip. This keeps
+        the visual surface clean while preserving the long-form
+        explanation for users who want it.
 
         Returns the inner frame. Caller should `.pack(...)` widgets into it.
         """
@@ -301,6 +580,15 @@ class App:
         header = ttk.Frame(wrapper)
         header.pack(fill="x")
         ttk.Label(header, text=title, style="Section.TLabel").pack(side="left")
+        if help_text:
+            info = ttk.Label(
+                header, text="ⓘ",
+                foreground=self._COLOR_MUTED,
+                font=("Segoe UI", 10),
+                cursor="question_arrow",
+            )
+            info.pack(side="left", padx=(6, 0))
+            self._attach_tooltip(info, help_text)
         ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(2, 6))
         body = ttk.Frame(wrapper)
         body.pack(fill="x")
@@ -349,6 +637,14 @@ class App:
         )
         self.btn_check_updates.pack(side="right", padx=4, pady=2)
 
+        # Theme toggle — flips sv_ttk between light/dark with one click.
+        # Defaults to light, matches what `_setup_styles` applied.
+        self._theme_is_dark = False
+        self.btn_theme = ttk.Button(
+            status_frm, text="☾  Dark", command=self._toggle_theme, width=10,
+        )
+        self.btn_theme.pack(side="right", padx=4, pady=2)
+
         # Two mutually-exclusive auth buttons sitting in the same slot —
         # whichever is appropriate gets packed in `_refresh_user_label`.
         self.btn_sign_out = ttk.Button(
@@ -360,16 +656,28 @@ class App:
 
         # Wrap everything in a Notebook so each tool gets its own tab.
         notebook = ttk.Notebook(self.root)
+        self.outer_notebook = notebook
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         iata_tab = ttk.Frame(notebook)
         bd_tab = ttk.Frame(notebook)
         oep_tab = ttk.Frame(notebook)
         zenith_tab = ttk.Frame(notebook)
-        notebook.add(iata_tab, text="IATA Code Validator")
-        notebook.add(bd_tab, text="BD Travel Agency Lookup")
-        notebook.add(oep_tab, text="BD Overseas Movement")
-        notebook.add(zenith_tab, text="Zenith")
+        # Tab text is a base name; `_refresh_tab_labels` appends running
+        # state ("●") and cache counts so users see status at a glance.
+        self._tab_base_labels = {
+            iata_tab: "IATA Code Validator",
+            bd_tab: "BD Travel Agency Lookup",
+            oep_tab: "BD Overseas Movement",
+            zenith_tab: "Zenith",
+        }
+        notebook.add(iata_tab, text=self._tab_base_labels[iata_tab])
+        notebook.add(bd_tab, text=self._tab_base_labels[bd_tab])
+        notebook.add(oep_tab, text=self._tab_base_labels[oep_tab])
+        notebook.add(zenith_tab, text=self._tab_base_labels[zenith_tab])
+        self._tab_widgets = {
+            "iata": iata_tab, "bd": bd_tab, "oep": oep_tab, "zenith": zenith_tab,
+        }
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
@@ -423,7 +731,10 @@ class App:
         self.btn_pause.pack(side="left", padx=4)
         self.btn_resume = ttk.Button(ctrl, text="Resume", command=self._resume, state="disabled")
         self.btn_resume.pack(side="left", padx=4)
-        self.btn_stop = ttk.Button(ctrl, text="Stop", command=self._stop, state="disabled")
+        self.btn_stop = ttk.Button(
+            ctrl, text="Stop", command=self._stop,
+            state="disabled", style="Danger.TButton",
+        )
         self.btn_stop.pack(side="left", padx=4)
 
         # ----- Progress -----
@@ -431,7 +742,7 @@ class App:
         prog.pack(fill="x", padx=4, pady=(8, 4))
         self.progress_bar = ttk.Progressbar(prog, mode="determinate")
         self.progress_bar.pack(fill="x")
-        self.progress_label = ttk.Label(prog, text="Idle.", style="Hint.TLabel")
+        self.progress_label = ttk.Label(prog, text="Pick an Excel above, then click Validate IATA codes.", style="Hint.TLabel")
         self.progress_label.pack(anchor="w", pady=(2, 0))
 
         # ----- Log -----
@@ -447,6 +758,11 @@ class App:
         scroll = ttk.Scrollbar(log_box, command=self.log_text.yview)
         scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
+        self._attach_log_placeholder(
+            self.log_text,
+            "  Live validation events will appear here once you click "
+            "Validate IATA codes.",
+        )
 
     # ------------------------------------------------------------------
     # BD Travel Agency tab
@@ -546,7 +862,7 @@ class App:
         prog.pack(fill="x", padx=4, pady=(8, 4))
         self.bd_progress_bar = ttk.Progressbar(prog, mode="determinate")
         self.bd_progress_bar.pack(fill="x")
-        self.bd_progress_label = ttk.Label(prog, text="Idle.", style="Hint.TLabel")
+        self.bd_progress_label = ttk.Label(prog, text="Refresh once to cache the agency list, then run the lookup.", style="Hint.TLabel")
         self.bd_progress_label.pack(anchor="w", pady=(2, 0))
 
         # ----- Log -----
@@ -562,6 +878,10 @@ class App:
         bd_scroll = ttk.Scrollbar(log_box, command=self.bd_log_text.yview)
         bd_scroll.pack(side="right", fill="y")
         self.bd_log_text.configure(yscrollcommand=bd_scroll.set, state="disabled")
+        self._attach_log_placeholder(
+            self.bd_log_text,
+            "  Agency lookup events will appear here once a run starts.",
+        )
 
         self._toggle_bd_mode()
 
@@ -574,20 +894,14 @@ class App:
         parent = self._make_scrollable(parent)
 
         # ----- Description -----
-        intro = self._section(
+        self._section(
             parent,
             "Where are Bangladeshi workers going?  ·  oep.gov.bd",
-        )
-        ttk.Label(
-            intro,
-            text=(
+            help_text=(
                 "Pulls clearance data straight from the Overseas Employment "
                 "Platform. Pick a date range and view, then Run."
             ),
-            style="Hint.TLabel",
-            wraplength=820,
-            justify="left",
-        ).pack(anchor="w")
+        )
 
         # ----- Filters -----
         body = self._section(parent, "Filters")
@@ -700,7 +1014,7 @@ class App:
         )
         self.btn_oep_export.pack(side="left", padx=(8, 0))
 
-        self.oep_status_label = ttk.Label(ctrl, text="Idle.", style="Hint.TLabel")
+        self.oep_status_label = ttk.Label(ctrl, text="Pick a date range and a view, then Run.", style="Hint.TLabel")
         self.oep_status_label.pack(side="left", padx=12)
 
         # ----- Results panel — tree OR chart, depending on mode -----
@@ -2216,14 +2530,22 @@ class App:
                     f"Signed in · user={sv.get('ID_ADMIN')} · "
                     f"company={sv.get('ID_SOCIETE')} · app={sv.get('ID_APPLICATION')}"
                 ),
+                foreground=self._COLOR_SUCCESS,
+                font=("Segoe UI Semibold", 10),
             )
             self.btn_zenith_login.configure(state="normal", text="Sign in again")
             # Don't keep the password in the widget after success.
             self.zenith_pwd_entry.delete(0, "end")
             self._zenith_log("Signed in to Zenith.")
+            # Collapse the form to a one-line strip — the credentials
+            # row is dead UI once auth is established.
+            self._zenith_collapse_login()
         elif kind == MSG_ZENITH_LOGIN_FAILED:
             self.btn_zenith_login.configure(state="normal", text="Sign in to Zenith")
-            self.zenith_login_status.configure(text="Not signed in")
+            self.zenith_login_status.configure(
+                text="Not signed in",
+                foreground=self._COLOR_MUTED, font=("Segoe UI", 9),
+            )
             messagebox.showerror("Zenith login failed", str(payload))
         elif kind == MSG_ZENITH_PROGRESS:
             completed, total_n, ok, nf, err = payload  # type: ignore[misc]
@@ -2276,6 +2598,8 @@ class App:
             path = str(payload)
             self._zenith_fl_log(f"Done. Wrote {path}")
             self._zenith_fl_reset_buttons()
+            # The Ordered-Report appender is now actionable.
+            self.btn_zenith_fl_append_ordered.configure(state="normal")
             messagebox.showinfo(
                 "Zenith Flight Loads — Done",
                 f"Finished.\n\nOutput:\n{path}",
@@ -2379,8 +2703,31 @@ class App:
         elif kind == MSG_ZENITH_BULK_PROGRESS:
             idx, total, code, status_code = payload  # type: ignore[misc]
             self.zenith_bulk_progress.configure(maximum=total, value=idx)
+            # Live counters so users see exactly where the money is going.
+            counters = self._zenith_bulk_counters
+            counters[status_code] = counters.get(status_code, 0) + 1
+            ok = counters.get("OK", 0)
+            cached = counters.get("CACHED", 0)
+            errors = counters.get("NOT_FOUND", 0) + sum(
+                v for k, v in counters.items()
+                if k not in ("OK", "CACHED", "CANCELLED")
+            )
+            # Throughput + ETA from a sliding wall clock.
+            import time
+            now = time.monotonic()
+            if self._zenith_bulk_started_at is None:
+                self._zenith_bulk_started_at = now
+            elapsed = max(now - self._zenith_bulk_started_at, 0.001)
+            rate = idx / elapsed
+            remaining = (total - idx) / rate if rate > 0 else 0
+            eta = _fmt_dur(remaining) if remaining else "—"
             self.zenith_bulk_status_label.configure(
-                text=f"{idx}/{total}  ·  {code}  [{status_code}]",
+                text=(
+                    f"{idx:,}/{total:,}  ·  "
+                    f"{ok:,} fetched · {cached:,} cached · {errors:,} errors  ·  "
+                    f"{rate:.1f}/s  ·  ETA {eta}"
+                ),
+                style="Hint.TLabel",
             )
             self._zenith_bulk_log_line(f"  {idx}/{total} {code}: {status_code}")
         elif kind == MSG_ZENITH_BULK_DONE:
@@ -2391,8 +2738,12 @@ class App:
                 text=(
                     f"Done — {info['ok']}/{info['total']} resolved, "
                     f"{info['errors']} errors"
-                )
+                ),
+                style="Success.TLabel" if info["errors"] == 0 else "Warning.TLabel",
             )
+            # Reset for the next run.
+            self._zenith_bulk_counters = {}
+            self._zenith_bulk_started_at = None
             self._zenith_bulk_log_line(f"Wrote: {info['path']}")
             messagebox.showinfo(
                 "PNR Bulk Lookup — Done",
@@ -2826,9 +3177,15 @@ class App:
         return result["ok"]
 
     def _refresh_user_label(self) -> None:
+        # sv_ttk overrides named-style foregrounds for tk.Label children,
+        # so set the colour directly on the widget — that always wins.
+        font_bold = ("Segoe UI Semibold", 10)
         if self._signed_in_user:
             email = self._signed_in_user.get("email") or "(signed in)"
-            self.status_user_label.configure(text=f"Signed in: {email}")
+            self.status_user_label.configure(
+                text=f"●  Signed in: {email}",
+                foreground=self._COLOR_SUCCESS, font=font_bold,
+            )
             self.btn_sign_in.pack_forget()
             self.btn_sign_out.pack(
                 side="right", padx=4, pady=2, before=self.btn_check_updates,
@@ -2836,15 +3193,19 @@ class App:
         else:
             self.btn_sign_out.pack_forget()
             if auth.GOOGLE_CLIENT_ID:
-                # CI build with the client ID baked in — offer sign in.
-                self.status_user_label.configure(text="Not signed in")
+                self.status_user_label.configure(
+                    text="○  Not signed in",
+                    foreground=self._COLOR_WARNING, font=font_bold,
+                )
                 self.btn_sign_in.pack(
                     side="right", padx=4, pady=2, before=self.btn_check_updates,
                 )
             else:
-                # Dev build / fork with no client ID — auth is unavailable.
-                # Don't offer a button that can't possibly succeed.
-                self.status_user_label.configure(text="Unauthenticated (dev build)")
+                self.status_user_label.configure(
+                    text="○  Unauthenticated (dev build)",
+                    foreground=self._COLOR_MUTED,
+                    font=("Segoe UI", 9),
+                )
                 self.btn_sign_in.pack_forget()
 
     def _on_sign_in(self) -> None:
@@ -2872,6 +3233,28 @@ class App:
     # ==================================================================
     # Self-updater
     # ==================================================================
+
+    def _toggle_theme(self) -> None:
+        """Flip the sv_ttk theme + relabel the toggle.
+
+        sv_ttk handles re-painting every widget; we just have to nudge
+        a few of our custom-styled labels back to their semantic colors
+        in case the theme reset their foregrounds.
+        """
+        try:
+            import sv_ttk
+            self._theme_is_dark = not self._theme_is_dark
+            sv_ttk.set_theme("dark" if self._theme_is_dark else "light")
+            self.btn_theme.configure(
+                text="☀  Light" if self._theme_is_dark else "☾  Dark",
+            )
+            # Re-apply our semantic styles — sv_ttk's set_theme resets
+            # every style table including the ones we configured.
+            self._setup_styles()
+            # Force a refresh of the auth status chip so its color survives.
+            self._refresh_user_label()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Theme toggle failed: %s", exc)
 
     def _on_check_for_updates(self) -> None:
         if self._update_worker is not None and self._update_worker.is_alive():
@@ -2943,22 +3326,21 @@ class App:
     def _build_zenith_tab(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
 
-        intro = self._section(
-            parent, "Zenith Customer Lookup  ·  asia.ttinteractive.com",
-        )
-        ttk.Label(
-            intro, style="Hint.TLabel",
-            text=(
-                "Bulk-extract customer details (name, email, phone, address) "
-                "for a list of Customer IDs. Read-only — never modifies "
-                "Zenith data. Resume-safe: a SQLite cache lets you stop and "
-                "restart without re-fetching."
+        self._section(
+            parent, "Zenith  ·  asia.ttinteractive.com",
+            help_text=(
+                "Four sub-tabs: Customer Lookup, Flight Loads, "
+                "Flight History Analyzer, PNR Bulk Lookup. "
+                "Sign in once below; the session is shared across all four."
             ),
-            wraplength=900, justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 4))
+        )
 
         # ----- Login -----
-        login_body = self._section(parent, "Sign in to Zenith")
+        # Wrap the login section in its own frame so we can collapse it
+        # to a one-line summary once the user is authenticated.
+        self.zenith_login_section = ttk.Frame(parent)
+        self.zenith_login_section.pack(fill="x", padx=4, pady=(8, 4))
+        login_body = self._section(self.zenith_login_section, "Sign in to Zenith")
         login_row = ttk.Frame(login_body)
         login_row.pack(fill="x", padx=2)
         self.zenith_user_entry = ttk.Entry(
@@ -2992,10 +3374,26 @@ class App:
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
 
+        # Compact one-line strip shown in place of the login form once
+        # the user is authenticated. Hidden by default — the
+        # `_refresh_zenith_login_collapse` method swaps the two views.
+        self.zenith_login_compact = ttk.Frame(parent)
+        self.zenith_login_compact_label = ttk.Label(
+            self.zenith_login_compact, text="",
+            foreground=self._COLOR_SUCCESS,
+            font=("Segoe UI Semibold", 10),
+        )
+        self.zenith_login_compact_label.pack(side="left", padx=(4, 12))
+        ttk.Button(
+            self.zenith_login_compact, text="Sign in again",
+            command=self._zenith_show_login_form,
+        ).pack(side="left")
+
         # ----- Inner notebook so each Zenith feature gets its own
         # canvas without polluting the others. Login above remains
         # shared across all sub-tabs.
         inner_nb = ttk.Notebook(parent)
+        self.zenith_inner_notebook = inner_nb
         inner_nb.pack(fill="both", expand=True, padx=4, pady=(8, 0))
         customer_inner = ttk.Frame(inner_nb)
         flight_inner = ttk.Frame(inner_nb)
@@ -3142,7 +3540,8 @@ class App:
         )
         self.btn_zenith_resume.pack(side="left", padx=(4, 0))
         self.btn_zenith_stop = ttk.Button(
-            ctl, text="Stop", command=self._zenith_stop, state="disabled",
+            ctl, text="Stop", command=self._zenith_stop,
+            state="disabled", style="Danger.TButton",
         )
         self.btn_zenith_stop.pack(side="left", padx=(4, 0))
         self.btn_zenith_export = ttk.Button(
@@ -3157,7 +3556,9 @@ class App:
         )
         self.zenith_progress_bar.pack(fill="x", padx=2, pady=(0, 4))
         self.zenith_progress_label = ttk.Label(
-            prog_body, text="Idle.", style="Hint.TLabel",
+            prog_body,
+            text="Sign in to Zenith, then pick a Customer-ID Excel and Run.",
+            style="Hint.TLabel",
         )
         self.zenith_progress_label.pack(anchor="w", padx=2)
 
@@ -3173,6 +3574,10 @@ class App:
         log_scroll = ttk.Scrollbar(log_frame, command=self.zenith_log_text.yview)
         log_scroll.pack(side="right", fill="y")
         self.zenith_log_text.configure(yscrollcommand=log_scroll.set)
+        self._attach_log_placeholder(
+            self.zenith_log_text,
+            "  Customer-lookup events will appear here once a run starts.",
+        )
 
         self._refresh_zenith_cache_label()
 
@@ -3183,20 +3588,16 @@ class App:
 
     def _build_zenith_flight_subtab(self, parent: ttk.Frame) -> None:
         """Inner tab — date range pull from the View PNLs report."""
-        # ----- Description -----
-        intro = self._section(
+        # ----- Description (tucked into a tooltip on the section title) -----
+        self._section(
             parent, "Flight Loads  ·  View PNLs",
-        )
-        ttk.Label(
-            intro, style="Hint.TLabel",
-            text=(
+            help_text=(
                 "Pull flight-load data (tickets, seats, load %, status) "
                 "for a date range. The server caps each search at 10 "
                 "pages; this tab auto-chunks longer ranges into smaller "
                 "windows so you can ask for up to ~12 months."
             ),
-            wraplength=900, justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 4))
+        )
 
         # ----- Range + page-size form -----
         form = self._section(parent, "Range")
@@ -3240,16 +3641,14 @@ class App:
         ).grid(row=0, column=7, padx=(0, 12), pady=4)
 
         # ----- Throughput -----
-        speed = self._section(parent, "Throughput")
-        ttk.Label(
-            speed, style="Hint.TLabel",
-            text=(
+        speed = self._section(
+            parent, "Throughput",
+            help_text=(
                 "Polite delay between paginated calls. The View PNLs page "
                 "is heavier than the Customer page (~360 KB per call); "
                 "1.0 s is a safe default."
             ),
-            wraplength=900, justify="left",
-        ).pack(anchor="w", padx=2, pady=(0, 4))
+        )
         knobs = ttk.Frame(speed)
         knobs.pack(fill="x", padx=2)
         ttk.Label(knobs, text="Delay (sec):").grid(
@@ -3292,14 +3691,24 @@ class App:
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 0))
         self.btn_zenith_fl_run = ttk.Button(
-            ctl, text="Run", style="Primary.TButton",
+            ctl, text="Pull flight loads", style="Primary.TButton",
             command=self._zenith_fl_run,
         )
         self.btn_zenith_fl_run.pack(side="left")
         self.btn_zenith_fl_stop = ttk.Button(
-            ctl, text="Stop", command=self._zenith_fl_stop, state="disabled",
+            ctl, text="Stop", command=self._zenith_fl_stop,
+            state="disabled", style="Danger.TButton",
         )
         self.btn_zenith_fl_stop.pack(side="left", padx=(8, 0))
+        # Append the LAST run's data into a user-picked Ordered Report
+        # (cross-tab one-date-per-block format). Enabled only after a
+        # successful run because we need the rows in memory.
+        self.btn_zenith_fl_append_ordered = ttk.Button(
+            ctl, text="Append to Ordered Report…",
+            command=self._zenith_fl_append_ordered,
+            state="disabled",
+        )
+        self.btn_zenith_fl_append_ordered.pack(side="left", padx=(8, 0))
 
         # ----- Progress + log -----
         prog_body = self._section(parent, "Progress")
@@ -3308,7 +3717,9 @@ class App:
         )
         self.zenith_fl_progress_bar.pack(fill="x", padx=2, pady=(0, 4))
         self.zenith_fl_progress_label = ttk.Label(
-            prog_body, text="Idle.", style="Hint.TLabel",
+            prog_body,
+            text="Pick a date range and page size, then Pull flight loads.",
+            style="Hint.TLabel",
         )
         self.zenith_fl_progress_label.pack(anchor="w", padx=2)
 
@@ -3325,10 +3736,17 @@ class App:
         )
         fl_scroll.pack(side="right", fill="y")
         self.zenith_fl_log_text.configure(yscrollcommand=fl_scroll.set)
+        self._attach_log_placeholder(
+            self.zenith_fl_log_text,
+            "  Flight-loads pagination events will appear here once a run starts.",
+        )
 
         # ----- Worker state -----
         self._zenith_fl_worker: threading.Thread | None = None
         self._zenith_fl_stop_flag = threading.Event()
+        # Last run's rows — re-used by 'Append to Ordered Report' so
+        # the user can choose where to merge after seeing the export.
+        self._zenith_fl_last_rows: list = []
 
     # ==================================================================
     # Zenith Flight History Analyzer sub-tab — UI
@@ -3344,20 +3762,16 @@ class App:
         """
         parent = self._make_scrollable(parent)
 
-        intro = self._section(
+        self._section(
             parent, "Flight History Analyzer  ·  audits downloaded .xls logs",
-        )
-        ttk.Label(
-            intro,
-            text=(
+            help_text=(
                 "Reads the ModificationHistory .xls files exported from "
                 "Zenith's Inventory → Flight List → History view. "
-                "Builds a 7-sheet audit: class downgrades, downgrade leaders, "
-                "G-class issuance, agent activity, revenue mgmt, suspicious "
-                "activity, and raw events."
+                "Builds a 7-sheet audit: class downgrades, downgrade "
+                "leaders, G-class issuance, agent activity, revenue "
+                "mgmt, suspicious activity, and raw events."
             ),
-            style="Hint.TLabel", wraplength=820, justify="left",
-        ).pack(anchor="w", padx=2, pady=(0, 4))
+        )
 
         # ----- Input folder + output -----
         io_body = self._section(parent, "Folders")
@@ -3448,7 +3862,9 @@ class App:
         )
         self.btn_zenith_fh_pnr.pack(side="left", padx=(8, 0))
         self.zenith_fh_status_label = ttk.Label(
-            ctl, text="Idle.", style="Hint.TLabel",
+            ctl,
+            text="Browse a logs folder, then Run history audit.",
+            style="Hint.TLabel",
         )
         self.zenith_fh_status_label.pack(side="left", padx=(12, 0))
 
@@ -3491,19 +3907,15 @@ class App:
         """Standalone bulk lookup: Excel of PNRs in → Excel with route/customer out."""
         parent = self._make_scrollable(parent)
 
-        intro = self._section(
+        self._section(
             parent, "PNR Bulk Lookup  ·  paste a list, get every detail",
-        )
-        ttk.Label(
-            intro,
-            text=(
+            help_text=(
                 "Reads a column of PNR codes from an Excel file, looks up "
                 "each one against Zenith, and writes the route, customer, "
                 "status, fares, and per-segment breakdown back to a new "
                 "workbook. Cached locally so re-runs are instant."
             ),
-            style="Hint.TLabel", wraplength=820, justify="left",
-        ).pack(anchor="w", padx=2, pady=(0, 4))
+        )
 
         # ----- Files -----
         io_body = self._section(parent, "Files")
@@ -3535,7 +3947,21 @@ class App:
         self.zenith_bulk_column_combo = ttk.Combobox(
             io_body, textvariable=self.zenith_bulk_column_name, state="readonly",
         )
+        self.zenith_bulk_column_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._zenith_bulk_refresh_caption(),
+        )
         self._form_row(io_body, 2, "PNR column:", self.zenith_bulk_column_combo)
+
+        # Live caption: "1,841 PNRs detected  ·  427 already cached  ·  1,414 to fetch"
+        # Updates the moment the user picks a sheet + column, so they
+        # know what they're about to ask for before clicking Run.
+        self.zenith_bulk_caption = ttk.Label(
+            io_body, text="", style="Hint.TLabel",
+        )
+        self.zenith_bulk_caption.grid(
+            row=3, column=1, sticky="w", padx=(0, 4), pady=(0, 4),
+        )
 
         out_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_output_dir)
         out_btn = ttk.Button(
@@ -3553,11 +3979,14 @@ class App:
         )
         self.btn_zenith_bulk_run.pack(side="left")
         self.btn_zenith_bulk_stop = ttk.Button(
-            ctl, text="Stop", command=self._zenith_bulk_stop, state="disabled",
+            ctl, text="Stop", command=self._zenith_bulk_stop,
+            state="disabled", style="Danger.TButton",
         )
         self.btn_zenith_bulk_stop.pack(side="left", padx=(8, 0))
         self.zenith_bulk_status_label = ttk.Label(
-            ctl, text="Idle.", style="Hint.TLabel",
+            ctl,
+            text="Pick an Excel above, then Look up PNRs.",
+            style="Hint.TLabel",
         )
         self.zenith_bulk_status_label.pack(side="left", padx=(12, 0))
 
@@ -3576,10 +4005,17 @@ class App:
         sb = ttk.Scrollbar(log_body, command=self.zenith_bulk_log.yview)
         sb.pack(side="left", fill="y")
         self.zenith_bulk_log.configure(yscrollcommand=sb.set)
+        self._attach_log_placeholder(
+            self.zenith_bulk_log,
+            "  PNR-lookup events will appear here once a run starts.",
+        )
 
         # ----- Worker state -----
         self._zenith_bulk_worker: threading.Thread | None = None
         self._zenith_bulk_stop_flag = threading.Event()
+        # Live progress counters for the status line (E enhancement).
+        self._zenith_bulk_counters: dict[str, int] = {}
+        self._zenith_bulk_started_at: float | None = None
 
     def _zenith_bulk_pick_input(self) -> None:
         f = filedialog.askopenfilename(
@@ -3634,16 +4070,63 @@ class App:
             return
         self.zenith_bulk_column_combo["values"] = cols
         current = self.zenith_bulk_column_name.get().strip()
-        if current in cols:
+        if current not in cols:
+            # Prefer a header that looks like a PNR column.
+            pnr_like = next(
+                (c for c in cols if c.strip().lower().startswith("pnr")), None,
+            )
+            if pnr_like:
+                self.zenith_bulk_column_name.set(pnr_like)
+            elif cols:
+                self.zenith_bulk_column_combo.current(0)
+        # Trigger the live caption now that sheet + column are set.
+        self._zenith_bulk_refresh_caption()
+
+    def _zenith_bulk_refresh_caption(self) -> None:
+        """Show 'N PNRs detected · M cached · K to fetch' below the picker.
+
+        Reads the Excel column the user just chose (fast — just the
+        single column, no full Dossier fetch) and intersects with the
+        local SQLite cache to surface what a Run would actually cost.
+        """
+        path = self.zenith_bulk_input_path.get().strip()
+        sheet = self.zenith_bulk_sheet_name.get().strip()
+        column = self.zenith_bulk_column_name.get().strip()
+        if not (path and sheet and column and Path(path).is_file()):
+            self.zenith_bulk_caption.configure(text="")
             return
-        # Prefer a header that looks like a PNR column.
-        pnr_like = next(
-            (c for c in cols if c.strip().lower().startswith("pnr")), None,
+        try:
+            codes = excel_io.read_pnr_codes_from_excel(
+                Path(path), sheet_name=sheet, column_name=column,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface compactly
+            self.zenith_bulk_caption.configure(
+                text=f"⚠ Couldn't read column: {exc}",
+                style="Error.TLabel",
+            )
+            return
+        total = len(codes)
+        if total == 0:
+            self.zenith_bulk_caption.configure(
+                text="No PNR codes found in that column.",
+                style="Warning.TLabel",
+            )
+            return
+        cached = sum(1 for c in codes if self._zenith_pnr_cache.get(c) is not None)
+        to_fetch = total - cached
+        # Rough time estimate at 1s per uncached PNR.
+        est = ""
+        if to_fetch > 0:
+            mins = max(1, to_fetch // 60)
+            est = f"  ·  ~{mins} min"
+        self.zenith_bulk_caption.configure(
+            text=(
+                f"{total:,} PNRs detected  ·  "
+                f"{cached:,} already cached  ·  "
+                f"{to_fetch:,} to fetch{est}"
+            ),
+            style="Hint.TLabel",
         )
-        if pnr_like:
-            self.zenith_bulk_column_name.set(pnr_like)
-        elif cols:
-            self.zenith_bulk_column_combo.current(0)
 
     def _zenith_bulk_pick_output(self) -> None:
         d = filedialog.askdirectory(
@@ -3728,6 +4211,11 @@ class App:
             f"Reading {len(codes)} PNRs ({cache_hits} cached, {misses} to fetch)…",
         )
         self._zenith_bulk_stop_flag.clear()
+        # Reset live counters + start-time at the top of every fresh run
+        # so the throughput / ETA display starts from zero each time.
+        self._zenith_bulk_counters = {}
+        import time as _t
+        self._zenith_bulk_started_at = _t.monotonic()
         self.btn_zenith_bulk_run.configure(state="disabled")
         self.btn_zenith_bulk_stop.configure(state="normal")
         self.zenith_bulk_progress.configure(value=0, maximum=len(codes))
@@ -3952,11 +4440,26 @@ class App:
         if report.downgrade_justifications:
             from collections import Counter
             counts = Counter(j.verdict for j in report.downgrade_justifications)
+            # Tag the verdicts with a semantic colour so the user can
+            # tell QUESTIONABLE (red) from JUSTIFIED (green) at a glance.
+            tree.tag_configure("verdict_bad", background=self._COLOR_ROW_BAD)
+            tree.tag_configure("verdict_warn", background=self._COLOR_ROW_WARN)
+            tree.tag_configure("verdict_good", background=self._COLOR_ROW_GOOD)
             tree.insert("", "end", values=("", ""))
             tree.insert("", "end", values=("Downgrade verdicts (load-aware)", ""))
+            verdict_tags = {
+                "QUESTIONABLE": ("verdict_bad",),
+                "SITUATIONAL": ("verdict_warn",),
+                "JUSTIFIED": ("verdict_good",),
+                "UNKNOWN": (),
+            }
             for v in ("QUESTIONABLE", "SITUATIONAL", "JUSTIFIED", "UNKNOWN"):
                 if counts.get(v):
-                    tree.insert("", "end", values=(f"  · {v}", f"{counts[v]:,}"))
+                    tree.insert(
+                        "", "end",
+                        values=(f"  · {v}", f"{counts[v]:,}"),
+                        tags=verdict_tags[v],
+                    )
         if report.pnr_routes:
             tree.insert("", "end", values=("", ""))
             tree.insert("", "end", values=("PNR Routes (enriched)", ""))
@@ -4306,6 +4809,35 @@ class App:
             else:
                 self.zenith_column_name.set(cols[0])
 
+    def _zenith_collapse_login(self) -> None:
+        """Hide the full sign-in form; show the compact 'signed in' strip."""
+        if hasattr(self, "zenith_login_section"):
+            self.zenith_login_section.pack_forget()
+        if hasattr(self, "zenith_login_compact"):
+            sv = self._zenith_session.state_values if self._zenith_session else {}
+            email = (self._zenith_session.state_values.get("ID_ADMIN")
+                     if self._zenith_session else "")
+            self.zenith_login_compact_label.configure(
+                text=(
+                    f"●  Signed in to Zenith  ·  user={sv.get('ID_ADMIN')}  ·  "
+                    f"company={sv.get('ID_SOCIETE')}"
+                ),
+            )
+            self.zenith_login_compact.pack(
+                fill="x", padx=8, pady=(8, 4),
+                before=getattr(self, "zenith_inner_notebook", None),
+            )
+
+    def _zenith_show_login_form(self) -> None:
+        """Re-expand the full form (for 'Sign in again')."""
+        if hasattr(self, "zenith_login_compact"):
+            self.zenith_login_compact.pack_forget()
+        if hasattr(self, "zenith_login_section"):
+            self.zenith_login_section.pack(
+                fill="x", padx=4, pady=(8, 4),
+                before=getattr(self, "zenith_inner_notebook", None),
+            )
+
     def _zenith_login(self) -> None:
         user = self.zenith_username.get().strip()
         pwd = self.zenith_pwd_entry.get()
@@ -4621,7 +5153,57 @@ class App:
             log.exception("Flight-loads Excel write failed")
             self._post(MSG_ZENITH_FL_ERROR, f"Excel write failed: {exc}")
             return
+        # Keep the rows in memory so the user can later append them to
+        # an Ordered Report without re-running the fetch.
+        self._zenith_fl_last_rows = rows
         self._post(MSG_ZENITH_FL_DONE, str(cfg["out_path"]))
+
+    def _zenith_fl_append_ordered(self) -> None:
+        """Append the last run's rows to a user-picked Ordered Report file."""
+        if not self._zenith_fl_last_rows:
+            messagebox.showinfo(
+                "Append to Ordered Report",
+                "Run a Flight Loads pull first — there's no data to append yet.",
+            )
+            return
+        # Pick an existing file or a new path; create_if_missing handles either.
+        f = filedialog.asksaveasfilename(
+            title="Pick the Ordered Report file (existing or new)",
+            initialdir=str(Path.home() / "Documents"),
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            confirmoverwrite=False,
+        )
+        if not f:
+            return
+        try:
+            summary = excel_io.append_flight_loads_to_ordered_report(
+                Path(f), self._zenith_fl_last_rows, create_if_missing=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ordered Report append failed")
+            messagebox.showerror(
+                "Append to Ordered Report — Error",
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self._zenith_fl_log(
+            f"Ordered Report updated: +{summary['dates_added']} new dates, "
+            f"{summary['dates_refreshed']} dates refreshed, "
+            f"{summary['cells_updated']} cells written.",
+        )
+        messagebox.showinfo(
+            "Append to Ordered Report — Done",
+            (
+                f"Saved to: {f}\n\n"
+                f"  New dates added:      {summary['dates_added']}\n"
+                f"  Existing dates refreshed: {summary['dates_refreshed']}\n"
+                f"  Total dates in file:  {summary['total_dates']}\n"
+                f"  Flights added:        {summary['flights_added']}\n"
+                f"  Flights updated:      {summary['flights_updated']}\n"
+                f"  Cells written:        {summary['cells_updated']}"
+            ),
+        )
 
     def _zenith_fl_stop(self) -> None:
         self._zenith_fl_stop_flag.set()

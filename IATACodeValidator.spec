@@ -53,6 +53,10 @@ for pkg in [
     "onnxruntime",
     "keyring",
     "rapidfuzz",
+    # sv_ttk ships its theme as Tcl resources next to the .py file —
+    # PyInstaller misses those by default. `collect_all` picks up the
+    # whole package so `set_theme()` finds its `.tcl` script at runtime.
+    "sv_ttk",
 ]:
     pkg_datas, pkg_bins, pkg_hi = collect_all(pkg)
     datas += pkg_datas

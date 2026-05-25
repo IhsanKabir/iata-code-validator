@@ -390,12 +390,33 @@ def lookup_pnr(
         "vaction": "VERIF",
         "Id": pnr_code.strip().upper(),
     }
-    try:
-        resp = sess.get(QUICK_SEARCH_URL, params=params, timeout=timeout_s)
-    except requests.RequestException as exc:
+    # Retry transient network errors (DNS hiccup, TCP reset, slow
+    # server) up to 3 times with backoff. ~30 of every ~2k PNRs trip
+    # one of these on flaky office Wi-Fi, and a single retry usually
+    # clears it without the user noticing.
+    import time as _t
+    resp = None
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):  # attempts at t=0, t=2s, t=5s
+        try:
+            resp = sess.get(QUICK_SEARCH_URL, params=params, timeout=timeout_s)
+            last_exc = None
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == 3:
+                break
+            backoff = 2 if attempt == 1 else 5
+            log.warning(
+                "PNR %s attempt %d/3 failed (%s) — retrying in %ds",
+                pnr_code, attempt, exc, backoff,
+            )
+            _t.sleep(backoff)
+    if resp is None:
         raise ZenithError(
-            f"Network error looking up PNR {pnr_code}: {exc}",
-        ) from exc
+            f"Network error looking up PNR {pnr_code} after 3 attempts: "
+            f"{last_exc}",
+        ) from last_exc
 
     if resp.status_code in (401, 403):
         raise SessionExpiredError(

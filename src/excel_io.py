@@ -812,6 +812,410 @@ def write_zenith_flight_loads(path: Path, rows: Iterable) -> None:
     wb.save(path)
 
 
+# ---------------------------------------------------------------------------
+# Ordered (cross-tab) Flight Load report
+#
+# Reverse-engineered from the user's template. One growing workbook holds
+# every operating date as a 16-column block side-by-side. Each Flight
+# Loads run appends a new block on the right; existing dates + formatting
+# stay untouched.
+#
+# Schema per date (16 cols, in order):
+#   Capacity | STD | Aircraft | Starting fare | Flown Seats | Infant
+#   | Sold | No-Show | Gate No-show | Immigration Offload
+#   | Immigration not faced | Unsold | Value of unsold ticket
+#   | Utilization | Load Factor | Note
+#
+# The auto-fill scope (from FlightLoadRow data) is intentionally narrow:
+# Capacity, STD, Aircraft, Flown Seats, Load Factor. Everything else
+# (Starting fare, no-shows, infant, etc.) stays blank for manual entry
+# — that's how the template is built and what users will expect.
+# ---------------------------------------------------------------------------
+
+ORDERED_REPORT_SHEET = "Ordered Data"
+ORDERED_REPORT_HEADER_FILL_RGB = "FF1F4E78"   # dark blue, white bold text
+ORDERED_REPORT_DATE_BLOCK_WIDTH = 16
+ORDERED_REPORT_PER_DATE_HEADERS = (
+    "Capacity",
+    "STD",
+    "Aircraft",
+    "Starting fare\nas on {date_short}",
+    "Flown Seats",
+    "Infant",
+    "Sold",
+    "No-Show",
+    "Gate No-show",
+    "Immigration Offload",
+    "Immigration not faced",
+    "Unsold",
+    "Value of unsold ticket",
+    "Utilization",
+    "Load Factor",
+    "Note",
+)
+# 1-based column offsets within a date block (matches the schema above).
+ORDERED_REPORT_COL = {
+    "capacity": 1,
+    "std": 2,
+    "aircraft": 3,
+    "starting_fare": 4,
+    "flown_seats": 5,
+    "infant": 6,
+    "sold": 7,
+    "no_show": 8,
+    "gate_no_show": 9,
+    "imm_offload": 10,
+    "imm_not_faced": 11,
+    "unsold": 12,
+    "value_unsold": 13,
+    "utilization": 14,
+    "load_factor": 15,
+    "note": 16,
+}
+
+
+def _seats_available_to_numbers(text: str) -> tuple[int | None, float | None]:
+    """Parse '13/410 97%' → (capacity=410, load_pct=0.97).
+
+    Tolerates over-bookings ('-5/152 103%' → (152, 1.03)) and missing %
+    suffix. Returns (None, None) on anything we can't read.
+    """
+    if not text:
+        return None, None
+    import re as _re
+    m = _re.match(
+        r"\s*(-?\d+)\s*/\s*(\d+)\s+(-?\d+(?:\.\d+)?)\s*%\s*$", text,
+    )
+    if not m:
+        return None, None
+    try:
+        return int(m.group(2)), float(m.group(3)) / 100.0
+    except ValueError:
+        return None, None
+
+
+def _bracketed_int(text: str) -> int | None:
+    """Parse '[152]' → 152. Returns None on anything unparseable."""
+    if not text:
+        return None
+    import re as _re
+    m = _re.search(r"-?\d+", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except ValueError:
+        return None
+
+
+def _aircraft_label(aircraft: str, registration: str) -> str:
+    """Format the aircraft cell the way the existing template does it.
+
+    The template uses 'ATR-72-600', 'Boeing 737-800' etc — just the type
+    string, no registration. Some legacy rows also include the dash
+    style. We keep the aircraft type as-is.
+    """
+    a = (aircraft or "").strip()
+    return a
+
+
+def _format_report_date_header(date_dmy: str) -> str:
+    """'24/05/2026' → '24/05/2026 (Sunday)'. Falls back to bare date if unparseable."""
+    try:
+        d = datetime.strptime(date_dmy, "%d/%m/%Y")
+    except ValueError:
+        return date_dmy
+    return f"{date_dmy} ({d.strftime('%A')})"
+
+
+def _short_date(date_dmy: str) -> str:
+    """'24/05/2026' → '24/05/26' for header label inside 'Starting fare as on …'."""
+    try:
+        d = datetime.strptime(date_dmy, "%d/%m/%Y")
+    except ValueError:
+        return date_dmy
+    return d.strftime("%d/%m/%y")
+
+
+def _read_existing_dates(ws) -> dict[str, int]:
+    """Map 'DD/MM/YYYY' → starting column of its date block, from row 1.
+
+    The user's template encodes dates as 'DD/MM/YYYY (Weekday)' in
+    merged row-1 cells; we strip the weekday and use the date as key.
+    """
+    import re as _re
+    out: dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=c).value
+        if not v:
+            continue
+        m = _re.match(r"\s*(\d{1,2}/\d{1,2}/\d{4})", str(v))
+        if m:
+            out[m.group(1).zfill(10)] = c   # zfill keeps 2-digit dates stable
+            # Also accept the literal value as found
+            out[m.group(1)] = c
+    return out
+
+
+def _read_existing_flight_rows(ws) -> dict[tuple[str, str], int]:
+    """Map (flight_number, leg_route) → row index from the existing sheet."""
+    out: dict[tuple[str, str], int] = {}
+    for r in range(3, ws.max_row + 1):
+        flight = ws.cell(row=r, column=1).value
+        leg = ws.cell(row=r, column=2).value
+        if not flight:
+            continue
+        key = (str(flight).strip(), str(leg or "").strip())
+        out.setdefault(key, r)
+    return out
+
+
+def _apply_ordered_header_styles(ws, start_col: int, end_col: int) -> None:
+    """Style the date-header cell (row 1) and column-label row (row 2)."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    fill = PatternFill(
+        fill_type="solid",
+        fgColor=ORDERED_REPORT_HEADER_FILL_RGB,
+    )
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    # Row 1 — merged date title
+    head = ws.cell(row=1, column=start_col)
+    head.fill = fill
+    head.font = white_bold
+    head.alignment = center
+    if end_col > start_col:
+        ws.merge_cells(
+            start_row=1, end_row=1, start_column=start_col, end_column=end_col,
+        )
+    # Row 2 — column labels in the same dark band
+    for c in range(start_col, end_col + 1):
+        cell = ws.cell(row=2, column=c)
+        cell.fill = fill
+        cell.font = white_bold
+        cell.alignment = center
+
+
+def _apply_load_factor_cf(ws, col_letter: str, last_row: int) -> None:
+    """Recreate the template's traffic-light CF on a Load Factor column.
+
+    Rules (matching the user's template):
+      load >= 0.9       — dark green
+      0.8 <= load < 0.9 — light green (#92D050)
+      0.6 <= load < 0.8 — yellow (#FFFF00)
+      load < 0.6        — red (#FF0000)
+    """
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import PatternFill
+    rng = f"{col_letter}3:{col_letter}{max(last_row, 3)}"
+    ws.conditional_formatting.add(
+        rng,
+        CellIsRule(
+            operator="greaterThanOrEqual", formula=["0.9"],
+            fill=PatternFill(fill_type="solid", fgColor="FF00B050"),
+        ),
+    )
+    ws.conditional_formatting.add(
+        rng,
+        CellIsRule(
+            operator="between", formula=["0.8", "0.899999"],
+            fill=PatternFill(fill_type="solid", fgColor="FF92D050"),
+        ),
+    )
+    ws.conditional_formatting.add(
+        rng,
+        CellIsRule(
+            operator="between", formula=["0.6", "0.799999"],
+            fill=PatternFill(fill_type="solid", fgColor="FFFFFF00"),
+        ),
+    )
+    ws.conditional_formatting.add(
+        rng,
+        CellIsRule(
+            operator="lessThan", formula=["0.6"],
+            fill=PatternFill(fill_type="solid", fgColor="FFFF0000"),
+        ),
+    )
+
+
+def append_flight_loads_to_ordered_report(
+    report_path: Path,
+    flight_load_rows: Iterable,
+    *,
+    create_if_missing: bool = True,
+) -> dict[str, int]:
+    """Append a Flight Loads run to a cross-tab Ordered Report workbook.
+
+    For each unique flight_date in `flight_load_rows` we append a new
+    16-col block on the right of the existing "Ordered Data" sheet,
+    fill in the values we can derive (Capacity, STD, Aircraft, Flown
+    Seats, Load Factor), and re-apply the traffic-light CF on the new
+    Load Factor column. Dates already present in the file are skipped
+    so re-runs are idempotent.
+
+    Returns a small summary dict so the GUI can show what changed.
+    """
+    rows = list(flight_load_rows)
+    if not rows:
+        return {"dates_added": 0, "flights_added": 0, "flights_updated": 0}
+
+    report_path = Path(report_path)
+    if report_path.exists():
+        wb = load_workbook(report_path)
+        ws = (
+            wb[ORDERED_REPORT_SHEET]
+            if ORDERED_REPORT_SHEET in wb.sheetnames
+            else wb.active
+        )
+    elif create_if_missing:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = ORDERED_REPORT_SHEET
+        # Freeze the three identity columns + the date header rows.
+        ws.cell(row=2, column=1, value="Flight No")
+        ws.cell(row=2, column=2, value="Leg/Sector")
+        ws.cell(row=2, column=3, value="Departure Time")
+        for c in (1, 2, 3):
+            cell = ws.cell(row=2, column=c)
+            from openpyxl.styles import Font, PatternFill, Alignment
+            cell.fill = PatternFill(
+                fill_type="solid", fgColor=ORDERED_REPORT_HEADER_FILL_RGB,
+            )
+            cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = "D3"
+    else:
+        raise FileNotFoundError(report_path)
+
+    existing_dates = _read_existing_dates(ws)
+    flight_row_map = _read_existing_flight_rows(ws)
+
+    # Group rows by date so each date is a single block.
+    by_date: dict[str, list] = {}
+    for r in rows:
+        by_date.setdefault(r.flight_date, []).append(r)
+
+    dates_added = 0
+    flights_added = 0
+    flights_updated = 0
+    next_col = ws.max_column + 1
+    if next_col < 4:
+        next_col = 4
+
+    dates_refreshed = 0
+    cells_updated = 0
+
+    for date in sorted(
+        by_date.keys(),
+        key=lambda d: datetime.strptime(d, "%d/%m/%Y"),
+    ):
+        is_new = date not in existing_dates
+        if is_new:
+            block_start = next_col
+            block_end = block_start + ORDERED_REPORT_DATE_BLOCK_WIDTH - 1
+            # Row 1 — date title
+            ws.cell(
+                row=1, column=block_start,
+                value=_format_report_date_header(date),
+            )
+            # Row 2 — per-date column labels
+            short = _short_date(date)
+            for i, label_tmpl in enumerate(ORDERED_REPORT_PER_DATE_HEADERS):
+                label = label_tmpl.format(date_short=short)
+                ws.cell(row=2, column=block_start + i, value=label)
+            _apply_ordered_header_styles(ws, block_start, block_end)
+        else:
+            # Refresh existing date — flights' counts may have moved
+            # as bookings came in. We only touch the 5 auto-fill cells
+            # (Capacity, STD, Aircraft, Flown Seats, Load Factor) so
+            # the user's manually-entered Starting Fare / No-Show /
+            # Notes stay untouched.
+            block_start = existing_dates[date]
+
+        # Per-flight cells
+        for fr in by_date[date]:
+            key = (
+                str(fr.flight_number).strip(),
+                str(fr.leg_route or "").strip(),
+            )
+            row_idx = flight_row_map.get(key)
+            if row_idx is None:
+                row_idx = ws.max_row + 1 if ws.max_row >= 3 else 3
+                ws.cell(row=row_idx, column=1, value=key[0])
+                ws.cell(row=row_idx, column=2, value=key[1])
+                ws.cell(row=row_idx, column=3, value=fr.departure_time or "")
+                flight_row_map[key] = row_idx
+                flights_added += 1
+            else:
+                flights_updated += 1
+
+            capacity, load_pct = _seats_available_to_numbers(fr.seats_available)
+            flown = _bracketed_int(fr.seats_confirmed)
+            aircraft_label = _aircraft_label(fr.aircraft, fr.registration)
+
+            if capacity is not None:
+                ws.cell(
+                    row=row_idx,
+                    column=block_start + ORDERED_REPORT_COL["capacity"] - 1,
+                    value=capacity,
+                )
+                cells_updated += 1
+            if fr.departure_time:
+                ws.cell(
+                    row=row_idx,
+                    column=block_start + ORDERED_REPORT_COL["std"] - 1,
+                    value=fr.departure_time,
+                )
+                cells_updated += 1
+            if aircraft_label:
+                ws.cell(
+                    row=row_idx,
+                    column=block_start + ORDERED_REPORT_COL["aircraft"] - 1,
+                    value=aircraft_label,
+                )
+                cells_updated += 1
+            if flown is not None:
+                ws.cell(
+                    row=row_idx,
+                    column=block_start + ORDERED_REPORT_COL["flown_seats"] - 1,
+                    value=flown,
+                )
+                cells_updated += 1
+            if load_pct is not None:
+                cell = ws.cell(
+                    row=row_idx,
+                    column=block_start + ORDERED_REPORT_COL["load_factor"] - 1,
+                    value=round(load_pct, 4),
+                )
+                cell.number_format = "0.00%"
+                cells_updated += 1
+
+        # CF only needs to be (re-)applied for new blocks; the user's
+        # template already carries CF rules on existing Load Factor
+        # columns so re-running won't pile up duplicates.
+        if is_new:
+            lf_col_letter = get_column_letter(
+                block_start + ORDERED_REPORT_COL["load_factor"] - 1,
+            )
+            _apply_load_factor_cf(ws, lf_col_letter, ws.max_row)
+            existing_dates[date] = block_start
+            block_end = block_start + ORDERED_REPORT_DATE_BLOCK_WIDTH - 1
+            next_col = block_end + 1
+            dates_added += 1
+        else:
+            dates_refreshed += 1
+
+    wb.save(report_path)
+    return {
+        "dates_added": dates_added,
+        "dates_refreshed": dates_refreshed,
+        "flights_added": flights_added,
+        "flights_updated": flights_updated,
+        "cells_updated": cells_updated,
+        "total_dates": len(existing_dates),
+    }
+
+
 def build_zenith_flight_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

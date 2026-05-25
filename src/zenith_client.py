@@ -867,14 +867,36 @@ def fetch_flight_loads(
                 "VolsOuverts": "VolsOuverts",
                 "ID_ETATVOL": "",
             }
-            try:
-                resp = session.session.post(
-                    url, data=data, timeout=timeout_s, allow_redirects=True,
-                )
-            except requests.RequestException as exc:
+            # Retry transient network errors a few times with backoff.
+            # Zenith occasionally drops connections mid-request
+            # (ConnectionResetError) and read timeouts happen when the
+            # server is briefly slow. Without this, one blip kills the
+            # whole chunk and the user has to restart from scratch.
+            resp = None
+            last_exc: Exception | None = None
+            for attempt in range(1, 4):  # 3 attempts: 0s, 4s, 10s
+                try:
+                    resp = session.session.post(
+                        url, data=data, timeout=timeout_s, allow_redirects=True,
+                    )
+                    last_exc = None
+                    break
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    if attempt == 3:
+                        break
+                    backoff = 4 if attempt == 1 else 10
+                    log.warning(
+                        "Flight-loads %s page %d attempt %d/%d failed (%s) — "
+                        "retrying in %ds",
+                        chunk_label, page, attempt, 3, exc, backoff,
+                    )
+                    time.sleep(backoff)
+            if resp is None:
                 raise ZenithError(
-                    f"Network error on chunk {chunk_label} page {page}: {exc}"
-                ) from exc
+                    f"Network error on chunk {chunk_label} page {page} after "
+                    f"3 attempts: {last_exc}"
+                ) from last_exc
             if resp.status_code in (401, 403) or "/otds/" in resp.url:
                 raise SessionExpiredError(
                     f"Zenith returned {resp.status_code} on flight-loads — "
