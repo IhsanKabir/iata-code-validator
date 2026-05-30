@@ -3608,7 +3608,7 @@ class App:
         self.zenith_fl_date_from = tk.StringVar(value=a_week_ago.strftime("%d/%m/%Y"))
         self.zenith_fl_date_to = tk.StringVar(value=today.strftime("%d/%m/%Y"))
         self.zenith_fl_page_size = tk.StringVar(value="100")
-        self.zenith_fl_chunk_days = tk.IntVar(value=10)
+        self.zenith_fl_chunk_days = tk.IntVar(value=7)
         self.zenith_fl_delay_s = tk.DoubleVar(value=1.0)
 
         row1 = ttk.Frame(form)

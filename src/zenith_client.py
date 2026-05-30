@@ -817,13 +817,223 @@ def iter_date_chunks(
         cursor = end + timedelta(days=1)
 
 
+def _flight_row_key(r: "FlightLoadRow") -> tuple[str, str, str, str]:
+    """Stable identity for a single (flight, date, leg, cabin) load row.
+
+    Multi-stop flights produce several rows that share flight_number +
+    flight_date but differ by leg_route, so the leg + cabin must be part
+    of the key. Used to dedup across paginated responses.
+    """
+    return (r.flight_number, r.flight_date, r.leg_route, r.leg_cabin)
+
+
+def _post_flight_load_page(
+    session: ZenithSession,
+    cfrom: str,
+    cto: str,
+    page: int,
+    page_size: int,
+    *,
+    timeout_s: float,
+    chunk_label: str,
+):
+    """POST one Nav={page} request with retry/backoff. Returns the response.
+
+    Raises ZenithError on exhausted retries, SessionExpiredError on
+    401/403/login-redirect. Returns None to signal "rate limited, caller
+    should retry this same page".
+    """
+    url = f"{FLIGHT_LOAD_URL}?Nav={page}"
+    data = {
+        "hidAction": "aff",
+        "idVol": "", "ID_Vol": "", "idLeg": "", "idProgVol": "",
+        "idvol_toggle": "", "toggleCodeStatusVolGDS": "",
+        "BoolAffCriteresGDS": "", "PrgVol_Numero": "",
+        "date_depart_vol": cfrom,
+        "date_fin_vol": cto,
+        "CodeISOAeroDep": "", "CodeISOAeroArr": "",
+        "HeureLocale": "HeureLocaleOK",
+        "DisplayOppositeLeg": "DisplayOppositeLeg",
+        "NbReponse": str(page_size),
+        "DayTime": "",
+        "VolsOuverts": "VolsOuverts",
+        "ID_ETATVOL": "",
+    }
+    resp = None
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):  # 3 attempts: 0s, 4s, 10s backoff
+        try:
+            resp = session.session.post(
+                url, data=data, timeout=timeout_s, allow_redirects=True,
+            )
+            last_exc = None
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == 3:
+                break
+            backoff = 4 if attempt == 1 else 10
+            log.warning(
+                "Flight-loads %s page %d attempt %d/3 failed (%s) — retrying in %ds",
+                chunk_label, page, attempt, exc, backoff,
+            )
+            time.sleep(backoff)
+    if resp is None:
+        raise ZenithError(
+            f"Network error on chunk {chunk_label} page {page} after "
+            f"3 attempts: {last_exc}"
+        ) from last_exc
+    if resp.status_code in (401, 403) or "/otds/" in resp.url:
+        raise SessionExpiredError(
+            f"Zenith returned {resp.status_code} on flight-loads — "
+            "session expired, please re-login."
+        )
+    if resp.status_code in (429, 503):
+        log.warning("Zenith rate limited on page %d — sleeping 10s", page)
+        time.sleep(10.0)
+        return None  # caller retries the same page
+    resp.raise_for_status()
+    return resp
+
+
+def _fetch_flight_load_range(
+    session: ZenithSession,
+    cfrom: str,
+    cto: str,
+    *,
+    page_size: int,
+    inter_call_delay_s: float,
+    stop_event: threading.Event | None,
+    timeout_s: float,
+) -> tuple[list["FlightLoadRow"], bool]:
+    """Fetch every page for one date range, deduping across pages.
+
+    Returns (rows, hit_cap_with_data). `hit_cap_with_data` is True when
+    we reached the FLIGHT_LOAD_MAX_PAGES ceiling AND the last page was
+    still contributing new rows — i.e. the range is too big and the
+    caller should split it rather than accept silent truncation.
+
+    The stop condition is exhaustion-based, never the old
+    `distinct_flights < page_size` heuristic (which mistook a full page
+    of multi-stop flights for the last page and dropped whole days).
+    """
+    chunk_label = f"{cfrom} → {cto}"
+    log.info("Zenith flight-loads range %s (page_size=%d)", chunk_label, page_size)
+    range_rows: list[FlightLoadRow] = []
+    range_seen: set[tuple[str, str, str, str]] = set()
+    hit_cap_with_data = False
+    rate_limit_retries = 0
+
+    page = 1
+    while page <= FLIGHT_LOAD_MAX_PAGES:
+        if stop_event is not None and stop_event.is_set():
+            break
+        resp = _post_flight_load_page(
+            session, cfrom, cto, page, page_size,
+            timeout_s=timeout_s, chunk_label=chunk_label,
+        )
+        if resp is None:
+            # Rate limited — _post already slept 10s. Retry the SAME page,
+            # but bound it so a server that throttles forever can't hang
+            # the whole run. After 5 throttles on one page, give up loudly.
+            rate_limit_retries += 1
+            if rate_limit_retries > 5:
+                raise RateLimitedError(
+                    f"Zenith kept rate-limiting chunk {chunk_label} page "
+                    f"{page} (6 attempts). Try again later or raise the delay."
+                )
+            continue
+        rate_limit_retries = 0  # reset on any successful page fetch
+
+        page_rows = parse_flight_loads_html(resp.text)
+        if not page_rows:
+            # Genuine exhaustion: server has no more rows for this range.
+            log.info("  page %d: 0 rows — range complete", page)
+            break
+
+        new_rows = []
+        for r in page_rows:
+            key = _flight_row_key(r)
+            if key not in range_seen:
+                range_seen.add(key)
+                new_rows.append(r)
+        range_rows.extend(new_rows)
+        log.info(
+            "  page %d: %d rows (%d new, %d cumulative)",
+            page, len(page_rows), len(new_rows), len(range_rows),
+        )
+
+        if not new_rows:
+            # Every row on this page was already seen — exhausted. This
+            # also safely handles a server that ignores Nav and re-serves
+            # page 1 (broken pagination → second page is all dupes → stop).
+            break
+
+        if page == FLIGHT_LOAD_MAX_PAGES:
+            # We stopped because of the cap, not exhaustion: more rows
+            # likely exist beyond page 10. Signal the caller to split.
+            hit_cap_with_data = True
+
+        page += 1
+        if inter_call_delay_s > 0 and page <= FLIGHT_LOAD_MAX_PAGES:
+            time.sleep(inter_call_delay_s)
+
+    return range_rows, hit_cap_with_data
+
+
+def _split_date_range(cfrom: str, cto: str) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Split [cfrom, cto] (DD/MM/YYYY, inclusive) into two halves by date."""
+    from datetime import datetime, timedelta
+    d_from = datetime.strptime(cfrom, "%d/%m/%Y").date()
+    d_to = datetime.strptime(cto, "%d/%m/%Y").date()
+    span = (d_to - d_from).days
+    mid = d_from + timedelta(days=span // 2)
+    fmt = "%d/%m/%Y"
+    return (
+        (d_from.strftime(fmt), mid.strftime(fmt)),
+        ((mid + timedelta(days=1)).strftime(fmt), d_to.strftime(fmt)),
+    )
+
+
+def _log_flight_load_completeness(
+    rows: list["FlightLoadRow"], date_from: str, date_to: str,
+) -> list[str]:
+    """Log per-date row counts and flag any date with ZERO rows.
+
+    Returns the list of missing dates so callers can surface them. The
+    whole point: a gap can NEVER be silent again — it screams in the log.
+    """
+    from collections import Counter
+    from datetime import datetime, timedelta
+    by_date: Counter[str] = Counter(r.flight_date for r in rows)
+    d_from = datetime.strptime(date_from, "%d/%m/%Y").date()
+    d_to = datetime.strptime(date_to, "%d/%m/%Y").date()
+    missing: list[str] = []
+    cursor = d_from
+    while cursor <= d_to:
+        key = cursor.strftime("%d/%m/%Y")
+        if by_date.get(key, 0) == 0:
+            missing.append(key)
+        cursor += timedelta(days=1)
+    log.info(
+        "Flight-loads completeness: %d rows across %d dates (%s..%s)",
+        len(rows), len(by_date), date_from, date_to,
+    )
+    if missing:
+        log.warning(
+            "Flight-loads MISSING %d date(s) with zero rows: %s",
+            len(missing), ", ".join(missing),
+        )
+    return missing
+
+
 def fetch_flight_loads(
     session: ZenithSession,
     date_from: str,
     date_to: str,
     *,
     page_size: int = FLIGHT_LOAD_DEFAULT_PAGE_SIZE,
-    chunk_days: int = 10,
+    chunk_days: int = 7,
     inter_call_delay_s: float = 1.0,
     progress_cb: Callable[[str, int, int, int], None] | None = None,
     stop_event: threading.Event | None = None,
@@ -831,104 +1041,78 @@ def fetch_flight_loads(
 ) -> list[FlightLoadRow]:
     """Pull all flight-load rows in [date_from, date_to] (DD/MM/YYYY).
 
-    Auto-chunks the date range to stay under the server's 10-page cap.
-    Within each chunk, paginates until the page returns fewer than
-    page_size flight headers (= last page reached) or the cap is hit.
+    Robust against the server's 10-page-per-search cap: the date range is
+    chunked, each chunk paginated with cross-page dedup, and **any chunk
+    that hits the page cap with data still arriving is automatically
+    split in half and re-fetched** — so flight density or a large range
+    can never silently truncate a chunk. `chunk_days` is now only a
+    performance hint (initial granularity); correctness no longer depends
+    on it.
 
     progress_cb signature: (chunk_label, completed_chunks, total_chunks, rows_so_far)
     """
-    chunks = list(iter_date_chunks(date_from, date_to, chunk_days))
-    total_chunks = len(chunks)
-    all_rows: list[FlightLoadRow] = []
+    from collections import deque
 
-    for chunk_idx, (cfrom, cto) in enumerate(chunks, start=1):
+    work: deque[tuple[str, str]] = deque(
+        iter_date_chunks(date_from, date_to, chunk_days)
+    )
+    total_known = len(work)        # grows as oversized chunks split
+    completed = 0
+    all_rows: list[FlightLoadRow] = []
+    global_seen: set[tuple[str, str, str, str]] = set()
+
+    while work:
         if stop_event is not None and stop_event.is_set():
             break
-        chunk_label = f"{cfrom} → {cto}"
-        log.info("Zenith flight-loads chunk %s (page_size=%d)", chunk_label, page_size)
+        cfrom, cto = work.popleft()
+        range_rows, capped = _fetch_flight_load_range(
+            session, cfrom, cto,
+            page_size=page_size,
+            inter_call_delay_s=inter_call_delay_s,
+            stop_event=stop_event,
+            timeout_s=timeout_s,
+        )
 
-        chunk_rows: list[FlightLoadRow] = []
-        for page in range(1, FLIGHT_LOAD_MAX_PAGES + 1):
-            if stop_event is not None and stop_event.is_set():
-                break
-            url = f"{FLIGHT_LOAD_URL}?Nav={page}"
-            data = {
-                "hidAction": "aff",
-                "idVol": "", "ID_Vol": "", "idLeg": "", "idProgVol": "",
-                "idvol_toggle": "", "toggleCodeStatusVolGDS": "",
-                "BoolAffCriteresGDS": "", "PrgVol_Numero": "",
-                "date_depart_vol": cfrom,
-                "date_fin_vol": cto,
-                "CodeISOAeroDep": "", "CodeISOAeroArr": "",
-                "HeureLocale": "HeureLocaleOK",
-                "DisplayOppositeLeg": "DisplayOppositeLeg",
-                "NbReponse": str(page_size),
-                "DayTime": "",
-                "VolsOuverts": "VolsOuverts",
-                "ID_ETATVOL": "",
-            }
-            # Retry transient network errors a few times with backoff.
-            # Zenith occasionally drops connections mid-request
-            # (ConnectionResetError) and read timeouts happen when the
-            # server is briefly slow. Without this, one blip kills the
-            # whole chunk and the user has to restart from scratch.
-            resp = None
-            last_exc: Exception | None = None
-            for attempt in range(1, 4):  # 3 attempts: 0s, 4s, 10s
-                try:
-                    resp = session.session.post(
-                        url, data=data, timeout=timeout_s, allow_redirects=True,
-                    )
-                    last_exc = None
-                    break
-                except requests.RequestException as exc:
-                    last_exc = exc
-                    if attempt == 3:
-                        break
-                    backoff = 4 if attempt == 1 else 10
-                    log.warning(
-                        "Flight-loads %s page %d attempt %d/%d failed (%s) — "
-                        "retrying in %ds",
-                        chunk_label, page, attempt, 3, exc, backoff,
-                    )
-                    time.sleep(backoff)
-            if resp is None:
-                raise ZenithError(
-                    f"Network error on chunk {chunk_label} page {page} after "
-                    f"3 attempts: {last_exc}"
-                ) from last_exc
-            if resp.status_code in (401, 403) or "/otds/" in resp.url:
-                raise SessionExpiredError(
-                    f"Zenith returned {resp.status_code} on flight-loads — "
-                    "session expired, please re-login."
-                )
-            if resp.status_code in (429, 503):
-                log.warning("Zenith rate limited on page %d — sleeping 10s", page)
-                time.sleep(10.0)
-                continue
-            resp.raise_for_status()
-
-            page_rows = parse_flight_loads_html(resp.text)
-            chunk_rows.extend(page_rows)
-            # If fewer flight HEADERS than page_size, we're on the last page.
-            # Count distinct flight headers because each flight can have multiple legs.
-            distinct_flights = len({(r.flight_number, r.flight_date) for r in page_rows})
-            log.info(
-                "  page %d: %d rows, %d distinct flights",
-                page, len(page_rows), distinct_flights,
+        same_day = cfrom == cto
+        if capped and not same_day:
+            # Range too big for the 10-page cap — split and re-fetch the
+            # halves fresh (discard the partial rows to avoid a torn
+            # boundary). This is what makes completeness guaranteed.
+            (lo, hi) = _split_date_range(cfrom, cto)
+            log.warning(
+                "Flight-loads chunk %s → %s hit the %d-page cap with data "
+                "still arriving — splitting into %s→%s and %s→%s",
+                cfrom, cto, FLIGHT_LOAD_MAX_PAGES,
+                lo[0], lo[1], hi[0], hi[1],
             )
-            if distinct_flights < page_size:
-                break
-            if inter_call_delay_s > 0 and page < FLIGHT_LOAD_MAX_PAGES:
-                time.sleep(inter_call_delay_s)
+            work.appendleft(hi)
+            work.appendleft(lo)
+            total_known += 1  # one range became two
+            continue
+        if capped and same_day:
+            # A single day exceeding 1000 distinct flights is impossible
+            # for this carrier — but never fail silently if it happens.
+            log.error(
+                "Flight-loads single day %s exceeded the %d-page cap; "
+                "data for that day may be incomplete.",
+                cfrom, FLIGHT_LOAD_MAX_PAGES,
+            )
 
-        all_rows.extend(chunk_rows)
+        for r in range_rows:
+            key = _flight_row_key(r)
+            if key not in global_seen:
+                global_seen.add(key)
+                all_rows.append(r)
+
+        completed += 1
         if progress_cb:
             try:
-                progress_cb(chunk_label, chunk_idx, total_chunks, len(all_rows))
+                progress_cb(f"{cfrom} → {cto}", completed, total_known, len(all_rows))
             except Exception:  # noqa: BLE001 — never let callback kill the run
                 log.exception("flight-load progress callback raised")
-        # Polite gap between chunks
-        if inter_call_delay_s > 0 and chunk_idx < total_chunks:
+        # Polite gap between ranges.
+        if inter_call_delay_s > 0 and work:
             time.sleep(inter_call_delay_s)
+
+    _log_flight_load_completeness(all_rows, date_from, date_to)
     return all_rows
