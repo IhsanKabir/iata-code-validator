@@ -36,6 +36,16 @@ hiddenimports = [
     "matplotlib",
     "matplotlib.backends.backend_tkagg",
     "matplotlib.pyplot",
+    # Outlook COM automation for the Bulk Mailer tab. Lazily imported so
+    # the rest of the app runs on machines without Outlook, but the
+    # bundle must carry it for when the user opens that tab.
+    "win32com",
+    "win32com.client",
+    "pythoncom",
+    "pywintypes",
+    # Microsoft Graph device-code auth for the Bulk Mailer (send as M365
+    # without desktop Outlook or SMTP). Lazily imported.
+    "msal",
 ]
 
 # Bundle whisper model files individually (more reliable than dir-tuple form

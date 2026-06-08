@@ -58,6 +58,15 @@ GENDER_OPTIONS = (
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class OEPError(RuntimeError):
+    """Base class for any oep.gov.bd request failure."""
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -239,11 +248,40 @@ def fetch_country_clearance(
         "X-Requested-With": "XMLHttpRequest",
         "Referer": GEO_REPORT_URL,
     }
+    import time as _time
     log.info("OEP country-clearance %s..%s gender=%s countries=%s",
              date_from, date_to, gender_id or "all",
              list(country_ids) if country_ids else (country_id or "all"))
-    resp = sess.get(COUNTRY_REPORT_URL, params=params, headers=headers, timeout=timeout_s)
-    resp.raise_for_status()
+    resp = None
+    for attempt in (1, 2):
+        resp = sess.get(COUNTRY_REPORT_URL, params=params, headers=headers, timeout=timeout_s)
+        if resp.status_code in (401, 429):
+            if attempt == 1:
+                log.warning("OEP country-clearance %d — backing off 5s", resp.status_code)
+                _time.sleep(5)
+                continue
+            raise OEPRateLimitedError(
+                f"oep.gov.bd returned {resp.status_code}. The site appears to "
+                "be rate-limiting your IP. Wait 5-10 minutes and try again, "
+                "or run a smaller selection."
+            )
+        if resp.status_code >= 500:
+            # 500 here usually means the date window predates the dataset
+            # (OEP data begins ~2024) or the filter combo has no data.
+            if attempt == 1:
+                log.warning(
+                    "OEP country-clearance %d for %s..%s — retrying once in 3s",
+                    resp.status_code, date_from, date_to,
+                )
+                _time.sleep(3)
+                continue
+            raise OEPError(
+                f"oep.gov.bd returned {resp.status_code} for {date_from}..{date_to}. "
+                "This date range may predate the available data (OEP records "
+                "start around 2024). Try a more recent range."
+            )
+        resp.raise_for_status()
+        break
     body = resp.json()
     payload = body.get("payload") or {}
     rows = payload.get("data") or []
@@ -335,7 +373,7 @@ def parse_division_table(html: str) -> list[DivisionClearance]:
     return out
 
 
-class OEPRateLimitedError(RuntimeError):
+class OEPRateLimitedError(OEPError):
     """Raised when the geo endpoint returns 401 — usually IP rate-limiting."""
 
 
@@ -391,6 +429,29 @@ def fetch_division_clearance(
                 "be rate-limiting your IP. Wait 5-10 minutes and try again, "
                 "or run a smaller selection."
             )
+        if resp.status_code >= 500:
+            # OEP 500s on cells it can't service — most often a
+            # (country, month) combination with no data, e.g. a month
+            # before the dataset begins, or a country with zero clearances
+            # that window. Retry once for a transient blip, then SKIP the
+            # cell (return empty) rather than aborting a report built from
+            # hundreds of cells. A genuinely empty cell contributes nothing
+            # anyway, so skipping is correct, not lossy.
+            if attempt == 1:
+                log.warning(
+                    "OEP geo-clearance got %d for %s..%s countries=%s — "
+                    "retrying once in 3s",
+                    resp.status_code, date_from, date_to,
+                    list(country_ids or []),
+                )
+                time.sleep(3)
+                continue
+            log.warning(
+                "OEP geo-clearance persistent %d for %s..%s countries=%s — "
+                "skipping this cell (treated as no data)",
+                resp.status_code, date_from, date_to, list(country_ids or []),
+            )
+            return []
         resp.raise_for_status()
         break
 

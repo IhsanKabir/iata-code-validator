@@ -503,6 +503,49 @@ def fetch_many(
 
 
 # ---------------------------------------------------------------------------
+# Leg classification — Domestic/International + Inbound/Outbound
+# ---------------------------------------------------------------------------
+
+# US-Bangla's domestic network. Everything else is treated as international.
+BD_AIRPORTS = frozenset({
+    "DAC",  # Dhaka (hub)
+    "CGP",  # Chattogram
+    "ZYL",  # Sylhet
+    "CXB",  # Cox's Bazar
+    "JSR",  # Jessore
+    "SPD",  # Saidpur
+    "RJH",  # Rajshahi
+    "BZL",  # Barishal
+})
+HUB_AIRPORT = "DAC"
+
+
+def classify_leg_region(origin: str, destination: str) -> str:
+    """'Domestic' when both endpoints are BD airports, else 'International'."""
+    o, d = (origin or "").upper(), (destination or "").upper()
+    return "Domestic" if (o in BD_AIRPORTS and d in BD_AIRPORTS) else "International"
+
+
+def classify_leg_direction(origin: str, destination: str) -> str:
+    """'Outbound' (leaving hub/country) or 'Inbound' (returning).
+
+    International legs key off the BD border; domestic legs key off the
+    DAC hub. Falls back to Outbound for the rare non-hub domestic leg.
+    """
+    o, d = (origin or "").upper(), (destination or "").upper()
+    o_bd, d_bd = o in BD_AIRPORTS, d in BD_AIRPORTS
+    if o_bd and not d_bd:
+        return "Outbound"          # leaving Bangladesh
+    if d_bd and not o_bd:
+        return "Inbound"           # entering Bangladesh
+    if o == HUB_AIRPORT:
+        return "Outbound"          # domestic, departing hub
+    if d == HUB_AIRPORT:
+        return "Inbound"           # domestic, arriving hub
+    return "Outbound"
+
+
+# ---------------------------------------------------------------------------
 # Flight Load (PNL) — date-range bulk pull
 # ---------------------------------------------------------------------------
 
@@ -542,8 +585,21 @@ class FlightLoadRow:
     inventory_status: str     # "AS-Flight open" / "Closed the 22/05/2026"
     comments: str = ""
 
+    # Passenger-manifest drill-down keys, parsed from the leg's
+    # liste_passager_vol.asp link. Empty when the link isn't present.
+    leg_id_leg: str = ""      # id_leg for the passenger-list page
+    leg_id_aero: str = ""     # id_aero (departure airport id)
+
 
 # ---- regexes — anchored on stable structural markers ----
+
+# Per-leg passenger-list link inside each leg info-row. `&amp;` because
+# the href is HTML-escaped in the page source.
+_PAX_LINK_RE = re.compile(
+    r"liste_passager_vol\.asp\?id_vol=(?P<vol>\d+)&(?:amp;)?id_leg=(?P<leg>\d+)"
+    r"&(?:amp;)?id_aero=(?P<aero>\d+)",
+    re.IGNORECASE,
+)
 
 _FLIGHT_HEADER_RE = re.compile(
     # `BS308` is sometimes rendered as `BS<spaces>308` in the legacy markup,
@@ -761,6 +817,18 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
 
             inv_title = inv_cells[stop_idx] if stop_idx < len(inv_cells) else ""
 
+            # Passenger-manifest drill-down keys come from this leg's
+            # liste_passager_vol.asp link. The link's id_vol is per-stop
+            # (more precise than the parent leg-table id for multi-stop
+            # flights), so prefer it when present.
+            link_m = _PAX_LINK_RE.search(leg_row)
+            if link_m:
+                row_id_vol = link_m.group("vol")
+                row_id_leg = link_m.group("leg")
+                row_id_aero = link_m.group("aero")
+            else:
+                row_id_vol, row_id_leg, row_id_aero = flight_id_vol, "", ""
+
             rows.append(FlightLoadRow(
                 flight_number=flight_number,
                 day_of_week=hdr.group("dow"),
@@ -769,7 +837,7 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
                 aircraft=aircraft_type,
                 registration=registration,
                 total_tickets_issued=hdr.group("tickets"),
-                leg_id_vol=flight_id_vol,
+                leg_id_vol=row_id_vol or flight_id_vol,
                 leg_route=route,
                 leg_origin=origin,
                 leg_destination=destination,
@@ -782,6 +850,8 @@ def parse_flight_loads_html(html: str) -> list[FlightLoadRow]:
                 seats_wl=seat_wl,
                 seats_available=available,
                 inventory_status=inv_title,
+                leg_id_leg=row_id_leg,
+                leg_id_aero=row_id_aero,
             ))
     return rows
 
@@ -827,6 +897,16 @@ def _flight_row_key(r: "FlightLoadRow") -> tuple[str, str, str, str]:
     return (r.flight_number, r.flight_date, r.leg_route, r.leg_cabin)
 
 
+class _PageServerError(ZenithError):
+    """A page persistently returned HTTP 5xx (e.g. 500 on a deep Nav page).
+
+    The server can't service this page for this (possibly too-large) date
+    range. Internal signal — the range fetcher catches it and SPLITS the
+    chunk instead of aborting the run, since a smaller chunk needs fewer
+    pages and won't reach the 500-prone deep pages.
+    """
+
+
 def _post_flight_load_page(
     session: ZenithSession,
     cfrom: str,
@@ -839,9 +919,12 @@ def _post_flight_load_page(
 ):
     """POST one Nav={page} request with retry/backoff. Returns the response.
 
-    Raises ZenithError on exhausted retries, SessionExpiredError on
-    401/403/login-redirect. Returns None to signal "rate limited, caller
-    should retry this same page".
+    Retries transient failures (network drops, and HTTP 500/502/504 —
+    Zenith intermittently 500s on deeper Nav pages of large chunks). On:
+      - session loss (401/403/login redirect) → SessionExpiredError
+      - rate limit (429/503) → returns None (caller retries the same page)
+      - persistent 5xx after 3 tries → _PageServerError (caller splits)
+      - dead network after 3 tries → ZenithError (aborts; environmental)
     """
     url = f"{FLIGHT_LOAD_URL}?Nav={page}"
     data = {
@@ -859,41 +942,56 @@ def _post_flight_load_page(
         "VolsOuverts": "VolsOuverts",
         "ID_ETATVOL": "",
     }
-    resp = None
     last_exc: Exception | None = None
     for attempt in range(1, 4):  # 3 attempts: 0s, 4s, 10s backoff
+        backoff = 4 if attempt == 1 else 10
         try:
             resp = session.session.post(
                 url, data=data, timeout=timeout_s, allow_redirects=True,
             )
-            last_exc = None
-            break
         except requests.RequestException as exc:
             last_exc = exc
             if attempt == 3:
-                break
-            backoff = 4 if attempt == 1 else 10
+                raise ZenithError(
+                    f"Network error on chunk {chunk_label} page {page} after "
+                    f"3 attempts: {exc}"
+                ) from exc
             log.warning(
-                "Flight-loads %s page %d attempt %d/3 failed (%s) — retrying in %ds",
-                chunk_label, page, attempt, exc, backoff,
+                "Flight-loads %s page %d attempt %d/3 network error (%s) — "
+                "retrying in %ds", chunk_label, page, attempt, exc, backoff,
             )
             time.sleep(backoff)
-    if resp is None:
-        raise ZenithError(
-            f"Network error on chunk {chunk_label} page {page} after "
-            f"3 attempts: {last_exc}"
-        ) from last_exc
-    if resp.status_code in (401, 403) or "/otds/" in resp.url:
-        raise SessionExpiredError(
-            f"Zenith returned {resp.status_code} on flight-loads — "
-            "session expired, please re-login."
-        )
-    if resp.status_code in (429, 503):
-        log.warning("Zenith rate limited on page %d — sleeping 10s", page)
-        time.sleep(10.0)
-        return None  # caller retries the same page
-    resp.raise_for_status()
-    return resp
+            continue
+
+        # Got a response — classify by status.
+        if resp.status_code in (401, 403) or "/otds/" in resp.url:
+            raise SessionExpiredError(
+                f"Zenith returned {resp.status_code} on flight-loads — "
+                "session expired, please re-login."
+            )
+        if resp.status_code in (429, 503):
+            log.warning("Zenith rate limited on page %d — sleeping 10s", page)
+            time.sleep(10.0)
+            return None  # caller retries the same page
+        if resp.status_code in (500, 502, 504):
+            # Zenith 500s on deep Nav pages of big chunks. Retry a couple
+            # of times (could be transient load); if it sticks, signal a
+            # split rather than killing the whole run.
+            if attempt == 3:
+                raise _PageServerError(
+                    f"Zenith {resp.status_code} on chunk {chunk_label} "
+                    f"page {page} after 3 attempts"
+                )
+            log.warning(
+                "Zenith %d on chunk %s page %d attempt %d/3 — retrying in %ds",
+                resp.status_code, chunk_label, page, attempt, backoff,
+            )
+            time.sleep(backoff)
+            continue
+        resp.raise_for_status()  # any other 4xx is a real client error
+        return resp
+    # Unreachable: every path in the loop returns/raises/continues.
+    raise ZenithError(f"Flight-loads page {page} exhausted retries: {last_exc}")
 
 
 def _fetch_flight_load_range(
@@ -908,10 +1006,10 @@ def _fetch_flight_load_range(
 ) -> tuple[list["FlightLoadRow"], bool]:
     """Fetch every page for one date range, deduping across pages.
 
-    Returns (rows, hit_cap_with_data). `hit_cap_with_data` is True when
-    we reached the FLIGHT_LOAD_MAX_PAGES ceiling AND the last page was
-    still contributing new rows — i.e. the range is too big and the
-    caller should split it rather than accept silent truncation.
+    Returns (rows, needs_split). `needs_split` is True when either we hit
+    the FLIGHT_LOAD_MAX_PAGES ceiling with data still arriving, OR the
+    server returned a persistent 5xx on a deep page — both mean the range
+    is too big; the caller should split it rather than truncate or abort.
 
     The stop condition is exhaustion-based, never the old
     `distinct_flights < page_size` heuristic (which mistook a full page
@@ -928,10 +1026,20 @@ def _fetch_flight_load_range(
     while page <= FLIGHT_LOAD_MAX_PAGES:
         if stop_event is not None and stop_event.is_set():
             break
-        resp = _post_flight_load_page(
-            session, cfrom, cto, page, page_size,
-            timeout_s=timeout_s, chunk_label=chunk_label,
-        )
+        try:
+            resp = _post_flight_load_page(
+                session, cfrom, cto, page, page_size,
+                timeout_s=timeout_s, chunk_label=chunk_label,
+            )
+        except _PageServerError as exc:
+            # Server can't serve this page for this range size. Signal a
+            # split — smaller halves need fewer pages and avoid the 500.
+            log.warning(
+                "Flight-loads %s page %d server-errored (%s) — splitting chunk",
+                chunk_label, page, exc,
+            )
+            hit_cap_with_data = True
+            break
         if resp is None:
             # Rate limited — _post already slept 10s. Retry the SAME page,
             # but bound it so a server that throttles forever can't hang
@@ -1033,7 +1141,7 @@ def fetch_flight_loads(
     date_to: str,
     *,
     page_size: int = FLIGHT_LOAD_DEFAULT_PAGE_SIZE,
-    chunk_days: int = 7,
+    chunk_days: int = 5,
     inter_call_delay_s: float = 1.0,
     progress_cb: Callable[[str, int, int, int], None] | None = None,
     stop_event: threading.Event | None = None,
@@ -1116,3 +1224,219 @@ def fetch_flight_loads(
 
     _log_flight_load_completeness(all_rows, date_from, date_to)
     return all_rows
+
+
+# ---------------------------------------------------------------------------
+# Passenger manifest (per-leg drill-down) — liste_passager_vol.asp
+# ---------------------------------------------------------------------------
+
+PAX_MANIFEST_URL = (
+    f"{BASE_URL}/newui/aerien/gestionregulation/liste_passager_vol.asp"
+)
+
+
+@dataclass(frozen=True)
+class PassengerRecord:
+    """One passenger row from a flight-leg's passenger list (PNL detail).
+
+    Carries the full manifest — including sensitive PII (passport, DOB) —
+    because the user explicitly asked for every field. Treat exported
+    files as confidential.
+    """
+
+    # Flight context (from the page header + drill-down keys)
+    flight_number: str
+    flight_date: str          # DD/MM/YYYY
+    flight_time: str          # HH:MM
+    route_desc: str           # "Dubai Intl - Dhaka"
+    id_vol: str
+    id_leg: str
+
+    # Passenger identity
+    title: str                # Mr./Mrs./Ms./Mstr
+    full_name: str            # "ABBAS MOHAMMOD"
+    pax_type: str             # AD / CH / INF
+    gender: str               # M / F
+    date_of_birth: str        # DD/MM/YYYY (PII)
+    passport_no: str          # (PII)
+    weight_kg: str
+
+    # Booking / fare
+    cabin_code: str           # Y
+    prbd: str                 # E  (booking class letter)
+    fare_basis: str           # EDXBO (Cl.)
+    web_class: str            # Economy Lite
+    ticket_number: str        # 7792...
+    seat: str                 # 19A
+    pnr: str                  # host PNR
+    gds_pnr: str              # GDS PNR (2nd code if present)
+    leg: str                  # "DXB DAC"
+    issuing_agency: str       # "TA: 86219313 ..."
+    direction: str            # Outbound / Inbound
+
+
+_PAX_HEADER_RE = re.compile(
+    r"Flight\s*:\s*(?P<flt>BS\s*\d+)\s+(?P<route>.+?)\s+The\s+"
+    r"(?P<date>\d{2}/\d{2}/\d{4})\s+at\s+(?P<time>\d{2}:\d{2})",
+)
+_PAX_ROW_SPLIT_RE = re.compile(r'<td class="Col_NomPrenomAge"', re.IGNORECASE)
+_PAX_CELL_RE_TMPL = r'<td class="{col}"[^>]*>(?P<body>.*?)</td>'
+
+# Field sub-patterns within the name/age cell.
+_PAX_TITLE_RE = re.compile(r"\b(Mr\.|Mrs\.|Ms\.|Mstr\.?|Miss|Dr\.)", re.IGNORECASE)
+_PAX_TYPE_GENDER_RE = re.compile(r"\b(AD|CHD?|INF)\s*-\s*([MF])\b")
+_PAX_DOB_RE = re.compile(r"Born on:\s*(\d{2}/\d{2}/\d{4})")
+_PAX_PASSPORT_RE = re.compile(r"Passport\s*No\.?\s*:\s*([A-Za-z0-9]+)")
+_PAX_WEIGHT_RE = re.compile(r"(\d+)\s*Kg", re.IGNORECASE)
+_TICKET_NUM_RE = re.compile(r"\b(\d{13})\b")
+
+
+def _clean_cell(html_fragment: str) -> str:
+    """Strip tags + collapse whitespace + decode the few entities we see.
+
+    The legacy markup sometimes emits a malformed `&nbsp` with no trailing
+    semicolon (e.g. `Born on:&nbsp25/01/1988`), so we match the optional
+    semicolon — otherwise the DOB glues to the label and won't parse.
+    """
+    text = re.sub(r"<[^>]+>", " ", html_fragment)
+    text = re.sub(r"&nbsp;?", " ", text)
+    text = text.replace("&amp;", "&").replace("&#45;", "-")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _pax_cell(row_html: str, col: str, label: str) -> str:
+    """Extract one Col_* cell value, stripping its repeated xs-left label."""
+    m = re.search(_PAX_CELL_RE_TMPL.format(col=col), row_html, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    val = _clean_cell(m.group("body"))
+    # Each cell repeats the column header as an xs-left label; drop it.
+    if label and val.lower().startswith(label.lower()):
+        val = val[len(label):].strip()
+    return val
+
+
+def parse_passenger_list_html(
+    html: str, *, id_vol: str = "", id_leg: str = "",
+) -> list[PassengerRecord]:
+    """Parse a liste_passager_vol.asp page into PassengerRecord rows."""
+    hdr = _PAX_HEADER_RE.search(re.sub(r"<[^>]+>", " ", html))
+    if hdr:
+        flight_number = re.sub(r"\s+", "", hdr.group("flt"))
+        route_desc = re.sub(r"\s+", " ", hdr.group("route")).strip()
+        flight_date = hdr.group("date")
+        flight_time = hdr.group("time")
+    else:
+        flight_number = route_desc = flight_date = flight_time = ""
+
+    records: list[PassengerRecord] = []
+    # Each passenger row contains exactly one Col_NomPrenomAge cell.
+    marks = [m.start() for m in _PAX_ROW_SPLIT_RE.finditer(html)]
+    for pos in marks:
+        rstart = html.rfind("<tr", 0, pos)
+        rend = html.find("</tr>", pos)
+        if rstart < 0 or rend < 0:
+            continue
+        row = html[rstart:rend]
+
+        name_blob = _pax_cell(row, "Col_NomPrenomAge", "Surname, First name, Weight")
+        # The blob may begin with a leftover material-icon glyph token; the
+        # title regex anchors us regardless.
+        title = ""
+        tm = _PAX_TITLE_RE.search(name_blob)
+        if tm:
+            title = tm.group(1)
+        tg = _PAX_TYPE_GENDER_RE.search(name_blob)
+        pax_type = (tg.group(1) if tg else "")
+        gender = (tg.group(2) if tg else "")
+        dob = (_PAX_DOB_RE.search(name_blob).group(1)
+               if _PAX_DOB_RE.search(name_blob) else "")
+        passport = (_PAX_PASSPORT_RE.search(name_blob).group(1)
+                    if _PAX_PASSPORT_RE.search(name_blob) else "")
+        weight = (_PAX_WEIGHT_RE.search(name_blob).group(1)
+                  if _PAX_WEIGHT_RE.search(name_blob) else "")
+        # Name = text between the title and the pax-type token.
+        full_name = name_blob
+        if tm:
+            full_name = name_blob[tm.end():]
+        if tg:
+            cut = full_name.find(tg.group(0))
+            if cut >= 0:
+                full_name = full_name[:cut]
+        full_name = re.sub(r"\s+", " ", full_name).strip(" -·")
+
+        pnr_raw = _pax_cell(row, "Col_PNR", "PNR")
+        pnr_parts = pnr_raw.split()
+        pnr = pnr_parts[0] if pnr_parts else ""
+        gds_pnr = pnr_parts[1] if len(pnr_parts) > 1 else ""
+
+        billet_raw = _pax_cell(row, "Col_Billet", "Ticket")
+        tk = _TICKET_NUM_RE.search(billet_raw)
+        ticket_number = tk.group(1) if tk else ""
+
+        records.append(PassengerRecord(
+            flight_number=flight_number,
+            flight_date=flight_date,
+            flight_time=flight_time,
+            route_desc=route_desc,
+            id_vol=id_vol,
+            id_leg=id_leg,
+            title=title,
+            full_name=full_name,
+            pax_type=pax_type,
+            gender=gender,
+            date_of_birth=dob,
+            passport_no=passport,
+            weight_kg=weight,
+            cabin_code=_pax_cell(row, "Col_CabineClasseCode", "Cabin code"),
+            prbd=_pax_cell(row, "Col_PRBD", "PRBD"),
+            fare_basis=_pax_cell(row, "Col_Classe", "Cl."),
+            web_class=_pax_cell(row, "Col_Webclasse", "Web Cl."),
+            ticket_number=ticket_number,
+            seat=_pax_cell(row, "Col_SEAT", ""),
+            pnr=pnr,
+            gds_pnr=gds_pnr,
+            leg=_pax_cell(row, "Col_Leg", "Leg"),
+            issuing_agency=_pax_cell(row, "Col_AgenceEmettrice", "Issuing agency"),
+            direction=_pax_cell(row, "Col_AR", "OUT/IN"),
+        ))
+    return records
+
+
+def fetch_passenger_manifest(
+    session: ZenithSession,
+    id_vol: str,
+    id_leg: str,
+    id_aero: str,
+    *,
+    timeout_s: float = 120.0,
+) -> list[PassengerRecord]:
+    """Fetch + parse one flight-leg's passenger list.
+
+    Replicates the print-mode GET the Zenith UI issues, which returns the
+    entire manifest in a single response (no pagination).
+    """
+    params = {
+        "id_vol": str(id_vol), "id_leg": str(id_leg), "id_aero": str(id_aero),
+        "m": "0", "step": "1", "ID_LegManifeste": str(id_leg),
+        "TypePassager_Lib": "Passenger type", "ID_TypePassager": "",
+        "OptionAffichage": "5", "ModePrint": "ok", "AutoPrint": "off",
+        "IATASSRCODE": "", "DisplayCustomerInfo": "false",
+        "InvalidConnectingFlight": "false", "PRBDCode": "",
+        "IssuingAgency": "", "ID_TypeIssuingAgency": "",
+    }
+    sess = session.session
+    sess.headers.setdefault("User-Agent", USER_AGENT)
+    try:
+        resp = sess.get(PAX_MANIFEST_URL, params=params, timeout=timeout_s)
+    except requests.RequestException as exc:
+        raise ZenithError(
+            f"Network error fetching manifest id_vol={id_vol} id_leg={id_leg}: {exc}"
+        ) from exc
+    if resp.status_code in (401, 403) or "/otds/" in resp.url:
+        raise SessionExpiredError(
+            f"Zenith returned {resp.status_code} on the passenger manifest — "
+            "session expired, please re-login."
+        )
+    resp.raise_for_status()
+    return parse_passenger_list_html(resp.text, id_vol=str(id_vol), id_leg=str(id_leg))

@@ -168,6 +168,9 @@ ZENITH_OUTPUT_COLUMNS = [
 
 ZENITH_CACHE_DB = APP_DIR / "zenith_cache.sqlite"
 
+# Bulk Mailer tab — send-log so re-runs skip already-sent rows.
+MAILER_LOG_DB = APP_DIR / "mailer_log.sqlite"
+
 # Zenith Flight Loads sub-tab
 ZENITH_FLIGHT_OUTPUT_COLUMNS = [
     "Flight Number",

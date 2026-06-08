@@ -313,3 +313,80 @@ def test_categories_for_country_filters_and_sorts():
     assert [c.category_name for c in out] == ["Cook", "Driver"]
     assert out[0].total_employee == 200
     assert out[1].total_employee == 150
+
+
+# ---------------------------------------------------------------------------
+# Server-error resilience (fetch_division_clearance skips 500 cells)
+# ---------------------------------------------------------------------------
+
+from src.oep_client import (
+    fetch_division_clearance,
+    fetch_country_clearance,
+    GEO_REPORT_URL,
+    OEPError,
+    OEPRateLimitedError,
+)
+import src.oep_client as _oep
+
+
+class _Resp:
+    def __init__(self, status, text="", payload=None):
+        self.status_code = status
+        self.text = text
+        self._payload = payload if payload is not None else {"payload": {"data": []}}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError("raise_for_status should not be reached for handled codes")
+
+
+class _FakeSess:
+    def __init__(self, responses):
+        # responses: list of _Resp returned in order per .get() call
+        self._responses = list(responses)
+        self.headers = {}
+        self.calls = 0
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls += 1
+        return self._responses.pop(0)
+
+
+def _no_sleep(monkeypatch):
+    """oep_client does `import time` locally, so patch the stdlib module."""
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda *_a, **_k: None)
+
+
+def test_geo_clearance_skips_persistent_500(monkeypatch):
+    """A (country, month) cell that 500s twice is skipped (empty), not fatal."""
+    _no_sleep(monkeypatch)
+    sess = _FakeSess([_Resp(500), _Resp(500)])
+    rows = fetch_division_clearance(
+        "2023-11-01", "2023-11-30", country_ids=["12"], session=sess,
+    )
+    assert rows == []
+    assert sess.calls == 2  # one retry, then skip
+
+
+def test_geo_clearance_retries_then_succeeds(monkeypatch):
+    _no_sleep(monkeypatch)
+    good = """<table><tbody>
+        <tr><td>1</td><td>Dhaka</td><td>Dhaka</td><td>5,000</td></tr>
+    </tbody></table>"""
+    sess = _FakeSess([_Resp(500), _Resp(200, text=good)])
+    rows = fetch_division_clearance(
+        "2024-01-01", "2024-01-31", country_ids=["1"], session=sess,
+    )
+    assert len(rows) == 1 and rows[0].total_employee == 5000
+
+
+def test_country_clearance_500_raises_helpful_error(monkeypatch):
+    _no_sleep(monkeypatch)
+    sess = _FakeSess([_Resp(500), _Resp(500)])
+    with pytest.raises(OEPError) as ei:
+        fetch_country_clearance("2023-11-01", "2023-11-30", session=sess)
+    assert "predate" in str(ei.value).lower()

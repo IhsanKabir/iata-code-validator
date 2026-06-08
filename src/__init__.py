@@ -1,3 +1,5 @@
-"""IATA Code Validator + BD Travel Agency + BD Overseas Movement + Zenith Customer + Flight Loads + Flight History (Analyzer + Auto-downloader)."""
+"""Travel Ops Console — IATA validation, BD agency lookup, BD overseas
+movement, Zenith (customer / flight loads / history / PNR / passenger),
+and a Bulk Mailer (Outlook / Graph / SMTP)."""
 
-__version__ = "1.14.1"
+__version__ = "1.15.0"

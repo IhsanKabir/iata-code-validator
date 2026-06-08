@@ -1223,6 +1223,52 @@ def build_zenith_flight_output_path(folder: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Passenger manifest (per-leg drill-down) export
+# ---------------------------------------------------------------------------
+
+ZENITH_PAX_OUTPUT_COLUMNS = [
+    "Flight", "Flight Date", "Flight Time", "Route", "Leg", "Direction",
+    "Title", "Passenger Name", "Pax Type", "Gender",
+    "Date of Birth", "Passport No.", "Weight (kg)",
+    "Cabin", "PRBD", "Fare Basis", "Web Class",
+    "Ticket Number", "Seat", "PNR", "GDS PNR", "Issuing Agency",
+    "id_vol", "id_leg",
+]
+
+
+def write_passenger_manifest(path: Path, records: Iterable) -> None:
+    """Write passenger-manifest rows to one flat sheet (one row per pax).
+
+    `records` is an iterable of zenith_client.PassengerRecord. Contains
+    PII (passport, DOB) by design — the file is confidential.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Passengers"
+    ws.append(ZENITH_PAX_OUTPUT_COLUMNS)
+    for r in records:
+        ws.append([
+            r.flight_number, r.flight_date, r.flight_time, r.route_desc,
+            r.leg, r.direction,
+            r.title, r.full_name, r.pax_type, r.gender,
+            r.date_of_birth, r.passport_no, r.weight_kg,
+            r.cabin_code, r.prbd, r.fare_basis, r.web_class,
+            r.ticket_number, r.seat, r.pnr, r.gds_pnr, r.issuing_agency,
+            r.id_vol, r.id_leg,
+        ])
+    widths = {1: 9, 2: 11, 4: 22, 8: 26, 11: 12, 12: 14, 16: 10, 20: 10, 22: 30}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    wb.save(path)
+
+
+def build_zenith_pax_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_passengers_{timestamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
 # Zenith Flight History audit
 # ---------------------------------------------------------------------------
 

@@ -282,3 +282,40 @@ def test_completeness_no_gaps():
             self.flight_date = d
     rows = [_Row("01/06/2026"), _Row("02/06/2026")]
     assert _log_flight_load_completeness(rows, "01/06/2026", "02/06/2026") == []
+
+
+# ---------------------------------------------------------------------------
+# Leg classification (Domestic/International + Inbound/Outbound)
+# ---------------------------------------------------------------------------
+
+from src.zenith_client import classify_leg_region, classify_leg_direction
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize(("o", "d", "region"), [
+    ("DAC", "CXB", "Domestic"),
+    ("ZYL", "DAC", "Domestic"),
+    ("CGP", "DAC", "Domestic"),
+    ("DAC", "KUL", "International"),
+    ("DAC", "MLE", "International"),
+    ("DXB", "DAC", "International"),
+    ("CGP", "MCT", "International"),
+])
+def test_classify_leg_region(o, d, region):
+    assert classify_leg_region(o, d) == region
+
+
+@_pytest.mark.parametrize(("o", "d", "direction"), [
+    ("DAC", "CXB", "Outbound"),   # domestic ex-hub
+    ("ZYL", "DAC", "Inbound"),    # domestic to-hub
+    ("DAC", "DXB", "Outbound"),   # leaving BD
+    ("DXB", "DAC", "Inbound"),    # entering BD
+    ("RJH", "DAC", "Inbound"),
+    ("DAC", "MLE", "Outbound"),
+    ("MCT", "CGP", "Inbound"),    # foreign->BD
+    ("CGP", "MCT", "Outbound"),   # BD->foreign
+])
+def test_classify_leg_direction(o, d, direction):
+    assert classify_leg_direction(o, d) == direction
