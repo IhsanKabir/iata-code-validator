@@ -1,7 +1,7 @@
-# IATA Code Validator
+# Travel Ops Console
 
-A four-tab Windows desktop tool for travel-industry teams. Single `.exe`,
-no Python or admin required.
+A five-tab Windows desktop tool for travel-industry teams. Single `.exe`
+(`IATACodeValidator.exe`), no Python or admin required.
 
 [Download the latest release →](../../releases)
 
@@ -15,6 +15,7 @@ no Python or admin required.
 | **BD Travel Agency Lookup** | Resolve / export Bangladesh travel-agency records | regtravelagency.gov.bd |
 | **BD Overseas Movement** | 8 views of BD outflow (destinations, divisions, time series, pivots…) | oep.gov.bd |
 | **Zenith** | 4 sub-tabs against US-Bangla Zenith — *login required* | asia.ttinteractive.com |
+| **Bulk Mailer** | Mail-merge reports — per-recipient attachments, one click | Outlook / Graph / SMTP |
 
 **Zenith sub-tabs:** *Customer Lookup* · *Flight Loads* · *Flight History Analyzer* · *PNR Bulk Lookup*
 
@@ -27,7 +28,10 @@ no Python or admin required.
 3. Sign in with Google when prompted.
 4. Pick a tab. Pick input + output. Click **Run** / **Start**.
 
-Every run writes a timestamped `.xlsx` into the output folder you choose.
+The scraper tabs each write a timestamped `.xlsx` into the output folder you
+choose. **Bulk Mailer** works the other way round: point it at a mapping
+sheet (Email · Name · File · CC · BCC) plus an attachments folder, **Preview**
+to validate every row, then **Draft** for review or **Send**.
 
 ---
 
@@ -37,10 +41,13 @@ Every run writes a timestamped `.xlsx` into the output folder you choose.
 | File | Contents |
 | --- | --- |
 | `cache.sqlite` | IATA lookups |
-| `bd_cache.sqlite` | BD agency directory + match index |
+| `bd_agencies.sqlite` | BD agency directory + match index |
 | `zenith_cache.sqlite` | Zenith customer records |
 | `zenith_pnr.sqlite` | Zenith PNR Dossiers |
 | `oep_presets.json` | OEP filter presets |
+| `mailer_log.sqlite` | Bulk Mailer send-log (resume-safe, skips already-sent) |
+| `mailer_outlook_account.txt` | Last-used Outlook send-from account |
+| `graph_token.bin` | Microsoft Graph token cache (mailer device-code sign-in) |
 | `browser_profile/` | Chromium profile |
 | `iata_checker.log` | Rotating log (5 MB × 2) |
 
@@ -56,6 +63,9 @@ Every run writes a timestamped `.xlsx` into the output folder you choose.
 | OEP: HTTP 401 mid-run | IP rate-limited. Wait 5-10 min; retry with smaller scope. |
 | Zenith: HTTP 500 on history download | Sign out → Sign in. If still failing, site likely changed. |
 | Zenith / Flight Loads slow | First run pays the network cost; caches make subsequent runs instant. |
+| Mailer: drafts land in the wrong mailbox | Pick the send-from account in the dropdown; drafts move to that account's Drafts. |
+| Mailer: "admin approval required" (Graph) | Tenant blocks self-service consent — use the Outlook or SMTP transport instead. |
+| Mailer: provider throttles a large run | Raise the delay slider; re-run safely — already-sent rows are skipped. |
 
 </details>
 
@@ -93,7 +103,7 @@ python run_app.py
 
 Or `.\launch.ps1` (auto-picks the right Python).
 
-Tests: `python -m pytest tests/ -v` (178+ tests).
+Tests: `python -m pytest tests/ -v` (235+ tests).
 
 </details>
 
@@ -102,7 +112,7 @@ Tests: `python -m pytest tests/ -v` (178+ tests).
 
 ```text
 src/main.py            ── launches GUI
-src/gui.py             ── Tkinter, 4 tabs, 1 worker thread per tab
+src/gui.py             ── Tkinter, 5 tabs, 1 worker thread per tab
 src/auth.py            ── Google OAuth (per-team licensing)
 src/updater.py         ── in-app auto-update from Releases
 src/excel_io.py        ── shared openpyxl I/O
@@ -126,6 +136,12 @@ Zenith tabs
     zenith_loads_index.py        ── load-factor lookup
     zenith_pnr_client.py         ── PNR Dossier resolver
     zenith_pnr_cache.py          ── PNR cache
+
+Bulk Mailer tab
+    mailer_io.py     ── mapping reader + {name} templating + row validation
+    mailer_client.py ── Outlook COM + SMTP backends, MX auto-detect
+    graph_mailer.py  ── Microsoft Graph backend (device-code sign-in)
+    mailer_log.py    ── resume-safe send-log
 ```
 
 </details>
@@ -138,6 +154,9 @@ Zenith tabs
   high-volume work, license IATA's CheckACode Professional API.
 - Zenith tabs are read-only against a private US-Bangla system; require
   a valid Zenith account.
+- Bulk Mailer is provider-agnostic — works with Outlook (desktop COM),
+  Microsoft Graph (device-code sign-in), or any SMTP host. No recipient
+  cap; large runs are bounded only by your provider's daily send limit.
 - Auto-updater checks GitHub Releases on launch.
 
 **License:** © 2025-2026 A K M Ihsan Kabir. All Rights Reserved. See [LICENSE](LICENSE).
