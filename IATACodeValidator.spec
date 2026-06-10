@@ -46,6 +46,17 @@ hiddenimports = [
     # Microsoft Graph device-code auth for the Bulk Mailer (send as M365
     # without desktop Outlook or SMTP). Lazily imported.
     "msal",
+    # Reports sub-tab — shared analytics library. Core is STDLIB-ONLY (no
+    # duckdb/pandas), and the builders are intentionally NOT listed, so the
+    # download-only exe stays lean. Imported lazily in _build_zenith_reports_tab.
+    "reporting",
+    "reporting.reports_tab",
+    "reporting.auth",
+    "reporting.state",
+    "reporting.config",
+    "reporting._io",
+    "reporting.publish",
+    "reporting.registry",
 ]
 
 # Bundle whisper model files individually (more reliable than dir-tuple form

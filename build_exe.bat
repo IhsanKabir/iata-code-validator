@@ -14,6 +14,11 @@ REM ================================================================
 setlocal
 
 echo [1/4] Installing build deps...
+REM Build in a Python 3.13 venv. The pinned stack (matplotlib, faster-whisper,
+REM etc.) has no prebuilt wheels for Python 3.14, and source-building them needs a
+REM C compiler. Requires `py -3.13` (check with: py --list).
+if not exist ".venv\Scripts\python.exe" py -3.13 -m venv .venv
+call ".venv\Scripts\activate.bat"
 python -m pip install --upgrade pip >nul
 python -m pip install -r requirements.txt
 if errorlevel 1 goto :err

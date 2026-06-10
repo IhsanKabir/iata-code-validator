@@ -1,5 +1,6 @@
 """Configuration constants."""
 
+import os
 from pathlib import Path
 
 # Target site
@@ -194,3 +195,16 @@ ZENITH_FLIGHT_OUTPUT_COLUMNS = [
     "Inventory Status",
     "Comments",
 ]
+
+# ---------------------------------------------------------------------------
+# Zenith -> Reports sub-tab (download-only; gated by a 14-day rotating password)
+# ---------------------------------------------------------------------------
+# Pre-built analytics workbooks are produced by the separate pipeline and shared
+# read-only to each manager (per-folder NTFS ACLs are the privacy boundary). This
+# tab only authenticates + downloads — no data engine is bundled.
+#
+# Point this at the manager's reports folder. Override per-machine with the
+# USBA_REPORTS_DIR environment variable; set the default below to the real UNC
+# share once provisioned (currently the analyst's local publish folder).
+REPORTS_DIR = Path(os.environ.get("USBA_REPORTS_DIR", r"E:\Analysis\shared_reports"))
+REPORTS_AUTH_FILE = REPORTS_DIR / "auth.json"
