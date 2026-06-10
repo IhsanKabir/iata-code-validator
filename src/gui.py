@@ -132,6 +132,28 @@ MSG_UPDATE_DOWNLOADED = "update_downloaded"  # payload: Path
 MSG_UPDATE_ERROR = "update_error"
 
 
+# ---------------------------------------------------------------------------
+# Central usage-telemetry registry (future-proof)
+# ---------------------------------------------------------------------------
+# Any completion/"done" message listed here is reported to the usage backend
+# from ONE place in `_handle_msg`, so a newly added feature is tracked the
+# moment its DONE message is added here — no per-feature wiring. The value is
+# (action_label, count_key) where count_key, when set, is read from a dict
+# payload to record the batch size.
+_USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
+    MSG_ZENITH_LOGGED_IN: ("zenith_login", None),
+    MSG_ZENITH_DONE: ("zenith_customer", None),
+    MSG_ZENITH_FL_DONE: ("zenith_flight_loads", None),
+    MSG_ZENITH_PAX_DONE: ("zenith_passenger", "pax"),
+    MSG_ZENITH_FH_DONE: ("zenith_history_analyze", None),
+    MSG_ZENITH_DL_DONE: ("zenith_history_download", None),
+    MSG_ZENITH_PNR_DONE: ("zenith_pnr_enrich", None),
+    MSG_ZENITH_BULK_DONE: ("zenith_pnr_bulk", None),
+    MSG_OEP_DONE: ("oep_movement", None),
+    MSG_MAIL_DONE: ("mailer_send", "sent"),
+}
+
+
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -258,6 +280,11 @@ class App:
         # Live tab-label refresh — appends "●" while a worker is running
         # and "(N cached)" once an idle tab has cache to show off.
         self.root.after(500, self._refresh_tab_labels)
+        # Usage telemetry: report every feature use — including tabs added in
+        # the future — through one central, fire-and-forget path.
+        self._telemetry_ready = False
+        self._last_view: dict[str, str] = {}
+        self._install_usage_tracking()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _refresh_tab_labels(self) -> None:
@@ -314,6 +341,93 @@ class App:
                 self.root.after(2000, self._refresh_tab_labels)
             except tk.TclError:
                 return
+
+    # ------------------------------------------------------------------
+    # Usage telemetry — one central, future-proof path
+    # ------------------------------------------------------------------
+    def _track(
+        self,
+        action: str,
+        *,
+        target: str | None = None,
+        count: int = 0,
+        notes: str | None = None,
+    ) -> None:
+        """Fire-and-forget usage event. Safe from any thread, never blocks the
+        UI, never raises. Every feature reports through here so the backend
+        Usage view reflects what users actually do."""
+        def _send() -> None:
+            try:
+                auth.log_lookup_event(
+                    action=action, target=target,
+                    count=int(count or 0), notes=notes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("usage telemetry %r failed: %s", action, exc)
+        try:
+            threading.Thread(target=_send, daemon=True).start()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _install_usage_tracking(self) -> None:
+        """Bind tab-change telemetry on EVERY notebook in the widget tree.
+
+        Walking the whole tree means tabs and sub-tabs added in the future are
+        tracked automatically — no per-feature wiring. Completion events are
+        handled centrally via `_USAGE_EVENTS` in `_handle_msg`.
+        """
+        def _walk(widget) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Notebook):
+                    child.bind(
+                        "<<NotebookTabChanged>>", self._on_tab_changed, add="+",
+                    )
+                _walk(child)
+        try:
+            _walk(self.root)
+        except Exception:  # noqa: BLE001
+            log.debug("usage tab-tracking install failed", exc_info=True)
+        # Ignore the tab events that fire while the window first maps; only
+        # count real navigation once the UI has settled.
+        self.root.after(1500, lambda: setattr(self, "_telemetry_ready", True))
+
+    @staticmethod
+    def _clean_tab_label(text: str) -> str:
+        """Strip the live "●" / "(N cached)" annotations from a tab label."""
+        t = (text or "").replace("●", "").strip()
+        if t.endswith("cached)") and "(" in t:
+            t = t[: t.rfind("(")].strip()
+        return t
+
+    def _on_tab_changed(self, event) -> None:
+        """Report which tab the user opened. Deduped per notebook so only real
+        navigation (not repeated refreshes) is logged."""
+        if not getattr(self, "_telemetry_ready", False):
+            return
+        try:
+            nb = event.widget
+            if not hasattr(nb, "select"):
+                nb = self.root.nametowidget(nb)
+            sel = nb.select()
+            if not sel:
+                return
+            base = ""
+            try:
+                widget = self.root.nametowidget(sel)
+                base = self._tab_base_labels.get(widget, "")
+            except (tk.TclError, AttributeError, KeyError):
+                base = ""
+            if not base:
+                base = self._clean_tab_label(nb.tab(sel, "text"))
+        except tk.TclError:
+            return
+        if not base:
+            return
+        key = str(nb)
+        if self._last_view.get(key) == base:
+            return
+        self._last_view[key] = base
+        self._track(action="view", target=base)
 
     # ------------------------------------------------------------------
     # Theme + custom widget styles
@@ -974,16 +1088,25 @@ class App:
         self.mail_progress = ttk.Progressbar(prog, mode="determinate", maximum=1)
         self.mail_progress.pack(fill="x", padx=2, pady=2)
 
-        # Show the credential block matching the default transport (graph).
-        self._mail_sync_transport()
+        # Show the credential block matching the default transport — layout only;
+        # initial=True so we DON'T touch Outlook COM / MSAL at startup (that pops a
+        # Microsoft sign-in dialog before the user has even opened the mailer).
+        self._mail_sync_transport(initial=True)
 
     def _mail_sync_run_label(self) -> None:
         self.btn_mail_run.configure(
             text="Create drafts" if self.mail_mode.get() == "draft" else "Send now",
         )
 
-    def _mail_sync_transport(self) -> None:
-        """Show the credential block that matches the chosen transport."""
+    def _mail_sync_transport(self, initial: bool = False) -> None:
+        """Show the credential block that matches the chosen transport.
+
+        ``initial=True`` (the single build-time call) ONLY lays out the frames. It must
+        not touch Outlook COM or MSAL: doing so during app startup makes Outlook pop a
+        Microsoft (login.microsoftonline.com) sign-in dialog before the user has chosen
+        to use the mailer at all. The account-refresh / silent-sign-in side effects run
+        only when the user actually selects a transport (a deliberate radio click).
+        """
         t = self.mail_transport.get()
         self.mail_smtp_frame.pack_forget()
         self.mail_outlook_frame.pack_forget()
@@ -992,13 +1115,13 @@ class App:
             self.mail_smtp_frame.pack(fill="x", padx=2)
         elif t == "outlook":
             self.mail_outlook_frame.pack(fill="x", padx=2, pady=(2, 4))
-            if not self.mail_outlook_combo.cget("values"):
-                self._mail_refresh_outlook_accounts()
+            if not initial and not self.mail_outlook_combo.cget("values"):
+                self._mail_refresh_outlook_accounts()   # Dispatches Outlook COM — user action only
         else:  # graph
             self.mail_graph_frame.pack(fill="x", padx=2, pady=(2, 4))
-            # Try a silent sign-in from cached token so returning users
-            # don't re-authenticate every launch.
-            if self._graph_session is None:
+            # silent sign-in from cached token so returning users don't re-auth —
+            # but only on a real selection, never during startup construction.
+            if not initial and self._graph_session is None:
                 self._mail_graph_try_silent()
 
     def _mail_graph_try_silent(self) -> None:
@@ -3147,6 +3270,20 @@ class App:
         self.root.after(100, self._poll_queue)
 
     def _handle_msg(self, kind: str, payload: object) -> None:
+        # Central usage telemetry — fire for any registered completion message
+        # before the feature-specific handling, so a handler that raises can't
+        # swallow the event. Best-effort; never affects the UI.
+        _spec = _USAGE_EVENTS.get(kind)
+        if _spec is not None:
+            _action, _count_key = _spec
+            _count = 0
+            if _count_key and isinstance(payload, dict):
+                try:
+                    _count = int(payload.get(_count_key) or 0)
+                except (TypeError, ValueError):
+                    _count = 0
+            self._track(action=_action, count=_count)
+
         if kind == MSG_LOG:
             self._log(str(payload))
         elif kind == MSG_PROGRESS:
@@ -3937,12 +4074,16 @@ class App:
             if user:
                 self._signed_in_user = user
                 self._refresh_user_label()
+                self._track(action="login", notes="resumed")
                 return True
             # Stale token — drop it and prompt fresh sign-in.
             auth.clear_token()
 
         # 2. Show modal sign-in dialog.
-        return self._show_login_dialog()
+        ok = self._show_login_dialog()
+        if ok:
+            self._track(action="login", notes="interactive")
+        return ok
 
     def _show_login_dialog(self) -> bool:
         dlg = tk.Toplevel(self.root)
