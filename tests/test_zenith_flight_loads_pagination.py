@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 import pytest
+import requests
 
 from src import zenith_client
 from src.zenith_client import (
@@ -248,6 +249,119 @@ def test_empty_first_page_stops_immediately():
         page_size=2, chunk_days=1, inter_call_delay_s=0,
     )
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Read-timeout resilience: a slow server splits the range, a dead network aborts
+# ---------------------------------------------------------------------------
+
+
+def test_read_timeout_splits_chunk_instead_of_aborting(monkeypatch):
+    """A read timeout on a multi-day chunk must trigger the SAME auto-split
+    recovery as an HTTP 5xx — not abort the whole run. Reproduces the
+    production "Read timed out" failure that previously killed the pull
+    mid-range, and proves every date is still recovered via the split.
+    """
+    from datetime import datetime, timedelta
+
+    # Don't actually sleep through the retry backoff during the test.
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+
+    full_range = ("01/06/2026", "10/06/2026")
+
+    class _TimeoutThenServe:
+        def __init__(self) -> None:
+            self.headers: dict = {}
+            self.calls: list[tuple[str, str, int]] = []
+
+        def post(self, url, data=None, timeout=None, allow_redirects=True):
+            page = int(re.search(r"Nav=(\d+)", url).group(1))
+            cfrom, cto = data["date_depart_vol"], data["date_fin_vol"]
+            self.calls.append((cfrom, cto, page))
+            if (cfrom, cto) == full_range:
+                # Accepted, but the server never answers within the read window.
+                raise requests.exceptions.ReadTimeout(
+                    "HTTPSConnectionPool(host='asia.ttinteractive.com', "
+                    "port=443): Read timed out."
+                )
+            # Sub-ranges after the split serve one flight per day, then exhaust.
+            if page != 1:
+                return _FakeResp(_page_html([]), url)
+            d_from = datetime.strptime(cfrom, "%d/%m/%Y").date()
+            d_to = datetime.strptime(cto, "%d/%m/%Y").date()
+            specs, cur = [], d_from
+            while cur <= d_to:
+                ds = cur.strftime("%d/%m/%Y")
+                specs.append((f"BS3{cur.day:02d}", ds, [("DAC-DXB", "3/72 96%")]))
+                cur += timedelta(days=1)
+            return _FakeResp(_page_html(specs), url)
+
+    class _Sess:
+        def __init__(self) -> None:
+            self.session = _TimeoutThenServe()
+
+    sess = _Sess()
+    rows = fetch_flight_loads(
+        sess, full_range[0], full_range[1],
+        page_size=2, chunk_days=10, inter_call_delay_s=0,
+    )
+
+    dates = {r.flight_date for r in rows}
+    expected, cur = set(), datetime.strptime(full_range[0], "%d/%m/%Y").date()
+    end = datetime.strptime(full_range[1], "%d/%m/%Y").date()
+    while cur <= end:
+        expected.add(cur.strftime("%d/%m/%Y"))
+        cur += timedelta(days=1)
+    assert expected <= dates, f"missing after split: {sorted(expected - dates)}"
+    # The original chunk timed out and was re-fetched as smaller sub-ranges.
+    sub_ranges = {(c, t) for (c, t, _p) in sess.session.calls}
+    assert any(r != full_range for r in sub_ranges), "expected a split re-fetch"
+
+
+def test_post_page_read_timeout_is_splittable(monkeypatch):
+    """Core change: a persistent read timeout raises the SPLITTABLE
+    _PageServerError, not a fatal ZenithError.
+    """
+    from src.zenith_client import _PageServerError, _post_flight_load_page
+
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+
+    class _AlwaysReadTimeout:
+        headers: dict = {}
+
+        def post(self, *_a, **_k):
+            raise requests.exceptions.ReadTimeout("Read timed out.")
+
+    sess = zenith_client.ZenithSession(session=_AlwaysReadTimeout())
+    with pytest.raises(_PageServerError):
+        _post_flight_load_page(
+            sess, "01/06/2026", "10/06/2026", 1, 100,
+            timeout_s=1.0, chunk_label="01/06/2026 → 10/06/2026",
+        )
+
+
+def test_post_page_connection_error_aborts(monkeypatch):
+    """A genuine connection failure (dead network/route) stays fatal — it
+    must NOT masquerade as a splittable error, since a smaller date range
+    cannot fix a dead network.
+    """
+    from src.zenith_client import _PageServerError, _post_flight_load_page
+
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+
+    class _AlwaysConnError:
+        headers: dict = {}
+
+        def post(self, *_a, **_k):
+            raise requests.exceptions.ConnectionError("Connection refused")
+
+    sess = zenith_client.ZenithSession(session=_AlwaysConnError())
+    with pytest.raises(zenith_client.ZenithError) as excinfo:
+        _post_flight_load_page(
+            sess, "01/06/2026", "10/06/2026", 1, 100,
+            timeout_s=1.0, chunk_label="01/06/2026 → 10/06/2026",
+        )
+    assert not isinstance(excinfo.value, _PageServerError)
 
 
 # ---------------------------------------------------------------------------

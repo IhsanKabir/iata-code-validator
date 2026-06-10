@@ -1,4 +1,4 @@
-"""HTTP client for Zenith TT Interactive (asia.ttinteractive.com).
+"""HTTP client for Zenith TT Interactive (usba.ttinteractive.com).
 
 Bulk extracts customer records (name, email, phone, address, etc.) given
 a list of Customer IDs. Read-only — never POSTs to update/create.
@@ -27,6 +27,7 @@ delay × N workers = effective rate. Tests at N=1 first, then dial up.
 from __future__ import annotations
 
 import logging
+import random
 import re
 import threading
 import time
@@ -43,7 +44,12 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://asia.ttinteractive.com"
+# Zenith serves each carrier from its OWN tenant subdomain — US-Bangla's is
+# `usba.ttinteractive.com` (it matches the company code). Login ONLY completes
+# on the tenant host: posting credentials to a different host (e.g. the old
+# `asia.` regional gateway) just bounces back to /otds/index.asp, which the
+# UI shows as "Login rejected by Zenith — landed at …action=TESTLOGIN".
+BASE_URL = "https://usba.ttinteractive.com"
 LOGIN_URL = f"{BASE_URL}/otds/index.asp?action=TESTLOGIN"
 LANDING_URL = f"{BASE_URL}/NewUI/aerien/f_index.asp"
 INIT_CONTEXT_URL = (
@@ -59,6 +65,16 @@ FLIGHT_LOAD_URL = f"{BASE_URL}/newui/aerien/commercial/Sale_ListeVols_NewStock.a
 # chunk the user's date range to keep each search under that cap.
 FLIGHT_LOAD_MAX_PAGES = 10
 FLIGHT_LOAD_DEFAULT_PAGE_SIZE = 100
+
+# Split the flight-load timeout into a (connect, read) tuple. A short connect
+# timeout fast-fails a dead network/route; the read timeout stays generous
+# because this legacy report is generated slowly server-side (the old flat
+# 60s conflated both, so a slow report and a dead network looked identical).
+FLIGHT_LOAD_CONNECT_TIMEOUT_S = 10.0
+# Capped backoff schedule (seconds) between page retries, indexed by
+# (attempt - 1) and clamped to the last entry. Jitter is applied on top so
+# retries don't resynchronize (AWS "equal jitter").
+_BACKOFF_SCHEDULE_S = (4.0, 10.0)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -919,12 +935,15 @@ def _post_flight_load_page(
 ):
     """POST one Nav={page} request with retry/backoff. Returns the response.
 
-    Retries transient failures (network drops, and HTTP 500/502/504 —
-    Zenith intermittently 500s on deeper Nav pages of large chunks). On:
+    Uses a (connect, read) timeout tuple so a dead network fast-fails while
+    the slow report still gets a generous read window. Retries transient
+    failures with capped backoff + jitter. On:
       - session loss (401/403/login redirect) → SessionExpiredError
       - rate limit (429/503) → returns None (caller retries the same page)
-      - persistent 5xx after 3 tries → _PageServerError (caller splits)
-      - dead network after 3 tries → ZenithError (aborts; environmental)
+      - persistent 5xx OR read timeout after 3 tries → _PageServerError
+        (caller splits the range — both mean "too heavy to serve in time")
+      - dead network / connect failure after 3 tries → ZenithError
+        (aborts; environmental — a smaller range won't help)
     """
     url = f"{FLIGHT_LOAD_URL}?Nav={page}"
     data = {
@@ -943,13 +962,43 @@ def _post_flight_load_page(
         "ID_ETATVOL": "",
     }
     last_exc: Exception | None = None
-    for attempt in range(1, 4):  # 3 attempts: 0s, 4s, 10s backoff
-        backoff = 4 if attempt == 1 else 10
+    for attempt in range(1, 4):  # 3 attempts; capped backoff + jitter between
+        # Capped backoff with equal jitter (AWS Builders' Library): keep half
+        # the scheduled wait, randomize the other half, so retries that bunch
+        # up don't all fire again at the same instant.
+        base = _BACKOFF_SCHEDULE_S[min(attempt - 1, len(_BACKOFF_SCHEDULE_S) - 1)]
+        backoff = base / 2.0 + random.uniform(0.0, base / 2.0)
         try:
             resp = session.session.post(
-                url, data=data, timeout=timeout_s, allow_redirects=True,
+                url, data=data,
+                timeout=(FLIGHT_LOAD_CONNECT_TIMEOUT_S, timeout_s),
+                allow_redirects=True,
             )
+        except requests.exceptions.ReadTimeout as exc:
+            # The server accepted the request but didn't answer within the
+            # read window. For this read-only report POST that's the SAME
+            # signal as an HTTP 5xx: the date range is too heavy to serve in
+            # time. So after 3 tries raise a SPLITTABLE error — a smaller
+            # range needs less server work and comes back in time — rather
+            # than aborting the run. Re-issuing the identical search is safe
+            # because the POST has no side effects (it only runs a query).
+            last_exc = exc
+            if attempt == 3:
+                raise _PageServerError(
+                    f"Read timeout on chunk {chunk_label} page {page} after "
+                    f"3 attempts: {exc}"
+                ) from exc
+            log.warning(
+                "Flight-loads %s page %d attempt %d/3 read timeout (%s) — "
+                "will split if it persists; retrying in %.1fs",
+                chunk_label, page, attempt, exc, backoff,
+            )
+            time.sleep(backoff)
+            continue
         except requests.RequestException as exc:
+            # Connect timeout, DNS failure, connection reset — the request
+            # most likely never reached the server, and a smaller range
+            # won't help. Environmental, so abort after 3 tries.
             last_exc = exc
             if attempt == 3:
                 raise ZenithError(
@@ -958,7 +1007,7 @@ def _post_flight_load_page(
                 ) from exc
             log.warning(
                 "Flight-loads %s page %d attempt %d/3 network error (%s) — "
-                "retrying in %ds", chunk_label, page, attempt, exc, backoff,
+                "retrying in %.1fs", chunk_label, page, attempt, exc, backoff,
             )
             time.sleep(backoff)
             continue
@@ -983,7 +1032,7 @@ def _post_flight_load_page(
                     f"page {page} after 3 attempts"
                 )
             log.warning(
-                "Zenith %d on chunk %s page %d attempt %d/3 — retrying in %ds",
+                "Zenith %d on chunk %s page %d attempt %d/3 — retrying in %.1fs",
                 resp.status_code, chunk_label, page, attempt, backoff,
             )
             time.sleep(backoff)
@@ -1145,7 +1194,7 @@ def fetch_flight_loads(
     inter_call_delay_s: float = 1.0,
     progress_cb: Callable[[str, int, int, int], None] | None = None,
     stop_event: threading.Event | None = None,
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
 ) -> list[FlightLoadRow]:
     """Pull all flight-load rows in [date_from, date_to] (DD/MM/YYYY).
 
