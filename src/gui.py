@@ -151,6 +151,28 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_ZENITH_BULK_DONE: ("zenith_pnr_bulk", None),
     MSG_OEP_DONE: ("oep_movement", None),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
+    MSG_UPDATE_FOUND: ("update_available", None),
+    MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
+}
+
+# Failure events — tracked the same way so the Usage view shows attempts that
+# errored, not only successes. Payload is usually the error string; we attach a
+# short, capped note for diagnostics (never record contents). Adding a new
+# feature's error message here is the only step to track its failures.
+_USAGE_ERRORS: "dict[str, str]" = {
+    MSG_ERROR: "iata_error",
+    MSG_BD_ERROR: "bd_error",
+    MSG_OEP_ERROR: "oep_error",
+    MSG_ZENITH_ERROR: "zenith_customer_error",
+    MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
+    MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
+    MSG_ZENITH_PAX_ERROR: "zenith_passenger_error",
+    MSG_ZENITH_FH_ERROR: "zenith_history_analyze_error",
+    MSG_ZENITH_DL_ERROR: "zenith_history_download_error",
+    MSG_ZENITH_PNR_ERROR: "zenith_pnr_enrich_error",
+    MSG_ZENITH_BULK_ERROR: "zenith_pnr_bulk_error",
+    MSG_MAIL_ERROR: "mailer_error",
+    MSG_UPDATE_ERROR: "update_error",
 }
 
 
@@ -3283,6 +3305,10 @@ class App:
                 except (TypeError, ValueError):
                     _count = 0
             self._track(action=_action, count=_count)
+        _err_action = _USAGE_ERRORS.get(kind)
+        if _err_action is not None:
+            _note = str(payload)[:120] if payload else None
+            self._track(action=_err_action, notes=_note)
 
         if kind == MSG_LOG:
             self._log(str(payload))
