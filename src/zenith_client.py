@@ -87,6 +87,14 @@ STATUS_NOT_FOUND = "NOT_FOUND"
 STATUS_ERROR = "ERROR"
 
 
+def _backoff_with_jitter(attempt: int, *, base_s: float, cap_s: float) -> float:
+    """Capped exponential backoff (seconds) with equal jitter for retry
+    `attempt` (1-based): keep half the wait, randomize the other half so
+    concurrent workers that fail together don't all retry in lockstep."""
+    raw = min(cap_s, base_s * (2 ** (max(1, attempt) - 1)))
+    return raw / 2.0 + random.uniform(0.0, raw / 2.0)
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -352,44 +360,67 @@ class ZenithSession:
         return cls(session=sess, state_values=state_values, company_code=company_code)
 
     def fetch_customer(
-        self, customer_id: str, *, timeout_s: float = 45.0,
+        self, customer_id: str, *, timeout_s: float = 45.0, max_attempts: int = 4,
     ) -> CustomerRecord:
-        """Fetch and parse one customer record.
+        """Fetch and parse one customer record, retrying transient failures.
 
-        Raises CustomerNotFoundError, SessionExpiredError, RateLimitedError,
-        or ZenithError on failures.
+        Zenith intermittently returns 502/503/504 (gateway timeout / overload)
+        on bulk runs; those — and network blips — are retried with capped
+        backoff + jitter instead of failing the ID on the first hiccup.
+        Session loss (401/403 or a login redirect) is NOT retried; it needs a
+        fresh login. Raises CustomerNotFoundError, SessionExpiredError,
+        RateLimitedError, or ZenithError once retries are exhausted.
         """
         params = {"IdCustomer": str(customer_id).strip()}
-        try:
-            resp = self.session.get(
-                CUSTOMER_LOOKUP_URL,
-                params=params,
-                allow_redirects=True,
-                timeout=timeout_s,
-            )
-        except requests.RequestException as exc:
-            raise ZenithError(f"Network error fetching {customer_id}: {exc}") from exc
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            is_last = attempt >= attempts
+            try:
+                resp = self.session.get(
+                    CUSTOMER_LOOKUP_URL,
+                    params=params,
+                    allow_redirects=True,
+                    timeout=timeout_s,
+                )
+            except requests.RequestException as exc:
+                if is_last:
+                    raise ZenithError(
+                        f"Network error fetching {customer_id} after "
+                        f"{attempts} attempts: {exc}"
+                    ) from exc
+                time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+                continue
 
-        if resp.status_code in (401, 403):
-            raise SessionExpiredError(
-                f"Zenith returned {resp.status_code} for ID {customer_id} — "
-                "session expired or never authenticated."
-            )
-        if resp.status_code in (429, 503):
-            raise RateLimitedError(
-                f"Zenith returned {resp.status_code} for ID {customer_id} — "
-                "back off and retry."
-            )
-        if resp.status_code >= 500:
-            raise ZenithError(
-                f"Zenith returned {resp.status_code} for ID {customer_id}."
-            )
-        # 200 means we got the customer page (or a not-found surrogate).
-        if "/otds/" in resp.url:
-            raise SessionExpiredError(
-                f"Zenith redirected ID {customer_id} back to login — session lost."
-            )
-        return parse_customer_html(resp.text, str(customer_id))
+            # Session loss — never retry; the caller must re-login.
+            if resp.status_code in (401, 403) or "/otds/" in resp.url:
+                raise SessionExpiredError(
+                    f"Zenith returned {resp.status_code} for ID {customer_id} — "
+                    "session expired or never authenticated."
+                )
+            # Rate limited / temporarily unavailable — back off (longer) + retry.
+            if resp.status_code in (429, 503):
+                if is_last:
+                    raise RateLimitedError(
+                        f"Zenith returned {resp.status_code} for ID "
+                        f"{customer_id} after {attempts} attempts — back off."
+                    )
+                time.sleep(_backoff_with_jitter(attempt, base_s=4.0, cap_s=12.0))
+                continue
+            # Transient gateway/server errors — the 502/503/504 (and 500) seen
+            # on bulk runs. Retry; only fail the ID if it sticks.
+            if resp.status_code >= 500:
+                if is_last:
+                    raise ZenithError(
+                        f"Zenith returned {resp.status_code} for ID "
+                        f"{customer_id} after {attempts} attempts."
+                    )
+                time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+                continue
+            # 2xx/3xx (not a login redirect) — parse it. A not-found page
+            # raises CustomerNotFoundError from here and is NOT retried.
+            return parse_customer_html(resp.text, str(customer_id))
+        # The loop always returns or raises on the final attempt; guard anyway.
+        raise ZenithError(f"Exhausted retries fetching {customer_id}.")
 
 
 # ---------------------------------------------------------------------------
