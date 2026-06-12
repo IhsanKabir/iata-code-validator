@@ -1,4 +1,4 @@
-patchright==1.59.1
+﻿patchright==1.59.1
 openpyxl==3.1.5
 faster-whisper==1.2.1
 requests==2.33.1
@@ -14,7 +14,7 @@ pyinstaller==6.20.0
 duckdb==1.5.2
 pandas==3.0.2
 pyarrow==24.0.0
-# Private shared analytics library — powers the Zenith > Reports sub-tab
+# Private shared analytics library â€” powers the Zenith > Reports sub-tab
 # (download list + the Instant Reports / mail-list windows). Built from the
 # analytics repo (`python scripts/build_wheel.py`) and vendored here.
-./wheels/usba_reporting-0.2.1-py3-none-any.whl
+./wheels/usba_reporting-0.2.2-py3-none-any.whl
