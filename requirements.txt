@@ -12,4 +12,4 @@ pyinstaller==6.20.0
 # Private shared analytics library — powers the Zenith > Reports sub-tab.
 # Built from the analytics repo (`python scripts/build_wheel.py`) and vendored
 # here so the build is self-contained. Lean, stdlib-only core (no duckdb/pandas).
-./wheels/usba_reporting-0.1.5-py3-none-any.whl
+./wheels/usba_reporting-0.1.9-py3-none-any.whl
