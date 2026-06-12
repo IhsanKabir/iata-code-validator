@@ -183,11 +183,16 @@ class OutlookSession:
             mail.BodyFormat = _OL_FORMAT_PLAIN
             acc = self._account_by_address(from_account)
             if acc is not None:
-                # Set both the send account and the From display so the
-                # message leaves as the chosen identity.
+                # Send AS this account via SendUsingAccount ONLY. We must NOT
+                # set SentOnBehalfOfName to the account's own address: that
+                # triggers Outlook/Exchange "send on behalf of" delegate
+                # semantics, which stall the message in the Outbox — the app
+                # reports SENT, but Outlook never transmits or files it —
+                # when the account has no delegate rights to itself.
+                # SendUsingAccount alone sends as the chosen identity, exactly
+                # like a normal manual compose (which delivers fine).
                 try:
                     mail.SendUsingAccount = acc
-                    mail.SentOnBehalfOfName = from_account
                 except Exception:  # noqa: BLE001 — non-fatal; falls back to default
                     pass
             mail.To = email.to

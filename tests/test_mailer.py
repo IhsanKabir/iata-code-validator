@@ -431,6 +431,10 @@ def test_outlook_send_pins_sent_items_to_sending_account(tmp_path):
     # (olFolderSentMail), not left to fall into the default account's.
     assert mail.SaveSentMessageFolder is not None
     assert mail.SaveSentMessageFolder.folder_id == _OL_FOLDER_SENT
+    # Send AS the account (SendUsingAccount), and NEVER "send on behalf of"
+    # its own address — that delegate flag stalls the message in the Outbox.
+    assert getattr(mail, "SendUsingAccount", None) is not None
+    assert getattr(mail, "SentOnBehalfOfName", None) is None
 
 
 def test_outlook_send_unmatched_account_still_sends(tmp_path):
