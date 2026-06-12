@@ -78,6 +78,11 @@ for pkg in [
     # PyInstaller misses those by default. `collect_all` picks up the
     # whole package so `set_theme()` finds its `.tcl` script at runtime.
     "sv_ttk",
+    # Instant Reports engine: duckdb/pyarrow/pandas ship native .pyd/.dll files
+    # and lazy submodules PyInstaller's static scan misses — collect them whole.
+    "duckdb",
+    "pyarrow",
+    "pandas",
 ]:
     pkg_datas, pkg_bins, pkg_hi = collect_all(pkg)
     datas += pkg_datas
