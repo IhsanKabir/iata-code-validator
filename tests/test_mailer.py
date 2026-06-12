@@ -331,3 +331,116 @@ def test_graph_message_json_omits_empty_cc_bcc(tmp_path):
     assert "ccRecipients" not in msg
     assert "bccRecipients" not in msg
     assert "attachments" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Outlook desktop: the sent copy is pinned to the SENDING account's Sent Items
+# (regression for "shows SENT but not in Sent Items"). COM is faked here.
+# ---------------------------------------------------------------------------
+
+from src.mailer_client import OutlookSession, _OL_FOLDER_SENT
+
+
+class _FakeFolder:
+    def __init__(self, folder_id):
+        self.folder_id = folder_id
+
+
+class _FakeStore:
+    def GetDefaultFolder(self, folder_id):
+        return _FakeFolder(folder_id)
+
+
+class _FakeAccount:
+    def __init__(self, smtp):
+        self.SmtpAddress = smtp
+        self.DeliveryStore = _FakeStore()
+
+
+class _FakeAccounts:
+    def __init__(self, accs):
+        self._a = accs
+
+    @property
+    def Count(self):
+        return len(self._a)
+
+    def Item(self, i):
+        return self._a[i - 1]
+
+
+class _FakeStores:
+    Count = 0
+
+    def Item(self, i):  # pragma: no cover - never reached (Count == 0)
+        raise IndexError
+
+
+class _FakeNS:
+    def __init__(self, accs):
+        self.Accounts = _FakeAccounts(accs)
+        self.Stores = _FakeStores()
+
+
+class _FakeMail:
+    def __init__(self):
+        self.Attachments = type("A", (), {"Add": lambda self, p: None})()
+        self.Recipients = type("R", (), {"ResolveAll": lambda self: None})()
+        self.sent = False
+        self.SaveSentMessageFolder = None
+
+    def Send(self):
+        self.sent = True
+
+
+class _FakeApp:
+    def __init__(self, accs):
+        self._accs = accs
+        self.last_mail = None
+
+    def CreateItem(self, _kind):
+        self.last_mail = _FakeMail()
+        return self.last_mail
+
+    def GetNamespace(self, _name):
+        return _FakeNS(self._accs)
+
+
+def _outlook_with(accs):
+    ol = OutlookSession.__new__(OutlookSession)  # bypass COM Dispatch
+    ol._app = _FakeApp(accs)
+    return ol
+
+
+def test_outlook_send_pins_sent_items_to_sending_account(tmp_path):
+    f = tmp_path / "rep.xlsx"
+    f.write_bytes(b"x")
+    ol = _outlook_with([
+        _FakeAccount("other@usbair.com"),          # default account (index 1)
+        _FakeAccount("ihsan.kabir@usbair.com"),     # the chosen sender
+    ])
+    outcome = ol.create(
+        OutgoingEmail(to="r@x.com", subject="S", body="B",
+                      attachments=(f,), cc="", bcc=""),
+        send=True, from_account="ihsan.kabir@usbair.com",
+    )
+    assert outcome.status == "SENT"
+    mail = ol._app.last_mail
+    assert mail.sent is True
+    # The sent copy is pinned to the sending account's Sent Items
+    # (olFolderSentMail), not left to fall into the default account's.
+    assert mail.SaveSentMessageFolder is not None
+    assert mail.SaveSentMessageFolder.folder_id == _OL_FOLDER_SENT
+
+
+def test_outlook_send_unmatched_account_still_sends(tmp_path):
+    ol = _outlook_with([_FakeAccount("other@usbair.com")])
+    outcome = ol.create(
+        OutgoingEmail(to="r@x.com", subject="S", body="B",
+                      attachments=(), cc="", bcc=""),
+        send=True, from_account="nobody@usbair.com",
+    )
+    assert outcome.status == "SENT"
+    assert ol._app.last_mail.sent is True
+    # No matching account/store → nothing to pin, but the send still happens.
+    assert ol._app.last_mail.SaveSentMessageFolder is None

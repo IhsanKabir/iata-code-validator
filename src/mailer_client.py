@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 _OL_MAIL_ITEM = 0          # olMailItem
 _OL_FORMAT_PLAIN = 1       # olFormatPlain
 _OL_FOLDER_DRAFTS = 16     # olFolderDrafts
+_OL_FOLDER_SENT = 5        # olFolderSentMail
 
 
 class MailerError(Exception):
@@ -133,14 +134,15 @@ class OutlookSession:
             pass
         return None
 
-    def _drafts_folder_for(self, address: str):
-        """Return the Drafts folder of the matching account's own store.
+    def _store_folder_for(self, address: str, folder_id: int):
+        """Return `folder_id`'s default folder in the matching account's OWN
+        delivery store.
 
-        Outlook's mail.Save() always drops into the DEFAULT account's
-        Drafts, ignoring SendUsingAccount — so a draft meant to go out
-        from account B silently lands in account A's Drafts when A is the
-        default. We locate the chosen account's delivery store and return
-        its Drafts folder so the caller can Move() the saved item there.
+        Outlook files Save()/Send() copies in the DEFAULT account's store,
+        ignoring SendUsingAccount — so a message meant to go out from account
+        B silently lands in account A's Drafts/Sent Items when A is the
+        default. We locate the chosen account's delivery store and return the
+        requested folder (Drafts, Sent Items, …) so the caller can target it.
         """
         if not address or self._app is None:
             return None
@@ -150,15 +152,19 @@ class OutlookSession:
             # Account.DeliveryStore → that mailbox's own folder tree.
             store = getattr(acc, "DeliveryStore", None) if acc else None
             if store is not None:
-                return store.GetDefaultFolder(_OL_FOLDER_DRAFTS)
+                return store.GetDefaultFolder(folder_id)
             # Fallback: scan stores for one whose display name matches.
             for i in range(1, ns.Stores.Count + 1):
                 st = ns.Stores.Item(i)
                 if address.lower() in str(st.DisplayName or "").lower():
-                    return st.GetDefaultFolder(_OL_FOLDER_DRAFTS)
+                    return st.GetDefaultFolder(folder_id)
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    def _drafts_folder_for(self, address: str):
+        """Drafts folder of the chosen account's own store (see _store_folder_for)."""
+        return self._store_folder_for(address, _OL_FOLDER_DRAFTS)
 
     def create(
         self, email: OutgoingEmail, *, send: bool, from_account: str = "",
@@ -209,6 +215,25 @@ class OutlookSession:
                 pass
 
             if send:
+                # Outlook files the Sent Items copy in the DEFAULT account's
+                # store when sending via SendUsingAccount, so the sent copy can
+                # go missing from the chosen account's Sent Items (the same
+                # quirk handled for Drafts above). Pin the save folder to the
+                # sending account's own Sent Items so the copy lands where the
+                # user expects to see it.
+                if from_account:
+                    sent_folder = self._store_folder_for(
+                        from_account, _OL_FOLDER_SENT,
+                    )
+                    if sent_folder is not None:
+                        try:
+                            mail.SaveSentMessageFolder = sent_folder
+                        except Exception:  # noqa: BLE001 — non-fatal
+                            log.warning(
+                                "Couldn't pin Sent Items folder for %s; "
+                                "Outlook will use the default account's.",
+                                from_account,
+                            )
                 mail.Send()
                 return SendOutcome(to=email.to, status="SENT")
             mail.Save()  # lands in the DEFAULT account's Drafts
