@@ -894,15 +894,17 @@ class App:
     def _build_mailer_tab(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
 
-        intro = self._section(parent, "Bulk Mailer  ·  via Outlook")
+        intro = self._section(parent, "Bulk Mailer")
         ttk.Label(
             intro, style="Hint.TLabel", justify="left", wraplength=900,
             text=(
                 "Send one personalised email per recipient from a mapping "
                 "Excel (Email · Name · File · optional CC · BCC). Files are "
-                "attached from a folder you pick. Uses your signed-in "
-                "Outlook desktop — no password needed. Default mode creates "
-                "DRAFTS you review before sending."
+                "attached from a folder you pick. Send via Microsoft 365 "
+                "sign-in (Graph — works without desktop Outlook), SMTP, or "
+                "Outlook desktop. Default mode creates DRAFTS you review first.\n"
+                "No mapping yet? Click 'Use latest report-pack mail list' below — "
+                "it loads the recipient list the Target Packs generate."
             ),
         ).pack(anchor="w", padx=4, pady=(0, 4))
 
@@ -918,6 +920,14 @@ class App:
             io_body, 1, "Attachments folder:", attach_entry,
             suffix=ttk.Button(io_body, text="Browse...", command=self._mail_pick_attach),
         )
+        # one-click mail-list helpers: load the pack-generated list (Email|Name|File|
+        # CC|BCC) + its attachments folder, or open the loaded mapping to edit by hand.
+        helper = ttk.Frame(io_body)
+        helper.grid(row=2, column=1, sticky="w", padx=2, pady=(4, 0))
+        ttk.Button(helper, text="Use latest report-pack mail list",
+                   command=self._mail_use_pack_list).pack(side="left")
+        ttk.Button(helper, text="Edit in Excel",
+                   command=self._mail_edit_mapping).pack(side="left", padx=(8, 0))
 
         # ----- Message -----
         msg_body = self._section(parent, "Message")
@@ -1292,6 +1302,50 @@ class App:
         d = filedialog.askdirectory(title="Pick the attachments folder")
         if d:
             self.mail_attach_dir.set(d)
+
+    def _pack_manifest_candidates(self):
+        """Folders where a report-pack Email_Manifest.xlsx may have been written
+        (the Sales-Person Target Packs generate one in Email|Name|File|CC|BCC form —
+        exactly this mailer's mapping format)."""
+        import os
+        from pathlib import Path
+        local = os.environ.get("LOCALAPPDATA", str(Path.home()))
+        return [
+            Path.home() / "Downloads" / "Sales Person Packs" / "Email_Manifest.xlsx",
+            Path(local) / "USBA_InstantReports" / "work" / "logs"
+            / "Sales Person Packs" / "Email_Manifest.xlsx",
+        ]
+
+    def _mail_use_pack_list(self) -> None:
+        """One click: load the newest report-pack mail list and point the
+        attachments folder at its packs — ready to send the salesperson packs."""
+        found = [p for p in self._pack_manifest_candidates() if p.is_file()]
+        if not found:
+            messagebox.showinfo(
+                "Mail list",
+                "No report-pack mail list found yet.\n\n"
+                "Build the Sales-Person Target Packs first (Reports > Build from "
+                "data, or the morning publish). They write Email_Manifest.xlsx next "
+                "to the per-person files, and it loads here automatically.")
+            return
+        newest = max(found, key=lambda p: p.stat().st_mtime)
+        self.mail_mapping_path.set(str(newest))
+        self.mail_attach_dir.set(str(newest.parent))
+        messagebox.showinfo(
+            "Mail list",
+            f"Loaded {newest.name}\nfrom {newest.parent}\n\n"
+            "Attachments folder set to the same place. Click 'Load + preview', then send.")
+
+    def _mail_edit_mapping(self) -> None:
+        """Open the currently-selected mapping Excel to edit recipients by hand."""
+        import os
+        from pathlib import Path
+        p = self.mail_mapping_path.get().strip()
+        if not p or not Path(p).is_file():
+            messagebox.showinfo("Mail list", "Pick or load a mapping Excel first, then Edit.")
+            return
+        if hasattr(os, "startfile"):
+            os.startfile(p)            # open the user's own mapping in Excel
 
     def _mail_preview(self) -> None:
         """Read the mapping, resolve files, fill the preview grid."""

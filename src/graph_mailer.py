@@ -29,13 +29,39 @@ from .mailer_client import MailerError, OutgoingEmail, SendOutcome, re_split_add
 log = logging.getLogger(__name__)
 
 
-# Well-known public client: "Microsoft Graph Command Line Tools" — the
-# same first-party app id Connect-MgGraph / the Graph CLI use. Unlike the
-# Azure CLI client (04b07795…, which is only preauthorized for ARM and
-# returns AADSTS65002 for Graph), this one IS preauthorized for delegated
-# Microsoft Graph scopes including Mail.Send / Mail.ReadWrite — so the
-# device-code flow works with no app registration.
-_PUBLIC_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+# Which first-party Microsoft public client we sign in AS (device-code flow,
+# no app registration). Tried in order until one is allowed by the tenant:
+#
+#   1. "Microsoft Office"  d3590ed6-52b3-4102-aeff-aad2292ab01c
+#      The Office desktop suite's own id. Tenants practically never require
+#      admin consent for it (blocking it would break Office), and it is
+#      preauthorized for the delegated mail scopes we need.
+#   2. "Microsoft Graph Command Line Tools"  14d82eec-204b-4c2f-b7e8-296a70dab67e
+#      The Graph CLI id. The usbair tenant returned "Need admin approval" for
+#      it (2026-06-12), so Office is now tried first.
+#
+# Override without a rebuild: put a client id (one line) in
+# %LOCALAPPDATA%/IATAChecker/graph_client_id.txt and it is used instead.
+_CLIENT_ID_CANDIDATES = [
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",   # Microsoft Office
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e",   # Microsoft Graph Command Line Tools
+]
+
+
+def _client_id() -> str:
+    """The client id to sign in with (file override first, else the default)."""
+    from . import config
+    override = config.APP_DIR / "graph_client_id.txt"
+    try:
+        if override.is_file():
+            value = override.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    except OSError:
+        pass
+    return _CLIENT_ID_CANDIDATES[0]
+
+
 _AUTHORITY = "https://login.microsoftonline.com/common"
 _SCOPES = ["Mail.Send", "Mail.ReadWrite"]
 _GRAPH = "https://graph.microsoft.com/v1.0"
@@ -95,7 +121,7 @@ class GraphSession:
         import msal
         cache = _load_cache()
         app = msal.PublicClientApplication(
-            _PUBLIC_CLIENT_ID, authority=_AUTHORITY, token_cache=cache,
+            _client_id(), authority=_AUTHORITY, token_cache=cache,
         )
         return app, cache
 
