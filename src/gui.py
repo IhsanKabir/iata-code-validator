@@ -4338,16 +4338,18 @@ class App:
         self.btn_check_updates.configure(state="disabled", text="Downloading…")
         self._update_worker = threading.Thread(
             target=self._update_download_worker,
-            args=(info.download_url,),
+            args=(info.download_url, info.sha256),
             daemon=True,
         )
         self._update_worker.start()
 
-    def _update_download_worker(self, url: str) -> None:
+    def _update_download_worker(self, url: str, expected_sha256: str = "") -> None:
         def progress(downloaded: int, total: int) -> None:
             self._post(MSG_UPDATE_PROGRESS, (downloaded, total))
         try:
-            staged = updater.download_update(url, on_progress=progress)
+            staged = updater.download_update(
+                url, on_progress=progress, expected_sha256=expected_sha256,
+            )
             self._post(MSG_UPDATE_DOWNLOADED, str(staged))
         except Exception as exc:  # noqa: BLE001
             log.exception("update download failed")

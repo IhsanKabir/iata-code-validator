@@ -115,17 +115,30 @@ jobs:
           $size = (Get-Item $exe).Length
           Write-Host "Built $exe — $([math]::Round($size / 1MB, 1)) MB"
 
+      - name: Write SHA-256 sidecar
+        shell: pwsh
+        run: |
+          $exe = "dist\IATACodeValidator.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # No trailing newline — consumed verbatim by the backend manifest.
+          [System.IO.File]::WriteAllText("$exe.sha256", $hash)
+          Write-Host "SHA-256: $hash"
+
       - name: Upload exe as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: IATACodeValidator-${{ github.ref_name }}
-          path: dist/IATACodeValidator.exe
+          path: |
+            dist/IATACodeValidator.exe
+            dist/IATACodeValidator.exe.sha256
           retention-days: 30
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/IATACodeValidator.exe
+          files: |
+            dist/IATACodeValidator.exe
+            dist/IATACodeValidator.exe.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

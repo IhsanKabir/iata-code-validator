@@ -21,10 +21,12 @@ the error from the result, not a traceback.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -52,6 +54,7 @@ class UpdateInfo:
     download_url: str
     notes: str
     is_newer: bool
+    sha256: str = ""  # from the backend manifest; verified before the swap
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,63 @@ def _is_newer(latest: str, current: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Primary channel — the app's own authenticated backend
+# ---------------------------------------------------------------------------
+# Corporate networks frequently block GitHub (api.github.com /
+# objects.githubusercontent.com) but DO allow the backend the app already
+# signs in to. So we check the backend FIRST and fall back to GitHub. The
+# backend returns {version, notes, download_url, sha256}; the download_url
+# points at the backend's own (reachable) download route, and the sha256 is
+# verified before the new exe is ever staged.
+
+
+def _check_backend_update(timeout: int = 10) -> UpdateInfo | None:
+    """Ask the app's authenticated backend for the latest release.
+
+    Returns None on ANY problem (not signed in, endpoint absent / 404,
+    network or proxy error, malformed JSON) so the caller silently falls
+    back to GitHub — behaviour is unchanged until the backend ships the
+    endpoint.
+    """
+    try:
+        from . import auth
+    except Exception:  # noqa: BLE001
+        return None
+    base = (getattr(auth, "API_BASE_URL", "") or "").rstrip("/")
+    try:
+        token = auth.get_token()
+    except Exception:  # noqa: BLE001
+        token = None
+    if not base or not token:
+        return None
+    req = urllib.request.Request(
+        f"{base}/api/v1/app/latest",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+            "X-User-Session": token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — any failure => fall back to GitHub
+        log.info("Backend update check unavailable (%s); trying GitHub", exc)
+        return None
+    version = str(data.get("version") or "").strip()
+    download_url = str(data.get("download_url") or "").strip()
+    if not version or not download_url:
+        return None
+    return UpdateInfo(
+        latest_version=version.lstrip("v"),
+        download_url=download_url,
+        notes=str(data.get("notes") or ""),
+        is_newer=_is_newer(version, __version__),
+        sha256=str(data.get("sha256") or "").strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 1 — check_for_update
 # ---------------------------------------------------------------------------
 
@@ -84,7 +144,15 @@ def check_for_update(timeout: int = 15) -> UpdateInfo | None:
     `is_newer` indicates whether the user should be offered an update.
     Even when not newer, we still return an UpdateInfo so the GUI can
     show "You're up to date."
+
+    Tries the app's authenticated backend FIRST (reachable where GitHub is
+    blocked), then falls back to GitHub Releases.
     """
+    backend = _check_backend_update(timeout=min(timeout, 10))
+    if backend is not None:
+        return backend
+
+    # FALLBACK: GitHub Releases — works for users who can reach GitHub.
     req = urllib.request.Request(
         GITHUB_API,
         headers={
@@ -142,26 +210,71 @@ def update_pending_path() -> Path:
 ProgressCallback = Callable[[int, int], None]
 
 
+def _ensure_free_space(folder: Path, needed_bytes: int) -> None:
+    """Raise OSError if `folder`'s volume can't hold the download + headroom."""
+    if needed_bytes <= 0:
+        return
+    try:
+        free = shutil.disk_usage(str(folder)).free
+    except OSError:
+        return  # can't determine — let the write attempt surface any real error
+    required = needed_bytes + 100 * 1024 * 1024  # staged exe + swap headroom
+    if free < required:
+        raise OSError(
+            f"Not enough disk space for the update: need ~{required // (1024 * 1024)} MB, "
+            f"only {free // (1024 * 1024)} MB free on {folder}."
+        )
+
+
+def _download_headers(url: str) -> dict[str, str]:
+    """Headers for the asset download.
+
+    Our own backend gates the download with the same session token the app
+    uses everywhere else, so attach X-User-Session when (and only when) the
+    URL points at the backend host. GitHub / presigned storage URLs get just
+    the User-Agent.
+    """
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        from . import auth
+        base = (getattr(auth, "API_BASE_URL", "") or "").rstrip("/")
+        if base and url.startswith(base):
+            token = auth.get_token()
+            if token:
+                headers["X-User-Session"] = token
+    except Exception:  # noqa: BLE001 — auth is optional; download still tries
+        pass
+    return headers
+
+
 def download_update(
     url: str,
     on_progress: ProgressCallback | None = None,
     timeout: int = 600,
+    expected_sha256: str = "",
 ) -> Path:
-    """Stream the .exe asset to the staging directory.
+    """Stream the .exe asset to the staging directory and verify it.
 
     `on_progress(downloaded_bytes, total_bytes)` is called every chunk —
     the GUI uses it to drive a progress bar. Total may be 0 if the
     server doesn't send a Content-Length.
+
+    When `expected_sha256` is supplied (from the backend manifest) the
+    downloaded bytes are hashed and compared before the file is staged; a
+    mismatch discards the download and raises, so a corrupt or tampered
+    binary can never reach the swap step.
     """
     target = update_pending_path()
     tmp = target.with_suffix(".part")
     if tmp.exists():
         tmp.unlink(missing_ok=True)
 
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, headers=_download_headers(url))
+    hasher = hashlib.sha256()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
+            _ensure_free_space(target.parent, total)
             downloaded = 0
             with tmp.open("wb") as f:
                 while True:
@@ -169,16 +282,28 @@ def download_update(
                     if not chunk:
                         break
                     f.write(chunk)
+                    hasher.update(chunk)
                     downloaded += len(chunk)
                     if on_progress is not None:
                         try:
                             on_progress(downloaded, total)
                         except Exception:  # noqa: BLE001 — never let UI crash the download
                             pass
-    except Exception as exc:
+    except Exception:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
         raise
+
+    # Integrity gate: never stage an exe that will replace the running one
+    # unless its hash matches the manifest.
+    if expected_sha256:
+        actual = hasher.hexdigest().lower()
+        if actual != expected_sha256.strip().lower():
+            tmp.unlink(missing_ok=True)
+            raise ValueError(
+                "Update integrity check failed (SHA-256 mismatch) — download "
+                "discarded; the running app was left untouched."
+            )
 
     # Atomic-ish rename — partial -> final.
     if target.exists():
