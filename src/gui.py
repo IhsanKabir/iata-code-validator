@@ -878,43 +878,54 @@ class App:
 
         iata_tab = ttk.Frame(notebook)
         bd_tab = ttk.Frame(notebook)
-        oep_tab = ttk.Frame(notebook)
         traffic_tab = ttk.Frame(notebook)
         zenith_tab = ttk.Frame(notebook)
         mailer_tab = ttk.Frame(notebook)
         # Tab text is a base name; `_refresh_tab_labels` appends running
         # state ("●") and cache counts so users see status at a glance.
+        # BD Overseas Movement (OEP) now lives as a sub-tab under Traffic
+        # Movement, alongside the air-traffic sources.
         self._tab_base_labels = {
             iata_tab: "IATA Code Validator",
             bd_tab: "BD Travel Agency Lookup",
-            oep_tab: "BD Overseas Movement",
-            traffic_tab: "Traffic",
+            traffic_tab: "Traffic Movement",
             zenith_tab: "Zenith",
             mailer_tab: "Bulk Mailer",
         }
         notebook.add(iata_tab, text=self._tab_base_labels[iata_tab])
         notebook.add(bd_tab, text=self._tab_base_labels[bd_tab])
-        notebook.add(oep_tab, text=self._tab_base_labels[oep_tab])
         notebook.add(traffic_tab, text=self._tab_base_labels[traffic_tab])
         notebook.add(zenith_tab, text=self._tab_base_labels[zenith_tab])
         notebook.add(mailer_tab, text=self._tab_base_labels[mailer_tab])
         self._tab_widgets = {
-            "iata": iata_tab, "bd": bd_tab, "oep": oep_tab, "traffic": traffic_tab,
+            "iata": iata_tab, "bd": bd_tab, "traffic": traffic_tab,
             "zenith": zenith_tab, "mailer": mailer_tab,
         }
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
-        self._build_oep_tab(oep_tab)
-        self._build_traffic_tab(traffic_tab)
+        self._build_traffic_tab(traffic_tab)  # builds Air Traffic + OEP sub-tabs
         self._build_zenith_tab(zenith_tab)
         self._build_mailer_tab(mailer_tab)
 
     # ==================================================================
-    # Traffic tab — air-traffic / passenger movement (multi-source)
+    # Traffic Movement tab — air traffic (multi-source) + BD overseas labour
     # ==================================================================
 
     def _build_traffic_tab(self, parent: ttk.Frame) -> None:
+        """Parent 'Traffic Movement' tab. Two sub-tabs, both movement data:
+        'Air Traffic' (multi-source air passenger/movement) and 'BD Overseas
+        Movement' (the OEP labour-clearance view), unified under one tab."""
+        inner_nb = ttk.Notebook(parent)
+        inner_nb.pack(fill="both", expand=True)
+        air_inner = ttk.Frame(inner_nb)
+        oep_inner = ttk.Frame(inner_nb)
+        inner_nb.add(air_inner, text="Air Traffic")
+        inner_nb.add(oep_inner, text="BD Overseas Movement")
+        self._build_air_traffic_subtab(air_inner)
+        self._build_oep_tab(oep_inner)
+
+    def _build_air_traffic_subtab(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
 
         self._section(

@@ -52,12 +52,19 @@ class TrafficSource(Protocol):
         ...
 
 
-# --- registered sources (ordered) -----------------------------------------
+# --- registered sources (ordered = dropdown order) ------------------------
 # Import singletons after the Protocol is defined to avoid a forward ref.
+# Clean reachable APIs first; India needs GitHub; BTS is file-based.
 from .malaysia_arrivals import SOURCE as _malaysia  # noqa: E402
+from .singapore_changi import SOURCE as _singapore  # noqa: E402
+from .qatar_hamad import SOURCE as _qatar  # noqa: E402
+from .india_dgca import SOURCE as _india  # noqa: E402
 from .bts_t100 import SOURCE as _bts  # noqa: E402
 
 SOURCES: "dict[str, TrafficSource]" = {
     _malaysia.id: _malaysia,
+    _singapore.id: _singapore,
+    _qatar.id: _qatar,
+    _india.id: _india,
     _bts.id: _bts,
 }

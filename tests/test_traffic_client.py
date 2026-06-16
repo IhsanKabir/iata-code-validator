@@ -66,7 +66,8 @@ def test_aggregate_by_period_sorted():
 # ---- registry / protocol contract ----
 
 def test_registry_contract():
-    assert {"malaysia_arrivals", "bts_t100"} <= set(SOURCES)
+    assert {"malaysia_arrivals", "singapore_changi", "qatar_hamad",
+            "india_dgca", "bts_t100"} <= set(SOURCES)
     for sid, s in SOURCES.items():
         for attr in ("id", "label", "granularity", "needs_credentials", "needs_file"):
             assert hasattr(s, attr), f"{sid} missing {attr}"
@@ -159,3 +160,65 @@ def test_bts_reads_csv(tmp_path):
                     "CARRIER": "BS", "PASSENGERS": "5000", "SEATS": "6000"})
     rows = bts.SOURCE.fetch({"csv_path": str(p)})
     assert any(r.origin == "DAC" and r.destination == "DXB" and r.value == 5000.0 for r in rows)
+
+
+# ---- Singapore Changi (data.gov.sg) ----
+
+from src.traffic_sources import singapore_changi as sg
+
+
+def test_singapore_parse():
+    rows = sg.parse_changi([
+        {"Year": "2015", "Month": "2015-01",
+         "Passenger_Total": "4,420,122", "Aircraft_Total": "28,780"},
+    ])
+    assert {r.metric for r in rows} == {"passengers", "movements"}
+    pax = next(r for r in rows if r.metric == "passengers")
+    assert pax.value == 4420122.0 and pax.airport == "SIN" and pax.period == "2015-01"
+    assert pax.country == "Singapore"
+
+
+# ---- Qatar Hamad (data.gov.qa) ----
+
+from src.traffic_sources import qatar_hamad as qa
+
+
+def test_qatar_parse_direction_and_period():
+    rows = qa.parse_hamad([
+        {"year": "2019", "month": "February", "type": "Arrivals", "total": 1429733},
+        {"year": "2019", "month": "May", "type": "Departures", "total": 1300000},
+    ])
+    arr = next(r for r in rows if r.direction == "arrival")
+    assert arr.period == "2019-02" and arr.airport == "DOH" and arr.value == 1429733.0
+    dep = next(r for r in rows if r.direction == "departure")
+    assert dep.period == "2019-05"
+
+
+# ---- India DGCA (Vonter mirror) ----
+
+from src.traffic_sources import india_dgca as inr
+
+_INDIA_CSV = (
+    "Year,Quarter,Country,PaxToIndia,PaxFromIndia,FreightToIndia,FreightFromIndia\n"
+    "15,1,AFGHANISTAN,37194,32721,96.72,676.42\n"
+    "20,2,BANGLADESH,100000,90000,1.0,2.0\n"
+)
+
+
+def test_india_parse_country_csv():
+    rows = inr.parse_country_csv(_INDIA_CSV)
+    # 2 countries x (to-India arrival + from-India departure) = 4 rows
+    assert len(rows) == 4
+    bd_arr = next(r for r in rows if r.country == "Bangladesh" and r.direction == "arrival")
+    assert bd_arr.period == "2020-Q2" and bd_arr.period_granularity == "quarter"
+    assert bd_arr.origin == "Bangladesh" and bd_arr.destination == "India"
+    assert bd_arr.value == 100000.0
+    af_dep = next(r for r in rows if r.country == "Afghanistan" and r.direction == "departure")
+    assert af_dep.period == "2015-Q1" and af_dep.origin == "India" and af_dep.value == 32721.0
+
+
+def test_india_route_aggregation():
+    rt = tc.aggregate_by_route(inr.parse_country_csv(_INDIA_CSV))
+    pairs = {(r.origin, r.destination): r.value for r in rt}
+    assert pairs[("Bangladesh", "India")] == 100000.0
+    assert pairs[("India", "Bangladesh")] == 90000.0
