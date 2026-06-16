@@ -36,11 +36,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import (
     __version__, auth, config, excel_io, graph_mailer, mailer_client, mailer_io,
-    oep_client, oep_presets, updater, zenith_client, zenith_history_analyzer,
-    zenith_history_downloader, zenith_history_parser, zenith_loads_index,
-    zenith_pnr_client,
+    oep_client, oep_presets, traffic_client, updater, zenith_client,
+    zenith_history_analyzer, zenith_history_downloader, zenith_history_parser,
+    zenith_loads_index, zenith_pnr_client,
 )
 from .mailer_log import MailerLog
+from .traffic_sources import SOURCES as TRAFFIC_SOURCES
 from .zenith_pnr_cache import ZenithPNRCache
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
@@ -83,6 +84,12 @@ MSG_OEP_LOG = "oep_log"
 MSG_OEP_DONE = "oep_done"         # payload: dict (see _oep_worker_run)
 MSG_OEP_ERROR = "oep_error"
 MSG_OEP_BUSY = "oep_busy"         # payload: str (status text)
+
+# Traffic tab worker → GUI message types
+MSG_TRAFFIC_LOG = "traffic_log"
+MSG_TRAFFIC_BUSY = "traffic_busy"   # payload: str (status text)
+MSG_TRAFFIC_DONE = "traffic_done"   # payload: dict (rows, view, source_label, dates)
+MSG_TRAFFIC_ERROR = "traffic_error"
 
 # Zenith worker → GUI message types
 MSG_ZENITH_LOG = "zenith_log"
@@ -150,6 +157,7 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_ZENITH_PNR_DONE: ("zenith_pnr_enrich", None),
     MSG_ZENITH_BULK_DONE: ("zenith_pnr_bulk", None),
     MSG_OEP_DONE: ("oep_movement", None),
+    MSG_TRAFFIC_DONE: ("traffic_movement", None),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
     MSG_UPDATE_FOUND: ("update_available", None),
     MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
@@ -163,6 +171,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
     MSG_ERROR: "iata_error",
     MSG_BD_ERROR: "bd_error",
     MSG_OEP_ERROR: "oep_error",
+    MSG_TRAFFIC_ERROR: "traffic_error",
     MSG_ZENITH_ERROR: "zenith_customer_error",
     MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
     MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
@@ -226,6 +235,16 @@ class App:
         self.oep_country_filter = tk.StringVar(value="")  # country option label
         self.oep_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
         self.oep_top_n = tk.StringVar(value="5")
+        # ----- Traffic tab state -----
+        _traffic_labels = [s.label for s in TRAFFIC_SOURCES.values()]
+        self.traffic_source = tk.StringVar(value=_traffic_labels[0] if _traffic_labels else "")
+        self.traffic_date_from = tk.StringVar(value="")
+        self.traffic_date_to = tk.StringVar(value="")
+        self.traffic_view = tk.StringVar(value="country")
+        self.traffic_csv_path = tk.StringVar(value="")
+        self.traffic_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self._traffic_worker = None
+        self._traffic_last_result = None
         self.oep_preset_name = tk.StringVar(value="")
 
         self._oep_worker: threading.Thread | None = None
@@ -860,6 +879,7 @@ class App:
         iata_tab = ttk.Frame(notebook)
         bd_tab = ttk.Frame(notebook)
         oep_tab = ttk.Frame(notebook)
+        traffic_tab = ttk.Frame(notebook)
         zenith_tab = ttk.Frame(notebook)
         mailer_tab = ttk.Frame(notebook)
         # Tab text is a base name; `_refresh_tab_labels` appends running
@@ -868,24 +888,300 @@ class App:
             iata_tab: "IATA Code Validator",
             bd_tab: "BD Travel Agency Lookup",
             oep_tab: "BD Overseas Movement",
+            traffic_tab: "Traffic",
             zenith_tab: "Zenith",
             mailer_tab: "Bulk Mailer",
         }
         notebook.add(iata_tab, text=self._tab_base_labels[iata_tab])
         notebook.add(bd_tab, text=self._tab_base_labels[bd_tab])
         notebook.add(oep_tab, text=self._tab_base_labels[oep_tab])
+        notebook.add(traffic_tab, text=self._tab_base_labels[traffic_tab])
         notebook.add(zenith_tab, text=self._tab_base_labels[zenith_tab])
         notebook.add(mailer_tab, text=self._tab_base_labels[mailer_tab])
         self._tab_widgets = {
-            "iata": iata_tab, "bd": bd_tab, "oep": oep_tab, "zenith": zenith_tab,
-            "mailer": mailer_tab,
+            "iata": iata_tab, "bd": bd_tab, "oep": oep_tab, "traffic": traffic_tab,
+            "zenith": zenith_tab, "mailer": mailer_tab,
         }
 
         self._build_iata_tab(iata_tab)
         self._build_bd_tab(bd_tab)
         self._build_oep_tab(oep_tab)
+        self._build_traffic_tab(traffic_tab)
         self._build_zenith_tab(zenith_tab)
         self._build_mailer_tab(mailer_tab)
+
+    # ==================================================================
+    # Traffic tab — air-traffic / passenger movement (multi-source)
+    # ==================================================================
+
+    def _build_traffic_tab(self, parent: ttk.Frame) -> None:
+        parent = self._make_scrollable(parent)
+
+        self._section(
+            parent,
+            "Air traffic & passenger movement  ·  multi-source",
+            help_text=(
+                "Pull passenger / movement data from open aviation sources into "
+                "one normalized table. Pick a source, optionally a date range, a "
+                "view, then Run. Export to Excel. Each source plugs in behind one "
+                "interface — more get added over time."
+            ),
+        )
+
+        body = self._section(parent, "Source & filters")
+        self._traffic_label_to_id = {s.label: s.id for s in TRAFFIC_SOURCES.values()}
+        self.traffic_source_combo = ttk.Combobox(
+            body, textvariable=self.traffic_source, state="readonly",
+            values=list(self._traffic_label_to_id.keys()), width=46,
+        )
+        self.traffic_source_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._traffic_on_source_change()
+        )
+        self._form_row(body, 0, "Source:", self.traffic_source_combo)
+
+        date_row = ttk.Frame(body)
+        ttk.Label(date_row, text="From:", width=6, anchor="w").pack(side="left")
+        ttk.Entry(date_row, textvariable=self.traffic_date_from, width=12).pack(
+            side="left", padx=(0, 12))
+        ttk.Label(date_row, text="To:", width=4, anchor="w").pack(side="left")
+        ttk.Entry(date_row, textvariable=self.traffic_date_to, width=12).pack(
+            side="left", padx=(0, 12))
+        ttk.Label(date_row, text="(YYYY-MM or YYYY-MM-DD — blank = all)",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(body, 1, "Date range:", date_row)
+
+        file_row = ttk.Frame(body)
+        self.traffic_file_entry = ttk.Entry(file_row, textvariable=self.traffic_csv_path)
+        self.traffic_file_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.btn_traffic_browse = ttk.Button(
+            file_row, text="Browse…", command=self._traffic_browse_csv, width=10)
+        self.btn_traffic_browse.pack(side="left")
+        self._form_row(body, 2, "Data file:", file_row)
+
+        body2 = self._section(parent, "View")
+        for value, label in (
+            ("country", "By country"),
+            ("airport", "By airport"),
+            ("route", "By route (origin → destination)"),
+            ("period", "By period (time series)"),
+        ):
+            ttk.Radiobutton(
+                body2, text=label, variable=self.traffic_view, value=value,
+            ).pack(anchor="w", padx=2, pady=1)
+
+        body3 = self._section(parent, "Output")
+        out_row = ttk.Frame(body3)
+        ttk.Entry(out_row, textvariable=self.traffic_output_dir).pack(
+            side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(out_row, text="Browse…", command=self._traffic_browse_out,
+                   width=10).pack(side="left")
+        self._form_row(body3, 0, "Folder:", out_row)
+
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill="x", pady=(8, 4), padx=4)
+        self.btn_traffic_run = ttk.Button(
+            ctrl, text="Run traffic report", command=self._traffic_run,
+            style="Primary.TButton")
+        self.btn_traffic_run.pack(side="left")
+        self.btn_traffic_export = ttk.Button(
+            ctrl, text="Export to Excel...", command=self._traffic_export,
+            state="disabled")
+        self.btn_traffic_export.pack(side="left", padx=(8, 0))
+        self.traffic_status_label = ttk.Label(
+            ctrl, text="Pick a source and view, then Run.", style="Hint.TLabel")
+        self.traffic_status_label.pack(side="left", padx=12)
+
+        body4 = self._section(parent, "Results")
+        self.traffic_tree_frame = ttk.Frame(body4)
+        self.traffic_tree_frame.pack(fill="both", expand=True)
+        self.traffic_tree = ttk.Treeview(
+            self.traffic_tree_frame, show="headings", height=14)
+        self.traffic_tree.pack(side="left", fill="both", expand=True)
+        t_scroll = ttk.Scrollbar(self.traffic_tree_frame, command=self.traffic_tree.yview)
+        t_scroll.pack(side="right", fill="y")
+        self.traffic_tree.configure(yscrollcommand=t_scroll.set)
+        self._traffic_set_columns([("#", 40), ("Info", 600)])
+        self.traffic_tree.insert("", "end", values=("—", "Pick a source and click Run."))
+
+        self._traffic_on_source_change()
+
+    def _traffic_current_source(self):
+        sid = self._traffic_label_to_id.get(self.traffic_source.get())
+        return TRAFFIC_SOURCES.get(sid) if sid else None
+
+    def _traffic_on_source_change(self) -> None:
+        src = self._traffic_current_source()
+        state = "normal" if getattr(src, "needs_file", False) else "disabled"
+        try:
+            self.traffic_file_entry.configure(state=state)
+            self.btn_traffic_browse.configure(state=state)
+        except tk.TclError:
+            pass
+
+    def _traffic_browse_csv(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Pick the data CSV (e.g. BTS T-100 Segment)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self.traffic_csv_path.set(path)
+
+    def _traffic_browse_out(self) -> None:
+        d = filedialog.askdirectory(title="Output folder")
+        if d:
+            self.traffic_output_dir.set(d)
+
+    def _traffic_set_columns(self, cols: "list[tuple[str, int]]") -> None:
+        ids = [c[0] for c in cols]
+        self.traffic_tree.configure(columns=ids)
+        for col_id, width in cols:
+            self.traffic_tree.heading(col_id, text=col_id)
+            anchor = "e" if any(
+                t in col_id.lower() for t in ("value", "%", "rank", "#")
+            ) else "w"
+            self.traffic_tree.column(col_id, width=width, anchor=anchor, stretch=True)
+
+    def _traffic_run(self) -> None:
+        if self._traffic_worker is not None and self._traffic_worker.is_alive():
+            return
+        src = self._traffic_current_source()
+        if src is None:
+            messagebox.showerror("Traffic", "Pick a data source first.")
+            return
+        if getattr(src, "needs_file", False) and not self.traffic_csv_path.get().strip():
+            messagebox.showerror(
+                "Traffic",
+                f"{src.label} needs a data file — click Browse and pick the CSV.",
+            )
+            return
+        cfg = {
+            "source_id": src.id,
+            "source_label": src.label,
+            "date_from": self.traffic_date_from.get().strip(),
+            "date_to": self.traffic_date_to.get().strip(),
+            "csv_path": self.traffic_csv_path.get().strip(),
+            "view": self.traffic_view.get(),
+        }
+        self.btn_traffic_run.configure(state="disabled")
+        self.btn_traffic_export.configure(state="disabled")
+        self.traffic_status_label.configure(text="Fetching…")
+        self._traffic_worker = threading.Thread(
+            target=self._traffic_worker_run, args=(cfg,), daemon=True)
+        self._traffic_worker.start()
+
+    def _traffic_worker_run(self, cfg: dict) -> None:
+        try:
+            src = TRAFFIC_SOURCES[cfg["source_id"]]
+            session = traffic_client.build_session()
+            filters = {
+                "date_from": cfg["date_from"], "date_to": cfg["date_to"],
+                "csv_path": cfg["csv_path"],
+            }
+
+            def progress(_i, _total, label):
+                self._post(MSG_TRAFFIC_BUSY, str(label))
+
+            rows = src.fetch(filters, session=session, progress_cb=progress)
+            if not rows:
+                self._post(MSG_TRAFFIC_ERROR, "No data returned for that source / filter.")
+                return
+            self._post(MSG_TRAFFIC_DONE, {
+                "rows": rows, "view": cfg["view"],
+                "source_label": cfg["source_label"],
+                "date_from": cfg["date_from"], "date_to": cfg["date_to"],
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Traffic worker crashed")
+            self._post(MSG_TRAFFIC_ERROR, f"{type(exc).__name__}: {exc}")
+
+    def _traffic_render_results(self, result: dict) -> None:
+        self._traffic_last_result = result
+        rows = result["rows"]
+        view = result["view"]
+        self.traffic_tree.delete(*self.traffic_tree.get_children())
+
+        def _share(v, total):
+            return f"{(100.0 * v / total):.1f}" if total else "0.0"
+
+        def _fmt(v):
+            return f"{v:,.0f}"
+
+        def _totals(agg):
+            tot: dict = {}
+            for t in agg:
+                tot[t.metric] = tot.get(t.metric, 0.0) + t.value
+            return tot
+
+        if view == "route":
+            agg = traffic_client.aggregate_by_route(rows)
+            tot = _totals(agg)
+            self._traffic_set_columns([
+                ("Rank", 50), ("Origin", 90), ("Destination", 90),
+                ("Metric", 110), ("Value", 120), ("Share %", 80)])
+            for i, t in enumerate(agg, start=1):
+                self.traffic_tree.insert("", "end", values=(
+                    i, t.origin, t.destination, t.metric, _fmt(t.value),
+                    _share(t.value, tot.get(t.metric, 0))))
+        elif view == "airport":
+            agg = traffic_client.aggregate_by_airport(rows)
+            tot = _totals(agg)
+            self._traffic_set_columns([
+                ("Rank", 50), ("Airport", 110), ("Metric", 120),
+                ("Value", 130), ("Share %", 80)])
+            for i, t in enumerate(agg, start=1):
+                self.traffic_tree.insert("", "end", values=(
+                    i, t.airport, t.metric, _fmt(t.value),
+                    _share(t.value, tot.get(t.metric, 0))))
+        elif view == "period":
+            agg = traffic_client.aggregate_by_period(rows)
+            self._traffic_set_columns([
+                ("Period", 120), ("Metric", 140), ("Value", 150)])
+            for t in agg:
+                self.traffic_tree.insert("", "end", values=(
+                    t.period, t.metric, _fmt(t.value)))
+        else:  # country
+            agg = traffic_client.aggregate_by_country(rows)
+            tot = _totals(agg)
+            self._traffic_set_columns([
+                ("Rank", 50), ("Country", 200), ("Metric", 120),
+                ("Value", 130), ("Share %", 80)])
+            for i, t in enumerate(agg, start=1):
+                self.traffic_tree.insert("", "end", values=(
+                    i, t.country, t.metric, _fmt(t.value),
+                    _share(t.value, tot.get(t.metric, 0))))
+
+        self.btn_traffic_run.configure(state="normal")
+        self.btn_traffic_export.configure(state="normal")
+        self.traffic_status_label.configure(
+            text=f"{len(rows):,} rows · {result['source_label']}")
+
+    def _traffic_export(self) -> None:
+        if not self._traffic_last_result:
+            messagebox.showinfo("Traffic", "Run a report first.")
+            return
+        view = self._traffic_last_result["view"]
+        folder = Path(self.traffic_output_dir.get().strip() or str(Path.home()))
+        default = excel_io.build_traffic_output_path(folder, view)
+        path = filedialog.asksaveasfilename(
+            title="Export Traffic report", initialdir=str(folder),
+            initialfile=default.name, defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            excel_io.write_traffic_report(
+                Path(path),
+                source_label=self._traffic_last_result["source_label"],
+                date_from=self._traffic_last_result["date_from"],
+                date_to=self._traffic_last_result["date_to"],
+                view=view,
+                rows=self._traffic_last_result["rows"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Traffic", f"Export failed: {exc}")
+            return
+        messagebox.showinfo("Traffic", f"Saved:\n{path}")
 
     # ==================================================================
     # Bulk Mailer tab
@@ -3425,6 +3721,16 @@ class App:
             self.btn_oep_run.configure(state="normal")
             self.btn_oep_export.configure(state="disabled")
             messagebox.showerror("OEP", str(payload))
+        # ------ Traffic tab messages ------
+        elif kind in (MSG_TRAFFIC_BUSY, MSG_TRAFFIC_LOG):
+            self.traffic_status_label.configure(text=str(payload))
+        elif kind == MSG_TRAFFIC_DONE:
+            self._traffic_render_results(payload)  # type: ignore[arg-type]
+        elif kind == MSG_TRAFFIC_ERROR:
+            self.btn_traffic_run.configure(state="normal")
+            self.btn_traffic_export.configure(state="disabled")
+            self.traffic_status_label.configure(text="Failed.")
+            messagebox.showerror("Traffic", str(payload))
         # ------ Update messages ------
         elif kind == MSG_UPDATE_FOUND:
             self._on_update_found(payload)  # type: ignore[arg-type]

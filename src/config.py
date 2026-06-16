@@ -208,3 +208,15 @@ ZENITH_FLIGHT_OUTPUT_COLUMNS = [
 # share once provisioned (currently the analyst's local publish folder).
 REPORTS_DIR = Path(os.environ.get("USBA_REPORTS_DIR", r"E:\Analysis\shared_reports"))
 REPORTS_AUTH_FILE = REPORTS_DIR / "auth.json"
+
+# ---------------------------------------------------------------------------
+# Traffic tab — air-traffic / passenger-movement, multi-source (Malaysia, BTS, …)
+# ---------------------------------------------------------------------------
+# One unified TrafficRow schema feeds one Treeview + one Excel writer, so every
+# source exports the same Raw sheet (the per-view Summary sheet is built in
+# excel_io.write_traffic_report).
+TRAFFIC_OUTPUT_COLUMNS_RAW = [
+    "Source", "Country", "Airport", "Origin", "Destination", "Carrier",
+    "Period", "Granularity", "Direction", "Flight Type",
+    "Metric", "Unit", "Value", "Nationality", "Gender", "Raw Label",
+]

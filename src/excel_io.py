@@ -677,6 +677,92 @@ def build_oep_output_path(folder: Path, kind: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Traffic tab IO (one writer for every source — rows are unified TrafficRows)
+# ---------------------------------------------------------------------------
+
+
+def write_traffic_report(
+    path: Path,
+    *,
+    source_label: str,
+    date_from: str,
+    date_to: str,
+    view: str,
+    rows: list,
+) -> None:
+    """Write a Traffic report: a per-`view` Summary sheet + a full Raw sheet.
+
+    `rows` are unified TrafficRow objects from any source. The Summary sheet
+    aggregates by country / airport / route / period; Share % is computed
+    within each metric so passengers and seats never blend.
+    """
+    from .config import TRAFFIC_OUTPUT_COLUMNS_RAW
+    from .traffic_client import (
+        aggregate_by_airport,
+        aggregate_by_country,
+        aggregate_by_period,
+        aggregate_by_route,
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append([f"Source: {source_label}"])
+    ws.append([f"Range: {date_from or 'all'} → {date_to or 'all'}    View: {view}"])
+    ws.append([])
+
+    def _metric_totals(agg) -> dict:
+        tot: dict[str, float] = {}
+        for t in agg:
+            tot[t.metric] = tot.get(t.metric, 0.0) + t.value
+        return tot
+
+    if view == "route":
+        agg = aggregate_by_route(rows)
+        tot = _metric_totals(agg)
+        ws.append(["Rank", "Origin", "Destination", "Metric", "Unit", "Value", "Share % (metric)"])
+        for i, t in enumerate(agg, start=1):
+            ws.append([i, t.origin, t.destination, t.metric, t.unit, t.value,
+                       _safe_share(t.value, tot.get(t.metric, 0))])
+    elif view == "airport":
+        agg = aggregate_by_airport(rows)
+        tot = _metric_totals(agg)
+        ws.append(["Rank", "Airport", "Metric", "Unit", "Value", "Share % (metric)"])
+        for i, t in enumerate(agg, start=1):
+            ws.append([i, t.airport, t.metric, t.unit, t.value,
+                       _safe_share(t.value, tot.get(t.metric, 0))])
+    elif view == "period":
+        agg = aggregate_by_period(rows)
+        ws.append(["Period", "Metric", "Unit", "Value"])
+        for t in agg:
+            ws.append([t.period, t.metric, t.unit, t.value])
+    else:  # "country" (default)
+        agg = aggregate_by_country(rows)
+        tot = _metric_totals(agg)
+        ws.append(["Rank", "Country", "Metric", "Unit", "Value", "Share % (metric)"])
+        for i, t in enumerate(agg, start=1):
+            ws.append([i, t.country, t.metric, t.unit, t.value,
+                       _safe_share(t.value, tot.get(t.metric, 0))])
+
+    raw_ws = wb.create_sheet("Raw")
+    raw_ws.append(TRAFFIC_OUTPUT_COLUMNS_RAW)
+    for r in rows:
+        raw_ws.append([
+            r.source_label, r.country, r.airport, r.origin, r.destination, r.carrier,
+            r.period, r.period_granularity, r.direction, r.flight_type,
+            r.metric, r.unit, r.value, r.nationality, r.gender, r.raw_label,
+        ])
+    wb.save(path)
+
+
+def build_traffic_output_path(folder: Path, kind: str) -> Path:
+    """`kind` ∈ {country, airport, route, period}."""
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"traffic_{kind}_{timestamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
 # Zenith Customer Lookup IO
 # ---------------------------------------------------------------------------
 
