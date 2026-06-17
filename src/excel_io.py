@@ -1575,6 +1575,85 @@ def build_zenith_history_output_path(folder: Path) -> Path:
     return folder / f"zenith_history_audit_{timestamp}.xlsx"
 
 
+def write_zenith_pnr_misuse_audit(path: Path, report) -> None:
+    """Multi-sheet workbook for the PNR misuse audit (re-pivoted flight corpus).
+
+    Sheets: Cover | Risk Worklist | Flags | Agent Activity. The Risk Worklist is the
+    ranked "look here first" view; Flags are the per-observation evidence. Flags are
+    decision-support leads needing human review, NOT determinations — the Cover says so.
+    """
+    wb = Workbook()
+
+    cover = wb.active
+    cover.title = "Cover"
+    cover.append(["Zenith PNR Misuse Audit  (decision-support — verify before any action)"])
+    cover.append([])
+    start, end = report.date_range
+    cover.append(["Events analysed", report.event_count])
+    cover.append(["PNRs", report.pnr_count])
+    cover.append(["Agents", report.agent_count])
+    cover.append([
+        "Date range",
+        f"{start.strftime('%Y-%m-%d') if start else '—'}"
+        f"  →  {end.strftime('%Y-%m-%d') if end else '—'}",
+    ])
+    cover.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    cover.append([])
+    sev_counts: dict[str, int] = {}
+    for f in report.flags:
+        sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+    cover.append(["Flags by severity"])
+    for sev in ("critical", "high", "medium", "low"):
+        if sev_counts.get(sev):
+            cover.append([sev, sev_counts[sev]])
+    cover.append([])
+    cover.append(["NOTE: every flag is an observation that needs human verification."])
+    cover.append(["Legitimate causes (involuntary refunds/IRROPS, central servicing,"])
+    cover.append(["group bookings, consolidators) can produce flags — review the evidence."])
+
+    ws = wb.create_sheet("Risk Worklist")
+    ws.append(["Rank", "Grain", "Entity", "Score", "Flags", "Families", "Top reasons"])
+    for rank, r in enumerate(report.risk_worklist, start=1):
+        ws.append([
+            rank, r.grain, r.entity, r.score, r.flag_count,
+            ", ".join(r.families), "  •  ".join(r.top_reasons),
+        ])
+
+    ws = wb.create_sheet("Flags")
+    ws.append([
+        "Severity", "Confidence", "Detector", "PNR", "Ticket Number",
+        "Agent User ID", "Department", "Timestamp", "Reason", "Evidence",
+    ])
+    for f in report.flags:
+        ws.append([
+            f.severity, f.confidence, f.detector, f.pnr, f.ticket_number,
+            f.agent_user_id, f.agent_department,
+            f.timestamp.strftime("%Y-%m-%d %H:%M") if f.timestamp else "",
+            f.reason, f.evidence,
+        ])
+
+    ws = wb.create_sheet("Agent Activity")
+    ws.append([
+        "Agent User ID", "Display Name", "Department", "Total Events",
+        "Issues", "Reissues", "Refunds", "Voids", "Downgrades",
+        "Off-hours", "Distinct PNRs",
+    ])
+    for a in report.agent_activity:
+        ws.append([
+            a.agent_user_id, a.agent_display_name, a.department, a.total_events,
+            a.issues, a.reissues, a.refunds, a.voids, a.downgrades,
+            a.off_hours, a.distinct_pnrs,
+        ])
+
+    wb.save(path)
+
+
+def build_zenith_pnr_misuse_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_pnr_misuse_audit_{timestamp}.xlsx"
+
+
 # ---------------------------------------------------------------------------
 # Zenith Bulk PNR Lookup
 # ---------------------------------------------------------------------------

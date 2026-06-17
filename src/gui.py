@@ -38,7 +38,7 @@ from . import (
     __version__, auth, config, excel_io, graph_mailer, mailer_client, mailer_io,
     oep_client, oep_presets, traffic_client, updater, zenith_client,
     zenith_history_analyzer, zenith_history_downloader, zenith_history_parser,
-    zenith_loads_index, zenith_pnr_client,
+    zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
 )
 from .mailer_log import MailerLog
 from .traffic_sources import SOURCES as TRAFFIC_SOURCES
@@ -112,6 +112,8 @@ MSG_ZENITH_FH_PROGRESS = "zenith_fh_progress"  # (i, total, current_file)
 MSG_ZENITH_FH_PARSED = "zenith_fh_parsed"      # payload: int (event count)
 MSG_ZENITH_FH_DONE = "zenith_fh_done"          # payload: HistoryAuditReport
 MSG_ZENITH_FH_ERROR = "zenith_fh_error"
+MSG_ZENITH_PNRMISUSE_DONE = "zenith_pnrmisuse_done"    # payload: summary dict
+MSG_ZENITH_PNRMISUSE_ERROR = "zenith_pnrmisuse_error"  # payload: str
 # Zenith Flight History downloader (Phase 3)
 MSG_ZENITH_DL_STATUS = "zenith_dl_status"      # payload: str (status line)
 MSG_ZENITH_DL_PROGRESS = "zenith_dl_progress"  # (i, total, label, status_code)
@@ -3913,6 +3915,26 @@ class App:
             self.btn_zenith_fh_run.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("Flight History Analyzer — Error", str(payload))
+        elif kind == MSG_ZENITH_PNRMISUSE_DONE:
+            self.btn_zenith_fh_misuse.configure(state="normal")
+            p = payload
+            self.zenith_fh_status_label.configure(
+                text=f"PNR misuse: {p['flags']} flag(s) → {Path(p['path']).name}")
+            if messagebox.askyesno(
+                    "PNR Misuse audit",
+                    f"Analysed {p['events']:,} events across {p['pnrs']:,} PNRs.\n"
+                    f"Flags: {p['flags']}  (critical {p['critical']}, high {p['high']}).\n"
+                    f"Top risk: {p['top']}\n\nSaved to:\n{p['path']}\n\n"
+                    "Flags are review leads, not findings. Open the workbook now?"):
+                try:
+                    import os
+                    os.startfile(p["path"])  # noqa: S606
+                except Exception:  # noqa: BLE001
+                    pass
+        elif kind == MSG_ZENITH_PNRMISUSE_ERROR:
+            self.btn_zenith_fh_misuse.configure(state="normal")
+            self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
+            messagebox.showerror("PNR Misuse audit — Error", str(payload))
         # ----- Flight History downloader (Phase 3) -----
         elif kind == MSG_ZENITH_DL_STATUS:
             self.zenith_fh_status_label.configure(text=str(payload))
@@ -5344,6 +5366,14 @@ class App:
             state="disabled",
         )
         self.btn_zenith_fh_pnr.pack(side="left", padx=(8, 0))
+        # Re-pivot the SAME logs into a PNR-centric misuse audit (refund-of-flown,
+        # self-refund, off-hours, downgrades, reissue churn) — no network, no extra
+        # download. Flags are review leads, not determinations.
+        self.btn_zenith_fh_misuse = ttk.Button(
+            ctl, text="PNR Misuse audit",
+            command=self._zenith_pnr_misuse_run,
+        )
+        self.btn_zenith_fh_misuse.pack(side="left", padx=(8, 0))
         self.zenith_fh_status_label = ttk.Label(
             ctl,
             text="Browse a logs folder, then Run history audit.",
@@ -5891,6 +5921,52 @@ class App:
             except Exception as exc:  # noqa: BLE001 — surface to UI
                 log.exception("Flight History audit failed")
                 self._post(MSG_ZENITH_FH_ERROR, f"{type(exc).__name__}: {exc}")
+
+        self._zenith_fh_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_fh_worker.start()
+
+    def _zenith_pnr_misuse_run(self) -> None:
+        """Re-pivot the same ModificationHistory corpus into a PNR misuse audit.
+
+        Reuses the Flight History logs + output folders. No network — parses the
+        already-downloaded .xls logs, runs the structural misuse detectors, and writes
+        a ranked risk worklist + flags workbook. Flags are review leads, not findings.
+        """
+        folder = self.zenith_fh_input_dir.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror(
+                "PNR Misuse audit",
+                f"Pick a valid logs folder first.\n\nCurrent: {folder!r}")
+            return
+        out_dir = self.zenith_fh_output_dir.get().strip() or str(Path.home() / "Documents")
+        if self._zenith_fh_worker and self._zenith_fh_worker.is_alive():
+            messagebox.showinfo("PNR Misuse audit", "An audit is already running.")
+            return
+        self.btn_zenith_fh_misuse.configure(state="disabled")
+        self.zenith_fh_status_label.configure(text="Running PNR misuse audit…")
+
+        def worker() -> None:
+            try:
+                events = zenith_history_parser.collect_history(folder)
+                report = zenith_pnr_history_analyzer.run_pnr_misuse_audit(events)
+                out_path = excel_io.build_zenith_pnr_misuse_output_path(Path(out_dir))
+                excel_io.write_zenith_pnr_misuse_audit(out_path, report)
+                sev: dict[str, int] = {}
+                for f in report.flags:
+                    sev[f.severity] = sev.get(f.severity, 0) + 1
+                top = report.risk_worklist[0] if report.risk_worklist else None
+                self._post(MSG_ZENITH_PNRMISUSE_DONE, {
+                    "path": str(out_path),
+                    "events": report.event_count,
+                    "pnrs": report.pnr_count,
+                    "flags": len(report.flags),
+                    "critical": sev.get("critical", 0),
+                    "high": sev.get("high", 0),
+                    "top": (f"{top.grain} {top.entity} (score {top.score})" if top else "—"),
+                })
+            except Exception as exc:  # noqa: BLE001 — surface to UI
+                log.exception("PNR misuse audit failed")
+                self._post(MSG_ZENITH_PNRMISUSE_ERROR, f"{type(exc).__name__}: {exc}")
 
         self._zenith_fh_worker = threading.Thread(target=worker, daemon=True)
         self._zenith_fh_worker.start()

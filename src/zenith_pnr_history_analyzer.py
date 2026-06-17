@@ -152,10 +152,20 @@ def _evidence(event: HistoryEvent) -> str:
 # Detectors (structural — no free-text regexes)
 # ---------------------------------------------------------------------------
 def _by_ticket(events: list[HistoryEvent]) -> dict[str, list[HistoryEvent]]:
+    """Group events by ticket number, falling back to PNR when the ticket isn't
+    parseable.
+
+    The ModificationHistory description often glues the coupon suffix to the e-ticket
+    (e.g. ``7792000000001C1``), so the parser's ``_TICKET_NUMBER_RE`` (which requires a
+    word boundary after 13 digits) yields nothing. PNR is then the best grouping key —
+    a PNR is one ticket for the vast majority of bookings, so the per-ticket detectors
+    still hold.
+    """
     out: dict[str, list[HistoryEvent]] = defaultdict(list)
     for e in events:
-        if e.ticket_number:
-            out[e.ticket_number].append(e)
+        key = e.ticket_number or e.pnr
+        if key:
+            out[key].append(e)
     for evs in out.values():
         evs.sort(key=lambda e: e.timestamp or datetime.min)
     return out
