@@ -484,6 +484,44 @@ class TestLookupMany:
         # The breaker stops the run well before all 60 are attempted.
         assert calls["n"] < 60
 
+    def test_governor_aborts_on_high_failure_rate_despite_sparse_success(self, monkeypatch) -> None:
+        # The real-world 504-storm: a success every ~10 PNRs keeps a *consecutive*-
+        # streak breaker resetting forever; the windowed failure-RATE breaker must
+        # still abort. Without the fix this would grind through all 400.
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        calls = {"n": 0}
+
+        def flaky(_session, _code, **_kw):
+            calls["n"] += 1
+            if calls["n"] % 10 == 0:                       # ~10% succeed, scattered
+                return parse_dossier_html(_build_dossier_html(pnr=f"OK{calls['n']:05d}"))
+            raise zpc.ZenithError("504")
+
+        monkeypatch.setattr(zpc, "lookup_pnr", flaky)
+        codes = [f"P{i:05d}" for i in range(400)]
+        out = zpc.lookup_many(object(), codes, concurrency=1, delay_s=0.0)
+        # Aborts once the window fills at a high failure rate — not after all 400.
+        assert calls["n"] < 120
+        # The handful that succeeded before the abort were still collected.
+        assert len(out) >= 1
+
+    def test_governor_does_not_abort_a_mostly_healthy_run(self, monkeypatch) -> None:
+        # A low failure rate must never trip the breaker — all PNRs get attempted.
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        calls = {"n": 0}
+
+        def mostly_ok(_session, _code, **_kw):
+            calls["n"] += 1
+            if calls["n"] % 20 == 0:                       # ~5% transient failures
+                raise zpc.ZenithError("504")
+            return parse_dossier_html(_build_dossier_html(pnr=f"OK{calls['n']:05d}"))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", mostly_ok)
+        codes = [f"P{i:05d}" for i in range(80)]
+        out = zpc.lookup_many(object(), codes, concurrency=1, delay_s=0.0)
+        assert calls["n"] == 80                            # every PNR attempted
+        assert len(out) == 76                              # 4 of 80 failed (the 20ths)
+
     def test_session_loss_raises_after_checkpointing(self, monkeypatch) -> None:
         def fake(_session, code, **_kw):
             if code == "DEAD01":

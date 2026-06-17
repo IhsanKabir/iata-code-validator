@@ -479,11 +479,14 @@ def lookup_many(
     code, status)` gets a running completion count. `stop_event` cancels the
     rest.
 
-    An adaptive governor tracks the running transient-failure streak: it slows
-    the workers once a 504-storm starts and ABORTS the run (rather than grinding
-    for hours) if Zenith stays down — every completed PNR is already reported
-    via on_result, so a re-run resumes from the cache.
+    An adaptive governor watches the transient-failure RATE over a sliding window
+    (with a long consecutive streak as a fast path): it slows the workers once
+    failures dominate and ABORTS the run rather than grinding for hours if Zenith
+    stays down — even when the storm is sprinkled with the odd success, which would
+    defeat a consecutive-streak-only breaker. Every completed PNR is already
+    reported via on_result, so a re-run resumes from the cache.
     """
+    import collections
     import threading
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -502,10 +505,32 @@ def lookup_many(
     # we never block draining thousands of doomed calls (mirrors fetch_many).
     _stop = stop_event if stop_event is not None else threading.Event()
 
-    # Adaptive governor — consecutive transient (5xx / timeout) failures.
-    SLOW_AT, ABORT_AT = 10, 25
-    gov = {"streak": 0, "aborted": False, "session_lost": None}
+    # Adaptive governor. Two independent ABORT triggers so a 504-storm can't grind:
+    #   * a sliding-window FAILURE RATE — catches a storm sprinkled with the odd
+    #     success, where a consecutive-streak counter keeps resetting and never trips;
+    #   * a long CONSECUTIVE streak — a fast path for a hard-down, before the window
+    #     even fills.
+    # SLOW raises the per-worker backoff once failures dominate; both are reset by any
+    # success. Aborting is safe: every completed PNR is already checkpointed via
+    # on_result, so a re-run resumes from the cache.
+    WINDOW = 30
+    SLOW_RATE, ABORT_RATE = 0.4, 0.8
+    ABORT_STREAK = 40
+    recent: "collections.deque" = collections.deque(maxlen=WINDOW)
+    gov = {"streak": 0, "slow": False, "aborted": False, "session_lost": None}
     gov_lock = threading.Lock()
+
+    def _record(transient_fail: bool) -> None:
+        """Fold one network outcome into the breaker (may flip slow/aborted)."""
+        with gov_lock:
+            recent.append(1 if transient_fail else 0)
+            gov["streak"] = gov["streak"] + 1 if transient_fail else 0
+            n = len(recent)
+            rate = sum(recent) / n if n else 0.0
+            gov["slow"] = n >= (WINDOW // 2) and rate >= SLOW_RATE
+            if (n >= WINDOW and rate >= ABORT_RATE) or gov["streak"] >= ABORT_STREAK:
+                gov["aborted"] = True
+                _stop.set()
 
     def _worker(code: str):
         if _stop.is_set():
@@ -516,18 +541,16 @@ def lookup_many(
         with gov_lock:
             if gov["aborted"]:
                 return code, None, "ERROR: Zenith overloaded — run aborted"
-            slow = gov["streak"] >= SLOW_AT
+            slow = gov["slow"]
         if slow:
             time.sleep(_backoff_with_jitter(2, base_s=2.0, cap_s=8.0))
         try:
             details = lookup_pnr(session, code)
-            with gov_lock:
-                gov["streak"] = 0
+            _record(False)
             time.sleep(delay_s)
             return code, details, "OK"
         except PNRNotFoundError:
-            with gov_lock:
-                gov["streak"] = 0
+            _record(False)
             time.sleep(delay_s)
             return code, None, "NOT_FOUND"
         except SessionExpiredError as exc:
@@ -538,14 +561,11 @@ def lookup_many(
             _stop.set()
             return code, None, "SESSION_EXPIRED"
         except ZenithError as exc:  # incl. RateLimitedError — transient server
-            with gov_lock:
-                gov["streak"] += 1
-                if gov["streak"] >= ABORT_AT:
-                    gov["aborted"] = True
-                    _stop.set()
+            _record(True)
             time.sleep(delay_s)
             return code, None, f"ERROR: {exc}"
         except Exception as exc:  # noqa: BLE001
+            _record(True)
             time.sleep(delay_s)
             return code, None, f"ERROR: {type(exc).__name__}: {exc}"
 
