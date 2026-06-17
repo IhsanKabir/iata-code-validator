@@ -210,6 +210,27 @@ REPORTS_DIR = Path(os.environ.get("USBA_REPORTS_DIR", r"E:\Analysis\shared_repor
 REPORTS_AUTH_FILE = REPORTS_DIR / "auth.json"
 
 # ---------------------------------------------------------------------------
+# Zenith -> PNR History / Audit sub-tab (investigative; access-gated)
+# ---------------------------------------------------------------------------
+# Bulk-scrapes each PNR's event-history tabs (Tickets / Changes / Reissue) and
+# mines them for trends + potential misuse. Sensitive: rows name staff logins,
+# PAX contact details, and payment/transaction ids. The raw scrape is cached as
+# gzipped HTML per (dossier, tab) so a parser fix never re-hits Zenith.
+#
+# The cache holds PII + accusatory data — point USBA_PNR_HISTORY_DB at an ACL'd
+# share in production; it falls back to the local app dir for development.
+ZENITH_PNR_HISTORY_CACHE_DB = Path(
+    os.environ.get("USBA_PNR_HISTORY_DB", str(APP_DIR / "zenith_pnr_history.sqlite"))
+)
+# Re-scrape a dossier's history if the cached copy is older than this.
+PNR_HISTORY_STALE_AFTER_DAYS = 3
+# Hard per-run request-budget ceiling (the GDS is fragile — recently 504-stormed).
+PNR_HISTORY_MAX_REQUESTS = 5000
+# Conservative throughput defaults (lighter than the per-PNR lookup, which is 1 GET).
+PNR_HISTORY_CONCURRENCY = 2
+PNR_HISTORY_DELAY_S = 1.5
+
+# ---------------------------------------------------------------------------
 # Traffic tab — air-traffic / passenger-movement, multi-source (Malaysia, BTS, …)
 # ---------------------------------------------------------------------------
 # One unified TrafficRow schema feeds one Treeview + one Excel writer, so every
