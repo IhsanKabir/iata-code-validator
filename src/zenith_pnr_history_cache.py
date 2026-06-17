@@ -56,7 +56,7 @@ class RawTab:
     tab: str
     html: str
     http_status: int
-    byte_size: int
+    byte_size: int            # original (UNCOMPRESSED) HTML size — drives the "<2 KB = empty" check
     fetched_at: datetime | None
     scrape_version: int = SCRAPE_VERSION
 

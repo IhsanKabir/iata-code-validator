@@ -108,10 +108,10 @@ def probe_pnr(sess, pnr: str) -> None:
         return
 
     # 1) Fetch the Dossier page HTML and scrape the event-history button targets.
-    raw = sess.get(QUICK_SEARCH_URL,
-                   params={"vaction": "VERIF", "Id": pnr.strip().upper(),
-                           "id_langue": "2", "GDSCRSPartnerRCIRLoc": ""},
-                   timeout=60)
+    raw = sess.session.get(QUICK_SEARCH_URL,
+                           params={"vaction": "VERIF", "Id": pnr.strip().upper(),
+                                   "id_langue": "2", "GDSCRSPartnerRCIRLoc": ""},
+                           timeout=60)
     _save(f"{pnr}_dossier_page", raw.text)
     found = sorted(set(_EVENT_URL_RE.findall(raw.text)))
     print(f"  search_event.asp references in Dossier page: {len(found)}")
