@@ -61,9 +61,11 @@ import requests
 from .zenith_client import (
     BASE_URL,
     USER_AGENT,
+    RateLimitedError,
     SessionExpiredError,
     ZenithError,
     ZenithSession,
+    _backoff_with_jitter,
 )
 
 log = logging.getLogger(__name__)
@@ -372,12 +374,20 @@ def lookup_pnr(
     pnr_code: str,
     *,
     timeout_s: float = 60.0,
+    max_attempts: int = 3,
 ) -> PNRDetails:
-    """Resolve `pnr_code` to a parsed PNRDetails record.
+    """Resolve `pnr_code` to a parsed PNRDetails record, retrying transients.
 
-    Goes through the same quickSearch redirect chain the Zenith UI uses
-    — that gives us automatic 302-following to the Dossier page without
-    us needing to know the internal Id_Dossier ahead of time.
+    Goes through the same quickSearch redirect chain the Zenith UI uses — that
+    gives us automatic 302-following to the Dossier page without us needing the
+    internal Id_Dossier ahead of time.
+
+    Zenith intermittently returns 502/503/504 (gateway timeout / overload) on
+    bulk PNR runs; those — and network blips — are retried with capped backoff
+    + jitter instead of failing the PNR on the first hiccup (the dominant cause
+    of bulk-run errors). Session loss (401/403 or a login redirect) is NOT
+    retried — it needs a fresh login. The read timeout stays generous because
+    the Dossier page is a large, slow ASPX render. Mirrors fetch_customer.
     """
     if not pnr_code:
         raise ValueError("pnr_code must be a non-empty string")
@@ -390,97 +400,181 @@ def lookup_pnr(
         "vaction": "VERIF",
         "Id": pnr_code.strip().upper(),
     }
-    # Retry transient network errors (DNS hiccup, TCP reset, slow
-    # server) up to 3 times with backoff. ~30 of every ~2k PNRs trip
-    # one of these on flaky office Wi-Fi, and a single retry usually
-    # clears it without the user noticing.
     import time as _t
-    resp = None
-    last_exc: Exception | None = None
-    for attempt in range(1, 4):  # attempts at t=0, t=2s, t=5s
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        is_last = attempt >= attempts
         try:
             resp = sess.get(QUICK_SEARCH_URL, params=params, timeout=timeout_s)
-            last_exc = None
-            break
         except requests.RequestException as exc:
-            last_exc = exc
-            if attempt == 3:
-                break
-            backoff = 2 if attempt == 1 else 5
-            log.warning(
-                "PNR %s attempt %d/3 failed (%s) — retrying in %ds",
-                pnr_code, attempt, exc, backoff,
+            if is_last:
+                raise ZenithError(
+                    f"Network error looking up PNR {pnr_code} after "
+                    f"{attempts} attempts: {exc}"
+                ) from exc
+            _t.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+            continue
+
+        # Session loss — never retry; the caller must re-login.
+        if resp.status_code in (401, 403) or "/otds/" in resp.url:
+            raise SessionExpiredError(
+                f"Zenith returned {resp.status_code} for PNR {pnr_code} — "
+                "session expired or never authenticated."
             )
-            _t.sleep(backoff)
-    if resp is None:
-        raise ZenithError(
-            f"Network error looking up PNR {pnr_code} after 3 attempts: "
-            f"{last_exc}",
-        ) from last_exc
+        # Rate limited / unavailable — back off longer + retry.
+        if resp.status_code in (429, 503):
+            if is_last:
+                raise RateLimitedError(
+                    f"Zenith returned {resp.status_code} for PNR {pnr_code} "
+                    f"after {attempts} attempts — back off."
+                )
+            _t.sleep(_backoff_with_jitter(attempt, base_s=4.0, cap_s=12.0))
+            continue
+        # Transient gateway/server errors — the 502/503/504/500 storm seen on
+        # bulk runs. Retry; only fail this PNR if it sticks.
+        if resp.status_code >= 500:
+            if is_last:
+                raise ZenithError(
+                    f"Zenith returned {resp.status_code} for PNR {pnr_code} "
+                    f"after {attempts} attempts."
+                )
+            _t.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+            continue
 
-    if resp.status_code in (401, 403):
-        raise SessionExpiredError(
-            f"Zenith returned {resp.status_code} for PNR {pnr_code}.",
-        )
-    if resp.status_code >= 500:
-        raise ZenithError(
-            f"Zenith returned {resp.status_code} for PNR {pnr_code}.",
-        )
-
-    # The dashboard returns the dashboard HTML when a PNR is unknown —
-    # detect that by the absence of any Dossier-style fields.
-    if "_lblPNRCode" not in resp.text and "PNR :" not in resp.text:
-        raise PNRNotFoundError(
-            f"Zenith couldn't resolve PNR {pnr_code!r}.",
-        )
-
-    return parse_dossier_html(resp.text)
+        # 2xx/3xx (not a login redirect). The dashboard HTML (no Dossier
+        # fields) means the PNR is unknown — NOT a transient, do not retry.
+        if "_lblPNRCode" not in resp.text and "PNR :" not in resp.text:
+            raise PNRNotFoundError(
+                f"Zenith couldn't resolve PNR {pnr_code!r}.",
+            )
+        return parse_dossier_html(resp.text)
+    # The loop always returns or raises on the final attempt; guard anyway.
+    raise ZenithError(f"Exhausted retries looking up PNR {pnr_code}.")
 
 
 def lookup_many(
     session: ZenithSession,
     pnr_codes: Iterable[str],
     *,
-    delay_s: float = 0.5,
+    concurrency: int = 3,
+    delay_s: float = 0.8,
     skip_cached=None,
+    on_result=None,
     progress_cb=None,
+    stop_event=None,
 ) -> dict[str, PNRDetails]:
-    """Look up many PNRs serially with a polite delay.
+    """Look up many PNRs with bounded concurrency + per-result checkpointing.
 
-    `skip_cached(pnr) -> PNRDetails|None` lets callers plug in a cache;
-    when it returns non-None we skip the network call.
+    Mirrors zenith_client.fetch_many: a ThreadPoolExecutor (1..10 workers),
+    each making serial calls with a polite per-worker delay. lookup_pnr already
+    retries transient 504/5xx, so a flaky server costs a retry, not a lost PNR —
+    and overlapping the (slow) waits across workers is what beats the serial
+    wall-clock.
+
+    `skip_cached(pnr) -> PNRDetails|None` short-circuits the network call.
+    `on_result(code, details_or_None, status)` fires as EACH result lands (in
+    the caller's thread, serially) so the caller can checkpoint to its cache
+    immediately — making a stopped/crashed run resume-safe. `status` is one of
+    OK / NOT_FOUND / CACHED / ERROR: … / STOPPED. `progress_cb(done, total,
+    code, status)` gets a running completion count. `stop_event` cancels the
+    rest.
+
+    An adaptive governor tracks the running transient-failure streak: it slows
+    the workers once a 504-storm starts and ABORTS the run (rather than grinding
+    for hours) if Zenith stays down — every completed PNR is already reported
+    via on_result, so a re-run resumes from the cache.
     """
+    import threading
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     out: dict[str, PNRDetails] = {}
     codes = [c.strip().upper() for c in pnr_codes if c and c.strip()]
     total = len(codes)
-    for idx, code in enumerate(codes, start=1):
+    if total == 0:
+        return out
+    concurrency = max(1, min(int(concurrency), 10))
+    delay_s = max(0.0, float(delay_s))
+
+    # One stop signal for the whole run — the caller's if supplied, else an
+    # internal one. Session loss / governor-abort set this; the as_completed
+    # loop then CANCELS the still-queued futures before the pool shuts down, so
+    # we never block draining thousands of doomed calls (mirrors fetch_many).
+    _stop = stop_event if stop_event is not None else threading.Event()
+
+    # Adaptive governor — consecutive transient (5xx / timeout) failures.
+    SLOW_AT, ABORT_AT = 10, 25
+    gov = {"streak": 0, "aborted": False, "session_lost": None}
+    gov_lock = threading.Lock()
+
+    def _worker(code: str):
+        if _stop.is_set():
+            return code, None, "STOPPED"
         cached = skip_cached(code) if skip_cached else None
         if cached is not None:
-            out[code] = cached
-            if progress_cb:
-                try:
-                    progress_cb(idx, total, code, "CACHED")
-                except Exception:  # noqa: BLE001
-                    log.exception("progress_cb raised")
-            continue
+            return code, cached, "CACHED"
+        with gov_lock:
+            if gov["aborted"]:
+                return code, None, "ERROR: Zenith overloaded — run aborted"
+            slow = gov["streak"] >= SLOW_AT
+        if slow:
+            time.sleep(_backoff_with_jitter(2, base_s=2.0, cap_s=8.0))
         try:
             details = lookup_pnr(session, code)
-            out[code] = details
-            if progress_cb:
+            with gov_lock:
+                gov["streak"] = 0
+            time.sleep(delay_s)
+            return code, details, "OK"
+        except PNRNotFoundError:
+            with gov_lock:
+                gov["streak"] = 0
+            time.sleep(delay_s)
+            return code, None, "NOT_FOUND"
+        except SessionExpiredError as exc:
+            # Not transient — stop the run cleanly (do NOT re-raise from the
+            # worker: that would make the pool drain every queued future).
+            with gov_lock:
+                gov["session_lost"] = exc
+            _stop.set()
+            return code, None, "SESSION_EXPIRED"
+        except ZenithError as exc:  # incl. RateLimitedError — transient server
+            with gov_lock:
+                gov["streak"] += 1
+                if gov["streak"] >= ABORT_AT:
+                    gov["aborted"] = True
+                    _stop.set()
+            time.sleep(delay_s)
+            return code, None, f"ERROR: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            time.sleep(delay_s)
+            return code, None, f"ERROR: {type(exc).__name__}: {exc}"
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_worker, c): c for c in codes}
+        for fut in as_completed(futures):
+            code, details, status = fut.result()
+            completed += 1
+            if status in ("OK", "CACHED") and details is not None:
+                out[code] = details
+            if on_result is not None:
                 try:
-                    progress_cb(idx, total, code, "OK")
+                    on_result(code, details, status)
+                except Exception:  # noqa: BLE001 — never let the callback kill the run
+                    log.exception("on_result raised for %s", code)
+            if progress_cb is not None:
+                try:
+                    progress_cb(completed, total, code, status)
                 except Exception:  # noqa: BLE001
                     log.exception("progress_cb raised")
-        except PNRNotFoundError:
-            if progress_cb:
-                progress_cb(idx, total, code, "NOT_FOUND")
-        except SessionExpiredError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — keep batch going
-            log.warning("PNR lookup failed for %s: %s", code, exc)
-            if progress_cb:
-                progress_cb(idx, total, code, f"ERROR: {exc}")
-        if delay_s > 0 and idx < total:
-            time.sleep(delay_s)
+            if _stop.is_set():
+                for rem in futures:
+                    if not rem.done():
+                        rem.cancel()
+                break
+
+    # Surface a lost session to the caller AFTER the pool is cleanly drained,
+    # so the GUI's SessionExpiredError handler still fires (re-login + resume).
+    if gov["session_lost"] is not None:
+        raise gov["session_lost"]
     return out

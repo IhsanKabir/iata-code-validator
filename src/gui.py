@@ -5710,54 +5710,62 @@ class App:
         sess = self._zenith_session
         stop = self._zenith_bulk_stop_flag
 
+        # Bounded concurrency + in-worker 504 retry beats the old serial loop:
+        # transient 504s are now retried (recovered) instead of lost, and the
+        # slow Dossier waits overlap across workers. 3 workers is the same
+        # proven range as the customer-lookup bulk path (fetch_many).
+        _BULK_CONCURRENCY = 3
+        _BULK_DELAY_S = 0.8
+
         def worker() -> None:
             try:
-                results: list = []
+                got: dict[str, object] = {}
                 errors: dict[str, str] = {}
-                for idx, code in enumerate(codes, start=1):
-                    if stop.is_set():
-                        self._post(
-                            MSG_ZENITH_BULK_PROGRESS,
-                            (idx, len(codes), code, "CANCELLED"),
-                        )
-                        break
-                    cached = cache.get(code)
-                    if cached is not None:
-                        results.append((code, cached))
-                        self._post(
-                            MSG_ZENITH_BULK_PROGRESS,
-                            (idx, len(codes), code, "CACHED"),
-                        )
-                        continue
-                    try:
-                        details = zenith_pnr_client.lookup_pnr(sess, code)
-                        cache.put(details)
-                        results.append((code, details))
-                        self._post(
-                            MSG_ZENITH_BULK_PROGRESS,
-                            (idx, len(codes), code, "OK"),
-                        )
-                    except zenith_pnr_client.PNRNotFoundError:
-                        # Keep this distinct from real errors so the
-                        # output sheet flags it as NOT_FOUND, not ERROR.
-                        results.append((code, None))
-                        self._post(
-                            MSG_ZENITH_BULK_PROGRESS,
-                            (idx, len(codes), code, "NOT_FOUND"),
-                        )
-                    except zenith_client.SessionExpiredError as exc:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("PNR bulk lookup %s failed: %s", code, exc)
-                        results.append((code, None))
-                        errors[code] = f"{type(exc).__name__}: {exc}"
-                        self._post(
-                            MSG_ZENITH_BULK_PROGRESS,
-                            (idx, len(codes), code, f"ERROR: {exc}"),
-                        )
-                    # Polite delay — only when we actually hit Zenith.
-                    import time
-                    time.sleep(0.5)
+
+                def on_result(code, details, status) -> None:
+                    # Fires as each PNR lands (serially, in this thread) — so we
+                    # checkpoint every success to the cache immediately, making
+                    # a Stop / crash / session-expiry resume-safe on re-run.
+                    if status == "OK":
+                        if details is not None:
+                            try:
+                                cache.put(details)
+                            except Exception:  # noqa: BLE001
+                                log.exception("cache.put failed for %s", code)
+                            got[code] = details
+                    elif status == "CACHED":
+                        got[code] = details
+                    elif status == "NOT_FOUND":
+                        got[code] = None
+                    elif isinstance(status, str) and status.startswith("ERROR"):
+                        got[code] = None
+                        errors[code] = status.split("ERROR:", 1)[-1].strip() or status
+
+                def progress(done, total, code, status) -> None:
+                    self._post(
+                        MSG_ZENITH_BULK_PROGRESS, (done, total, code, status),
+                    )
+
+                zenith_pnr_client.lookup_many(
+                    sess, codes,
+                    concurrency=_BULK_CONCURRENCY,
+                    delay_s=_BULK_DELAY_S,
+                    skip_cached=cache.get,
+                    on_result=on_result,
+                    progress_cb=progress,
+                    stop_event=stop,
+                )
+
+                # Rebuild output rows in INPUT order (completion order is
+                # arbitrary under concurrency). PNRs not processed (Stop) are
+                # simply absent from `got` and dropped from the sheet.
+                seen: set = set()
+                results: list = []
+                for raw in codes:
+                    c = raw.strip().upper()
+                    if c and c in got and c not in seen:
+                        seen.add(c)
+                        results.append((c, got[c]))
 
                 out_path = excel_io.build_zenith_pnr_bulk_output_path(out_folder)
                 excel_io.write_zenith_pnr_bulk(out_path, results, errors=errors)
@@ -5768,6 +5776,12 @@ class App:
                     "errors": len(errors),
                 }
                 self._post(MSG_ZENITH_BULK_DONE, summary)
+            except zenith_client.SessionExpiredError as exc:
+                self._post(
+                    MSG_ZENITH_BULK_ERROR,
+                    "Session expired — sign in again and re-run. PNRs already "
+                    f"fetched are cached and will be skipped. ({exc})",
+                )
             except Exception as exc:  # noqa: BLE001
                 log.exception("PNR bulk lookup failed")
                 self._post(

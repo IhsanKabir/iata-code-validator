@@ -334,3 +334,173 @@ def test_apply_pnr_enrichment_keeps_old_report_immutable() -> None:
     assert enriched is not report
     # Original trajectory still has empty customer_name.
     assert report.class_trajectories[0].customer_name == ""
+
+
+# ---------------------------------------------------------------------------
+# Network resilience — lookup_pnr retry ladder + concurrent lookup_many
+# ---------------------------------------------------------------------------
+
+import src.zenith_pnr_client as zpc  # noqa: E402
+from src.zenith_pnr_client import QUICK_SEARCH_URL  # noqa: E402
+
+
+class _Resp:
+    """Minimal stand-in for a requests.Response."""
+
+    def __init__(self, status_code: int = 200, text: str = "", url: str | None = None):
+        self.status_code = status_code
+        self.text = text
+        self.url = url or QUICK_SEARCH_URL
+
+
+class _Inner:
+    """Scripted requests.Session: each .get() pops the next queued item;
+    an Exception is raised, a _Resp is returned. Exhausted → repeat last."""
+
+    def __init__(self, items):
+        self._items = list(items)
+        self._last = self._items[-1] if self._items else _Resp()
+        self.headers: dict = {}
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        item = self._items.pop(0) if self._items else self._last
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _Sess:
+    """Stand-in for ZenithSession (only `.session` is used by lookup_pnr)."""
+
+    def __init__(self, inner: _Inner):
+        self.session = inner
+
+
+class TestLookupPnrRetry:
+    def _ok(self, pnr: str = "RETRY1") -> str:
+        return _build_dossier_html(pnr=pnr)
+
+    def test_retries_transient_504_then_succeeds(self, monkeypatch) -> None:
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        inner = _Inner([_Resp(504), _Resp(200, self._ok("RETRY1"))])
+        d = zpc.lookup_pnr(_Sess(inner), "RETRY1")
+        assert d.pnr_code == "RETRY1"
+        assert inner.calls == 2  # one retry recovered it
+
+    def test_persistent_5xx_raises_after_attempts(self, monkeypatch) -> None:
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        inner = _Inner([_Resp(504)])
+        with pytest.raises(zpc.ZenithError):
+            zpc.lookup_pnr(_Sess(inner), "X", max_attempts=3)
+        assert inner.calls == 3
+
+    def test_401_is_session_expired_and_not_retried(self) -> None:
+        inner = _Inner([_Resp(401)])
+        with pytest.raises(zpc.SessionExpiredError):
+            zpc.lookup_pnr(_Sess(inner), "X")
+        assert inner.calls == 1
+
+    def test_otds_redirect_is_session_expired(self) -> None:
+        inner = _Inner([_Resp(200, "dash", url="https://x/otds/index.asp")])
+        with pytest.raises(zpc.SessionExpiredError):
+            zpc.lookup_pnr(_Sess(inner), "X")
+        assert inner.calls == 1
+
+    def test_429_raises_rate_limited_after_attempts(self, monkeypatch) -> None:
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        inner = _Inner([_Resp(429)])
+        with pytest.raises(zpc.RateLimitedError):
+            zpc.lookup_pnr(_Sess(inner), "X", max_attempts=2)
+        assert inner.calls == 2
+
+    def test_network_error_retried_then_succeeds(self, monkeypatch) -> None:
+        import requests
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        inner = _Inner([requests.RequestException("boom"),
+                        _Resp(200, self._ok("NET001"))])
+        d = zpc.lookup_pnr(_Sess(inner), "NET001")
+        assert d.pnr_code == "NET001"
+        assert inner.calls == 2
+
+    def test_unknown_pnr_not_retried(self) -> None:
+        inner = _Inner([_Resp(200, "<html>dashboard only</html>")])
+        with pytest.raises(zpc.PNRNotFoundError):
+            zpc.lookup_pnr(_Sess(inner), "X")
+        assert inner.calls == 1  # NOT_FOUND is terminal, not a transient
+
+
+class TestLookupMany:
+    def test_collects_ok_notfound_error_via_on_result(self, monkeypatch) -> None:
+        def fake(_session, code, **_kw):
+            if code == "NOPE01":
+                raise zpc.PNRNotFoundError("x")
+            if code == "ERR001":
+                raise zpc.ZenithError("500 boom")
+            return parse_dossier_html(_build_dossier_html(pnr=code))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", fake)
+        seen: dict = {}
+        out = zpc.lookup_many(
+            object(), ["AAA111", "NOPE01", "ERR001", "BBB222"],
+            concurrency=2, delay_s=0.0,
+            on_result=lambda c, d, s: seen.__setitem__(c, s),
+        )
+        assert set(out) == {"AAA111", "BBB222"}
+        assert seen["AAA111"] == "OK"
+        assert seen["NOPE01"] == "NOT_FOUND"
+        assert seen["ERR001"].startswith("ERROR")
+
+    def test_skip_cached_short_circuits_network(self, monkeypatch) -> None:
+        fetched: list = []
+
+        def fake(_session, code, **_kw):
+            fetched.append(code)
+            return parse_dossier_html(_build_dossier_html(pnr=code))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", fake)
+        cached = parse_dossier_html(_build_dossier_html(pnr="HIT001"))
+        out = zpc.lookup_many(
+            object(), ["HIT001", "MISS01"], concurrency=1, delay_s=0.0,
+            skip_cached=lambda c: cached if c == "HIT001" else None,
+        )
+        assert "HIT001" not in fetched  # served from cache, never fetched
+        assert "MISS01" in fetched
+        assert out["HIT001"].pnr_code == "HIT001"
+
+    def test_governor_aborts_on_sustained_5xx(self, monkeypatch) -> None:
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        calls = {"n": 0}
+
+        def boom(_session, _code, **_kw):
+            calls["n"] += 1
+            raise zpc.ZenithError("504")
+
+        monkeypatch.setattr(zpc, "lookup_pnr", boom)
+        codes = [f"P{i:04d}" for i in range(60)]
+        out = zpc.lookup_many(object(), codes, concurrency=3, delay_s=0.0)
+        assert out == {}
+        # The breaker stops the run well before all 60 are attempted.
+        assert calls["n"] < 60
+
+    def test_session_loss_raises_after_checkpointing(self, monkeypatch) -> None:
+        def fake(_session, code, **_kw):
+            if code == "DEAD01":
+                raise zpc.SessionExpiredError("gone")
+            return parse_dossier_html(_build_dossier_html(pnr=code))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", fake)
+        seen: list = []
+        with pytest.raises(zpc.SessionExpiredError):
+            zpc.lookup_many(
+                object(), ["AAA111", "DEAD01", "BBB222", "CCC333"],
+                concurrency=1, delay_s=0.0,
+                on_result=lambda c, d, s: seen.append((c, s)),
+            )
+        # Whatever resolved before the session died was reported (so the
+        # caller's cache.put already checkpointed it → resume-safe).
+        assert ("AAA111", "OK") in seen
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert zpc.lookup_many(object(), [], concurrency=3) == {}
