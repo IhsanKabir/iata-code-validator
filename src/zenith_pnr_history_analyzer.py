@@ -192,12 +192,16 @@ def _is_off_hours(ts: datetime | None) -> bool:
     return h >= OFF_HOURS_START or h < OFF_HOURS_END
 
 
-def _excluded(event: HistoryEvent, whitelist: set[str]) -> bool:
+def _excluded_actor(agent, whitelist: set[str]) -> bool:
     """Only purely-automated actors (System/TTI, WEB) and explicitly whitelisted user_ids
     are dropped. Agency / OTA-api / GDS logins are KEPT (tagged) so external abuse still
     surfaces — they are separated in the output, not hidden."""
-    a = event.agent
-    return classify_actor(a) in _EXCLUDED_ACTOR_TYPES or bool(a.user_id and a.user_id in whitelist)
+    return classify_actor(agent) in _EXCLUDED_ACTOR_TYPES or bool(
+        agent.user_id and agent.user_id in whitelist)
+
+
+def _excluded(event: HistoryEvent, whitelist: set[str]) -> bool:
+    return _excluded_actor(event.agent, whitelist)
 
 
 def _evidence(event: HistoryEvent) -> str:
@@ -431,4 +435,117 @@ def run_pnr_misuse_audit(
         flown_events=flown_events,
         real_ticket_groups=real_groups,
         fallback_groups=len(groups) - real_groups,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — payment / contact detectors on the per-PNR DOSSIER events
+# (signals the flight ModificationHistory corpus cannot see). Input is a stream of
+# zenith_pnr_history_parser.DossierEvent (duck-typed: .agent .pnr .dossier_id .timestamp
+# .payment_txn_id .contact_changed .contact_new .is_reissue .raw_description).
+# ---------------------------------------------------------------------------
+PAYMENT_TXN_REUSE_MIN_PNRS = 2     # same transaction id across >= this many PNRs
+CONTACT_FUNNEL_MIN_PNRS = 5        # one contact value across >= this many PNRs
+
+
+@dataclass(frozen=True)
+class DossierAuditReport:
+    event_count: int
+    pnr_count: int
+    dossier_count: int
+    flags: tuple[PNRFlag, ...]
+    risk_worklist: tuple[RiskRow, ...]
+    payments_seen: int = 0
+    contacts_changed: int = 0
+    reissues_seen: int = 0
+    distinct_txn: int = 0
+
+
+def _dossier_evidence(e) -> str:
+    when = e.timestamp.strftime("%d/%m/%Y %H:%M") if e.timestamp else e.raw_date
+    return (f"{when} · {e.agent.user_id or '?'} · PNR {e.pnr} · "
+            f"{e.raw_description[:120]}").strip()
+
+
+def detect_payment_contact_flags(events, *, whitelist: set[str]) -> list[PNRFlag]:
+    """Payment-txn reuse + contact churn/funnel from the dossier comment signals."""
+    evs = [e for e in events if not _excluded_actor(e.agent, whitelist)]
+    flags: list[PNRFlag] = []
+
+    # 1) Payment transaction-id reuse — one payment claimed against several PNRs/logins.
+    by_txn: dict[str, list] = defaultdict(list)
+    for e in evs:
+        if e.payment_txn_id:
+            by_txn[e.payment_txn_id].append(e)
+    for txn, tevs in by_txn.items():
+        pnrs = sorted({e.pnr for e in tevs if e.pnr})
+        agents = sorted({e.agent.user_id for e in tevs if e.agent.user_id})
+        if len(pnrs) >= PAYMENT_TXN_REUSE_MIN_PNRS:
+            ex = tevs[0]
+            multi_agent = len(agents) > 1
+            extra = f" across {len(agents)} logins" if multi_agent else ""
+            flags.append(PNRFlag(
+                detector="payment_txn_reuse",
+                severity="critical" if (len(pnrs) >= 3 or multi_agent) else "high",
+                confidence=0.8, pnr="(multiple)", ticket_number=txn,
+                agent_user_id="(multiple)" if multi_agent else (agents[0] if agents else ""),
+                agent_department=ex.agent.department, timestamp=ex.timestamp,
+                reason=f"Payment txn {txn} on {len(pnrs)} PNRs ({', '.join(pnrs[:6])}){extra} "
+                       "— verify it isn't one payment reused (or a legitimate group booking).",
+                evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
+
+    # 2) Contact churn — a PNR whose passenger contact is changed (old!=new) repeatedly.
+    by_pnr: dict[str, list] = defaultdict(list)
+    for e in evs:
+        if e.contact_changed and e.pnr:
+            by_pnr[e.pnr].append(e)
+    for pnr, cevs in by_pnr.items():
+        if len(cevs) >= REPEATED_CHANGE_MIN:
+            ex = cevs[-1]
+            flags.append(PNRFlag(
+                detector="contact_churn", severity="medium", confidence=0.7,
+                pnr=pnr, ticket_number="", agent_user_id=ex.agent.user_id,
+                agent_department=ex.agent.department, timestamp=ex.timestamp,
+                reason=f"Passenger contact changed {len(cevs)}x on {pnr} — verify (resale / handover).",
+                evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
+
+    # 3) Contact funnel — one contact value across many unrelated PNRs (broker funnel).
+    by_contact: dict[str, set] = defaultdict(set)
+    contact_ex: dict[str, object] = {}
+    for e in evs:
+        if e.contact_new and e.pnr:
+            by_contact[e.contact_new].add(e.pnr)
+            contact_ex.setdefault(e.contact_new, e)
+    for contact, pnrs in by_contact.items():
+        if len(pnrs) >= CONTACT_FUNNEL_MIN_PNRS:
+            ex = contact_ex[contact]
+            flags.append(PNRFlag(
+                detector="contact_funnel", severity="medium", confidence=0.6,
+                pnr="(multiple)", ticket_number="", agent_user_id=ex.agent.user_id,
+                agent_department=ex.agent.department, timestamp=ex.timestamp,
+                reason=f"One contact appears on {len(pnrs)} PNRs — possible broker funnel.",
+                evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
+
+    flags.sort(key=lambda f: ({"critical": 0, "high": 1, "medium": 2, "low": 3}.get(f.severity, 4),
+                              f.timestamp or datetime.min))
+    return flags
+
+
+def run_dossier_audit(events, *, whitelist_user_ids: Iterable[str] = ()) -> DossierAuditReport:
+    """Audit dossier CHANGES events for payment-txn reuse + contact churn/funnel."""
+    evs = list(events)
+    whitelist = {u for u in whitelist_user_ids if u}
+    flags = detect_payment_contact_flags(evs, whitelist=whitelist)
+    worklist = (_score_grain("pnr", lambda f: f.pnr, flags)
+                + _score_grain("agent", lambda f: f.agent_user_id, flags))
+    worklist.sort(key=lambda r: r.score, reverse=True)
+    return DossierAuditReport(
+        event_count=len(evs),
+        pnr_count=len({e.pnr for e in evs if e.pnr}),
+        dossier_count=len({e.dossier_id for e in evs if e.dossier_id}),
+        flags=tuple(flags), risk_worklist=tuple(worklist),
+        payments_seen=sum(1 for e in evs if e.payment_txn_id),
+        contacts_changed=sum(1 for e in evs if e.contact_changed),
+        reissues_seen=sum(1 for e in evs if e.is_reissue),
+        distinct_txn=len({e.payment_txn_id for e in evs if e.payment_txn_id}),
     )

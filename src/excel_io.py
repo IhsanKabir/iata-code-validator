@@ -1680,6 +1680,71 @@ def build_zenith_pnr_misuse_output_path(folder: Path) -> Path:
     return folder / f"zenith_pnr_misuse_audit_{timestamp}.xlsx"
 
 
+def write_zenith_dossier_audit(path: Path, report) -> None:
+    """Workbook for the Phase-2 dossier audit (payment-txn reuse + contact churn/funnel).
+
+    Sheets: Cover | Risk Worklist | Flags. Flags are decision-support leads needing human
+    verification (group bookings / family contacts / central desks can produce them), NOT
+    determinations — the Cover says so.
+    """
+    wb = Workbook()
+    cover = wb.active
+    cover.title = "Cover"
+    cover.append(["Zenith PNR Dossier Audit — payment / contact "
+                  "(decision-support — verify before any action)"])
+    cover.append([])
+    cover.append(["Dossier events analysed", report.event_count])
+    cover.append(["PNRs", report.pnr_count])
+    cover.append(["Dossiers", report.dossier_count])
+    cover.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    cover.append([])
+    cover.append(["Coverage"])
+    cover.append(["Payment events seen", getattr(report, "payments_seen", 0)])
+    cover.append(["Distinct transaction ids", getattr(report, "distinct_txn", 0)])
+    cover.append(["Contact changes seen", getattr(report, "contacts_changed", 0)])
+    cover.append(["Reissues (coupon I->E) seen", getattr(report, "reissues_seen", 0)])
+    cover.append([])
+    sev_counts: dict[str, int] = {}
+    for f in report.flags:
+        sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+    cover.append(["Flags by severity"])
+    for sev in ("critical", "high", "medium", "low"):
+        if sev_counts.get(sev):
+            cover.append([sev, sev_counts[sev]])
+    cover.append([])
+    cover.append(["NOTE: leads needing human verification. A shared transaction id can be a"])
+    cover.append(["legitimate group booking; a shared contact can be a family or an agency desk."])
+
+    ws = wb.create_sheet("Risk Worklist")
+    ws.append(["Rank", "Grain", "Actor Type", "Entity", "Score", "Flags", "Families", "Top reasons"])
+    for rank, r in enumerate(report.risk_worklist, start=1):
+        ws.append([
+            rank, r.grain, getattr(r, "actor_type", ""), r.entity, r.score, r.flag_count,
+            ", ".join(r.families), "  •  ".join(r.top_reasons),
+        ])
+
+    ws = wb.create_sheet("Flags")
+    ws.append([
+        "Severity", "Confidence", "Detector", "Actor Type", "PNR", "Txn / Key",
+        "Agent User ID", "Department", "Timestamp", "Reason", "Evidence",
+    ])
+    for f in report.flags:
+        ws.append([
+            f.severity, f.confidence, f.detector, getattr(f, "actor_type", ""), f.pnr,
+            f.ticket_number, f.agent_user_id, f.agent_department,
+            f.timestamp.strftime("%Y-%m-%d %H:%M") if f.timestamp else "",
+            f.reason, f.evidence,
+        ])
+
+    wb.save(path)
+
+
+def build_zenith_dossier_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"zenith_dossier_audit_{timestamp}.xlsx"
+
+
 # ---------------------------------------------------------------------------
 # Zenith Bulk PNR Lookup
 # ---------------------------------------------------------------------------

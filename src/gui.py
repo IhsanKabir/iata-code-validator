@@ -39,10 +39,12 @@ from . import (
     oep_client, oep_presets, traffic_client, updater, zenith_client,
     zenith_history_analyzer, zenith_history_downloader, zenith_history_parser,
     zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
+    zenith_pnr_history_downloader,
 )
 from .mailer_log import MailerLog
 from .traffic_sources import SOURCES as TRAFFIC_SOURCES
 from .zenith_pnr_cache import ZenithPNRCache
+from .zenith_pnr_history_cache import ZenithPNRHistoryCache
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
 from .bd_cache import BDAgencyCache
 from .zenith_cache import ZenithCache
@@ -114,6 +116,9 @@ MSG_ZENITH_FH_DONE = "zenith_fh_done"          # payload: HistoryAuditReport
 MSG_ZENITH_FH_ERROR = "zenith_fh_error"
 MSG_ZENITH_PNRMISUSE_DONE = "zenith_pnrmisuse_done"    # payload: summary dict
 MSG_ZENITH_PNRMISUSE_ERROR = "zenith_pnrmisuse_error"  # payload: str
+MSG_ZENITH_DOSSIER_DONE = "zenith_dossier_done"        # payload: summary dict
+MSG_ZENITH_DOSSIER_ERROR = "zenith_dossier_error"      # payload: str
+MSG_ZENITH_DOSSIER_PROGRESS = "zenith_dossier_progress"  # payload: (i, n, pnr)
 # Zenith Flight History downloader (Phase 3)
 MSG_ZENITH_DL_STATUS = "zenith_dl_status"      # payload: str (status line)
 MSG_ZENITH_DL_PROGRESS = "zenith_dl_progress"  # (i, total, label, status_code)
@@ -3939,6 +3944,42 @@ class App:
             self.btn_zenith_fh_run.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("PNR Misuse audit — Error", str(payload))
+        # ----- PNR Dossier audit (Phase 2: payment / contact) -----
+        elif kind == MSG_ZENITH_DOSSIER_PROGRESS:
+            i, n, pnr = payload
+            self.zenith_bulk_progress.configure(value=i, maximum=max(n, 1))
+            self.zenith_bulk_status_label.configure(text=f"Dossier {i}/{n}: {pnr}")
+        elif kind == MSG_ZENITH_DOSSIER_DONE:
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_dossier.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            p = payload
+            note = " (stopped early)" if p.get("aborted") else ""
+            self.zenith_bulk_status_label.configure(
+                text=f"Dossier audit: {p['flags']} flag(s) → {Path(p['path']).name}{note}")
+            self._zenith_bulk_log_line(
+                f"Done{note}: {p['events']} events, {p['pnrs']} PNRs · "
+                f"scraped {p['scraped']}, cached {p['cached']}, failed {p['failed']} · "
+                f"{p['flags']} flags (crit {p['critical']}, high {p['high']}), "
+                f"{p['txn']} distinct txn")
+            if messagebox.askyesno(
+                    "Dossier audit",
+                    f"Scraped {p['pnrs']:,} PNRs ({p['scraped']} live, {p['cached']} cached, "
+                    f"{p['failed']} failed){note}.\n"
+                    f"Flags: {p['flags']} (critical {p['critical']}, high {p['high']}); "
+                    f"{p['txn']} distinct transaction ids.\n\nSaved to:\n{p['path']}\n\n"
+                    "Flags are review leads, not findings. Open the workbook now?"):
+                try:
+                    import os
+                    os.startfile(p["path"])  # noqa: S606
+                except Exception:  # noqa: BLE001
+                    pass
+        elif kind == MSG_ZENITH_DOSSIER_ERROR:
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_dossier.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            self.zenith_bulk_status_label.configure(text=f"⚠ {payload}")
+            messagebox.showerror("Dossier audit — Error", str(payload))
         # ----- Flight History downloader (Phase 3) -----
         elif kind == MSG_ZENITH_DL_STATUS:
             self.zenith_fh_status_label.configure(text=str(payload))
@@ -5500,6 +5541,11 @@ class App:
             state="disabled", style="Danger.TButton",
         )
         self.btn_zenith_bulk_stop.pack(side="left", padx=(8, 0))
+        self.btn_zenith_dossier = ttk.Button(
+            ctl, text="Dossier audit (payment/contact)",
+            command=self._zenith_dossier_run,
+        )
+        self.btn_zenith_dossier.pack(side="left", padx=(8, 0))
         self.zenith_bulk_status_label = ttk.Label(
             ctl,
             text="Pick an Excel above, then Look up PNRs.",
@@ -5662,6 +5708,83 @@ class App:
     def _zenith_bulk_stop(self) -> None:
         self._zenith_bulk_stop_flag.set()
         self.zenith_bulk_status_label.configure(text="Stopping…")
+
+    def _zenith_dossier_run(self) -> None:
+        """Phase-2 dossier audit: scrape each PNR's CHANGES history for payment-txn reuse
+        and contact churn/funnel. Reuses this tab's input Excel + session + output folder."""
+        if not getattr(self, "_zenith_session", None):
+            messagebox.showerror("Dossier audit", "Sign in to Zenith first (top of this tab).")
+            return
+        if self._zenith_bulk_worker and self._zenith_bulk_worker.is_alive():
+            messagebox.showinfo("Dossier audit", "A job is already running on this tab.")
+            return
+        input_path = self.zenith_bulk_input_path.get().strip()
+        if not input_path or not Path(input_path).is_file():
+            messagebox.showerror(
+                "Dossier audit", f"Pick a valid Excel of PNRs first.\nCurrent: {input_path!r}")
+            return
+        out_folder = Path(self.zenith_bulk_output_dir.get().strip() or str(Path.home()))
+        sheet = self.zenith_bulk_sheet_name.get().strip() or None
+        column = self.zenith_bulk_column_name.get().strip() or None
+        try:
+            codes = excel_io.read_pnr_codes_from_excel(
+                Path(input_path), sheet_name=sheet, column_name=column)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Dossier audit", f"Couldn't read the input Excel:\n{type(exc).__name__}: {exc}")
+            return
+        if not codes:
+            messagebox.showerror(
+                "Dossier audit", f"No PNRs found in column {column!r} of {Path(input_path).name}.")
+            return
+        if not messagebox.askyesno(
+            "Dossier audit",
+            f"Scrape dossier payment/contact history for {len(codes)} PNRs from Zenith?\n\n"
+            f"~2 requests per uncached PNR (budget {config.PNR_HISTORY_MAX_REQUESTS}); "
+            "cached locally so re-runs are cheap.\n\nFlags are review leads, not findings."):
+            return
+
+        self.zenith_bulk_log.configure(state="normal")
+        self.zenith_bulk_log.delete("1.0", "end")
+        self.zenith_bulk_log.configure(state="disabled")
+        self._zenith_bulk_log_line(f"Dossier audit: scraping {len(codes)} PNRs…")
+        self._zenith_bulk_stop_flag.clear()
+        self.btn_zenith_bulk_run.configure(state="disabled")
+        self.btn_zenith_dossier.configure(state="disabled")
+        self.btn_zenith_bulk_stop.configure(state="normal")
+        self.zenith_bulk_progress.configure(value=0, maximum=len(codes))
+        self.zenith_bulk_status_label.configure(text=f"Scraping {len(codes)} dossiers…")
+
+        sess = self._zenith_session
+        stop = self._zenith_bulk_stop_flag
+
+        def worker() -> None:
+            try:
+                cache = ZenithPNRHistoryCache(config.ZENITH_PNR_HISTORY_CACHE_DB)
+                events, stats = zenith_pnr_history_downloader.scrape_dossier_events(
+                    sess, codes, cache=cache, stop_flag=stop.is_set,
+                    progress_cb=lambda i, n, pnr: self._post(
+                        MSG_ZENITH_DOSSIER_PROGRESS, (i, n, pnr)))
+                report = zenith_pnr_history_analyzer.run_dossier_audit(events)
+                out_path = excel_io.build_zenith_dossier_output_path(out_folder)
+                excel_io.write_zenith_dossier_audit(out_path, report)
+                sev: dict[str, int] = {}
+                for f in report.flags:
+                    sev[f.severity] = sev.get(f.severity, 0) + 1
+                self._post(MSG_ZENITH_DOSSIER_DONE, {
+                    "path": str(out_path), "events": report.event_count,
+                    "pnrs": report.pnr_count, "flags": len(report.flags),
+                    "critical": sev.get("critical", 0), "high": sev.get("high", 0),
+                    "txn": report.distinct_txn, "scraped": stats.scraped,
+                    "cached": stats.from_cache, "failed": stats.failed,
+                    "aborted": stats.aborted,
+                })
+            except Exception as exc:  # noqa: BLE001 — surface to UI
+                log.exception("dossier audit failed")
+                self._post(MSG_ZENITH_DOSSIER_ERROR, f"{type(exc).__name__}: {exc}")
+
+        self._zenith_bulk_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_bulk_worker.start()
 
     def _zenith_bulk_run(self) -> None:
         if not getattr(self, "_zenith_session", None):
