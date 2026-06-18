@@ -1607,6 +1607,23 @@ def write_zenith_pnr_misuse_audit(path: Path, report) -> None:
         if sev_counts.get(sev):
             cover.append([sev, sev_counts[sev]])
     cover.append([])
+    # Actor-type breakdown — internal staff vs external agency/OTA/GDS channels, so the
+    # two stories read separately instead of drowning each other out.
+    actor_flags: dict[str, int] = {}
+    for f in report.flags:
+        t = getattr(f, "actor_type", "") or "?"
+        actor_flags[t] = actor_flags.get(t, 0) + 1
+    actor_events: dict[str, int] = {}
+    for a in report.agent_activity:
+        t = getattr(a, "actor_type", "") or "?"
+        actor_events[t] = actor_events.get(t, 0) + a.total_events
+    cover.append(["Actor type", "Flags", "Events"])
+    for t in ("internal", "agency", "api", "gds", "web", "system"):
+        if actor_flags.get(t) or actor_events.get(t):
+            cover.append([t, actor_flags.get(t, 0), actor_events.get(t, 0)])
+    cover.append(["  'internal' = US-Bangla staff (office logins). agency / api / gds = external"])
+    cover.append(["  channels. Filter any sheet by Actor Type to read each separately."])
+    cover.append([])
     cover.append(["Corpus coverage"])
     cover.append(["Flown events seen", getattr(report, "flown_events", 0)])
     cover.append(["Real-ticket groups", getattr(report, "real_ticket_groups", 0)])
@@ -1620,35 +1637,36 @@ def write_zenith_pnr_misuse_audit(path: Path, report) -> None:
     cover.append(["group bookings, consolidators) can produce flags — review the evidence."])
 
     ws = wb.create_sheet("Risk Worklist")
-    ws.append(["Rank", "Grain", "Entity", "Score", "Flags", "Families", "Top reasons"])
+    ws.append(["Rank", "Grain", "Actor Type", "Entity", "Score", "Flags", "Families", "Top reasons"])
     for rank, r in enumerate(report.risk_worklist, start=1):
         ws.append([
-            rank, r.grain, r.entity, r.score, r.flag_count,
+            rank, r.grain, getattr(r, "actor_type", ""), r.entity, r.score, r.flag_count,
             ", ".join(r.families), "  •  ".join(r.top_reasons),
         ])
 
     ws = wb.create_sheet("Flags")
     ws.append([
-        "Severity", "Confidence", "Detector", "PNR", "Ticket Number",
+        "Severity", "Confidence", "Detector", "Actor Type", "PNR", "Ticket Number",
         "Agent User ID", "Department", "Timestamp", "Reason", "Evidence",
     ])
     for f in report.flags:
         ws.append([
-            f.severity, f.confidence, f.detector, f.pnr, f.ticket_number,
-            f.agent_user_id, f.agent_department,
+            f.severity, f.confidence, f.detector, getattr(f, "actor_type", ""), f.pnr,
+            f.ticket_number, f.agent_user_id, f.agent_department,
             f.timestamp.strftime("%Y-%m-%d %H:%M") if f.timestamp else "",
             f.reason, f.evidence,
         ])
 
     ws = wb.create_sheet("Agent Activity")
     ws.append([
-        "Agent User ID", "Display Name", "Department", "Total Events",
+        "Agent User ID", "Display Name", "Department", "Actor Type", "Total Events",
         "Issues", "Reissues", "Refunds", "Voids", "Downgrades",
         "Off-hours", "Distinct PNRs",
     ])
     for a in report.agent_activity:
         ws.append([
-            a.agent_user_id, a.agent_display_name, a.department, a.total_events,
+            a.agent_user_id, a.agent_display_name, a.department,
+            getattr(a, "actor_type", ""), a.total_events,
             a.issues, a.reissues, a.refunds, a.voids, a.downgrades,
             a.off_hours, a.distinct_pnrs,
         ])

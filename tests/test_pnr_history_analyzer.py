@@ -8,12 +8,18 @@ from datetime import datetime
 from src.zenith_history_parser import Agent, FlightRef, HistoryEvent
 from src.zenith_pnr_history_analyzer import (
     classify_action,
+    classify_actor,
     run_pnr_misuse_audit,
 )
 
 
 def _agent(uid="agt1", dept="DAC Sales", name="Agent One") -> Agent:
     return Agent(raw=f"{name} ({uid}/{dept})", display_name=name, user_id=uid, department=dept)
+
+
+def _ag(uid: str, dept: str) -> Agent:
+    raw = f"X ({uid}/{dept})" if dept else f"X ({uid})"
+    return Agent(raw=raw, display_name="X", user_id=uid, department=dept)
 
 
 _FLIGHT = FlightRef(raw="BS341 DAC DXB", flight_number="BS341", origin="DAC",
@@ -221,3 +227,54 @@ class TestFalsePositiveGuards:
         wb = load_workbook(out)
         assert wb.sheetnames == ["Cover", "Risk Worklist", "Flags", "Agent Activity"]
         assert wb["Flags"].max_row == 1        # header only, no crash on empty flags
+
+
+class TestActorType:
+    def test_internal_office_codes(self) -> None:
+        for dept in ("DAC-02 Customer Service", "BO-3 Revenue Management",
+                     "ZYL-2 Sylhet City", "CXB-1 Cox's Bazar", "DAC-17 Uttara USBA-Office"):
+            assert classify_actor(_ag("staff123", dept)) == "internal"
+
+    def test_gds_vendors(self) -> None:
+        assert classify_actor(_ag("Galileo 1GBS1G", "Galileo 1G 1G")) == "gds"
+        assert classify_actor(_ag("AbacusBS1B", "Abacus 1B")) == "gds"
+        assert classify_actor(_ag("Sabre 1SBS1S", "Sabre 1S 1S")) == "gds"
+
+    def test_api_and_agency_and_web(self) -> None:
+        assert classify_actor(_ag("API_TAKEOFF TRAVELS", "")) == "api"
+        assert classify_actor(_ag("api_triplover", "")) == "api"
+        assert classify_actor(_ag("Twenty", "")) == "agency"      # blank dept, human login
+        assert classify_actor(_ag("Salim@24", "")) == "agency"
+        assert classify_actor(_ag("webbot", "WEB")) == "web"
+
+    def test_system_actor(self) -> None:
+        sysag = Agent(raw="System (/TTI)", display_name="System", user_id="", department="")
+        assert classify_actor(sysag) == "system"
+
+    def test_flags_and_rows_carry_actor_type(self) -> None:
+        a = _ag("jahirul3188", "DAC-02 Customer Service")        # internal
+        rep = run_pnr_misuse_audit([_ev(new_status="Refunded", hour=20, agent=a)])  # 02:00 DAC
+        assert rep.flags and rep.flags[0].actor_type == "internal"
+        row = next(r for r in rep.agent_activity if r.agent_user_id == "jahirul3188")
+        assert row.actor_type == "internal"
+        ag_rows = [r for r in rep.risk_worklist if r.grain == "agent"]
+        assert ag_rows and ag_rows[0].actor_type == "internal"
+
+    def test_agency_abuse_still_surfaces(self) -> None:
+        # External agency login is NOT excluded — its off-hours void still flags, tagged agency.
+        rep = run_pnr_misuse_audit([_ev(new_status="Voided", hour=20, agent=_ag("Twenty", ""))])
+        assert any(f.actor_type == "agency" for f in rep.flags)
+
+    def test_web_and_system_actors_excluded(self) -> None:
+        assert run_pnr_misuse_audit(
+            [_ev(new_status="Refunded", hour=20, agent=_ag("webbot", "WEB"))]).flags == ()
+
+    def test_workbook_has_actor_type_columns(self, tmp_path) -> None:
+        from openpyxl import load_workbook
+        from src.excel_io import write_zenith_pnr_misuse_audit
+        rep = run_pnr_misuse_audit([_ev(new_status="Voided", hour=20, agent=_ag("Twenty", ""))])
+        out = tmp_path / "at.xlsx"
+        write_zenith_pnr_misuse_audit(out, rep)
+        wb = load_workbook(out)
+        for sheet in ("Flags", "Risk Worklist", "Agent Activity"):
+            assert "Actor Type" in [c.value for c in wb[sheet][1]]

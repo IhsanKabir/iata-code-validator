@@ -18,6 +18,7 @@ to the Phase-2 per-PNR dossier scrape; this module is the cheap, offline, first 
 """
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -45,6 +46,17 @@ REFUND_VOID_BURST_PER_DAY = 8  # >= this many refunds+voids by one agent in a da
 
 _SEV_WEIGHT = {"low": 1, "medium": 2, "high": 4, "critical": 8}
 
+# Actor classification (grounded + verified against the real corpus). US-Bangla staff
+# carry an office-code department (DAC-02 Customer Service, BO-3 Revenue Management,
+# ZYL-2 Sylhet City, DAC-17 Uttara USBA-Office, ...); GDS pseudo-cities carry a vendor
+# name; OTA pushes use an api_ login; the System (/TTI) actor + the WEB channel are
+# automated; a human login with no office is an external travel agency.
+_OFFICE_RE = re.compile(r"^[A-Z]{2,3}-\d")
+_GDS_VENDORS = ("galileo", "abacus", "sabre", "amadeus", "travelsky", "worldspan", "travelport")
+# Only purely-automated actors are dropped from detectors; agency/api/gds stay (tagged) so
+# external abuse (e.g. agency void-churning) still surfaces — they're separated, not hidden.
+_EXCLUDED_ACTOR_TYPES = frozenset({"system", "web"})
+
 # Coupon statuses, normalised.
 _REFUNDED = "refunded"
 _VOIDED = {"voided", "void", "cancelled", "canceled"}
@@ -69,6 +81,7 @@ class PNRFlag:
     timestamp: datetime | None
     reason: str                   # observation ("Refund on a coupon that was Flown — verify involuntary")
     evidence: str                 # the triggering event(s), verbatim-ish
+    actor_type: str = ""          # internal | agency | api | gds | web | system
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,7 @@ class AgentActivityRow:
     downgrades: int
     off_hours: int
     distinct_pnrs: int
+    actor_type: str = ""          # internal | agency | api | gds | web | system
 
 
 @dataclass(frozen=True)
@@ -94,6 +108,7 @@ class RiskRow:
     families: tuple[str, ...]     # distinct detectors that fired
     flag_count: int
     top_reasons: tuple[str, ...]
+    actor_type: str = ""          # dominant actor type among this entity's flags
 
 
 @dataclass(frozen=True)
@@ -141,6 +156,30 @@ def classify_action(event: HistoryEvent) -> str:
     return "modify"
 
 
+def classify_actor(agent) -> str:
+    """Tag a 'Created by' actor: internal | agency | api | gds | web | system.
+
+    See `_OFFICE_RE` / `_GDS_VENDORS` above for the grounding. The flag worklist is
+    tagged by this so internal-staff misuse and external agency/GDS abuse can be read
+    separately rather than drowning each other out.
+    """
+    dept = (agent.department or "").strip()
+    dl = dept.lower()
+    raw = (agent.raw or "").lower()
+    uid = (agent.user_id or "").strip()
+    if agent.is_system or dl == "tti" or not uid:
+        return "system"
+    if dl == "web" or uid.lower() == "web":
+        return "web"
+    if any(v in raw for v in _GDS_VENDORS):
+        return "gds"
+    if agent.is_api:
+        return "api"
+    if _OFFICE_RE.match(dept) or "usba" in dl:
+        return "internal"
+    return "agency"
+
+
 def _local(ts: datetime) -> datetime:
     """GMT/UTC corpus timestamp -> Asia/Dhaka local (for hour-of-day reasoning)."""
     return ts + timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
@@ -154,9 +193,11 @@ def _is_off_hours(ts: datetime | None) -> bool:
 
 
 def _excluded(event: HistoryEvent, whitelist: set[str]) -> bool:
-    """System/API logins and explicitly whitelisted user_ids don't generate flags."""
+    """Only purely-automated actors (System/TTI, WEB) and explicitly whitelisted user_ids
+    are dropped. Agency / OTA-api / GDS logins are KEPT (tagged) so external abuse still
+    surfaces — they are separated in the output, not hidden."""
     a = event.agent
-    return a.is_system or a.is_api or (a.user_id and a.user_id in whitelist)
+    return classify_actor(a) in _EXCLUDED_ACTOR_TYPES or bool(a.user_id and a.user_id in whitelist)
 
 
 def _evidence(event: HistoryEvent) -> str:
@@ -223,7 +264,7 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                     pnr=e.pnr, ticket_number=key, agent_user_id=e.agent.user_id,
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason="Refund on a coupon that was Flown — verify it isn't an involuntary refund.",
-                    evidence=_evidence(e)))
+                    evidence=_evidence(e), actor_type=classify_actor(e.agent)))
 
             if is_real_ticket and act in ("refund", "void") and e.agent.user_id in issuers:
                 flags.append(PNRFlag(
@@ -232,7 +273,7 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason=f"Same login ({e.agent.user_id}) both issued and {act}ed this ticket "
                            "(no segregation of duties).",
-                    evidence=_evidence(e)))
+                    evidence=_evidence(e), actor_type=classify_actor(e.agent)))
 
             if act in ("refund", "void") and _is_off_hours(e.timestamp):
                 flags.append(PNRFlag(
@@ -241,7 +282,7 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason=f"{act.title()} at {_local(e.timestamp).strftime('%H:%M')} DAC "
                            "(off-hours).",
-                    evidence=_evidence(e)))
+                    evidence=_evidence(e), actor_type=classify_actor(e.agent)))
 
             # Downgrade vs the previous NON-excluded class on a REAL ticket.
             if prev_rbd and e.rbd_class and prev_rbd != e.rbd_class:
@@ -256,7 +297,7 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                         agent_user_id=e.agent.user_id, agent_department=e.agent.department,
                         timestamp=e.timestamp,
                         reason=f"Class downgrade {prev_rbd}->{e.rbd_class} ({sev} tiers).",
-                        evidence=_evidence(e)))
+                        evidence=_evidence(e), actor_type=classify_actor(e.agent)))
             if e.rbd_class:
                 prev_rbd = e.rbd_class
 
@@ -271,7 +312,8 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                 agent_department=last.agent.department, timestamp=last.timestamp,
                 reason=f"{rbd_changes} class changes on one ticket by {len(rbd_agents)} agent(s) "
                        "— possible reissue churn.",
-                evidence=f"agents: {', '.join(sorted(rbd_agents))} · {_evidence(last)}"))
+                evidence=f"agents: {', '.join(sorted(rbd_agents))} · {_evidence(last)}",
+                actor_type=classify_actor(last.agent)))
 
     # Refund/void burst by one agent in a day (per-event; safe on any grouping).
     burst: Counter[tuple[str, str]] = Counter()
@@ -292,7 +334,7 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                 agent_department=ex.agent.department, timestamp=ex.timestamp,
                 reason=f"{n} refunds/voids by {uid} on {day} — verify "
                        "(central desks / group ops do this legitimately).",
-                evidence=_evidence(ex)))
+                evidence=_evidence(ex), actor_type=classify_actor(ex.agent)))
 
     flags.sort(key=lambda f: (
         {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(f.severity, 4),
@@ -329,6 +371,7 @@ def agent_activity(events: Iterable[HistoryEvent]) -> list[AgentActivityRow]:
             downgrades=downgrades,
             off_hours=sum(1 for e in evs if _is_off_hours(e.timestamp)),
             distinct_pnrs=len({e.pnr for e in evs if e.pnr}),
+            actor_type=classify_actor(evs[0].agent),
         ))
     rows.sort(key=lambda r: (r.refunds + r.voids, r.total_events), reverse=True)
     return rows
@@ -350,8 +393,10 @@ def _score_grain(grain: str, key_fn, flags: list[PNRFlag]) -> list[RiskRow]:
         top = tuple(f.reason for f in sorted(
             fs, key=lambda f: _SEV_WEIGHT.get(f.severity, 1) * f.confidence,
             reverse=True)[:3])
+        actor = Counter(f.actor_type for f in fs if f.actor_type).most_common(1)
         rows.append(RiskRow(grain=grain, entity=entity, score=round(score, 2),
-                            families=tuple(families), flag_count=len(fs), top_reasons=top))
+                            families=tuple(families), flag_count=len(fs), top_reasons=top,
+                            actor_type=actor[0][0] if actor else ""))
     return rows
 
 
