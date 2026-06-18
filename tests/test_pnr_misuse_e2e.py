@@ -53,8 +53,8 @@ def _make_corpus(tmp_path):
              _coupon("7792000000002", "T", "Option->Issued"), "SELF01"),
         _row("01/01/2026 13:00", "Sod Agent (sodagent)",
              _coupon("7792000000002", "T", "Issued->Refunded"), "SELF01"),
-        # 3. Off-hours refund at 02:15 — offagent
-        _row("02/01/2026 02:15", "Off Agent (offagent)",
+        # 3. Off-hours refund at 20:15 GMT == 02:15 DAC (corpus is GMT; DAC=+6) — offagent
+        _row("02/01/2026 20:15", "Off Agent (offagent)",
              _coupon("7792000000003", "G", "Issued->Refunded"), "OFFH01"),
         # 4. Steep class downgrade Y->G — dgagent
         _row("01/01/2026 09:00", "Dg Agent (dgagent)",

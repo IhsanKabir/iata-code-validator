@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from .zenith_history_parser import (
@@ -33,8 +33,13 @@ from .zenith_history_parser import (
 # Tunable thresholds (module-level so the GUI can override; baseline-calibration
 # replaces the count-based ones in a later pass — see plan).
 # ---------------------------------------------------------------------------
-OFF_HOURS_START = 23          # an event at/after 23:00 ...
-OFF_HOURS_END = 6             # ... or before 06:00 is "off hours"
+# Flight ModificationHistory is exported via `excel=1`, whose timestamps are GMT/UTC
+# (verified by the Step-0 probe + the corpus hour-histogram). US-Bangla operates in
+# Asia/Dhaka (UTC+6, no DST), so we localise before ANY hour-of-day reasoning — otherwise
+# "off-hours" fires on Dhaka morning business hours (e.g. 04:21 GMT == 10:21 DAC).
+LOCAL_UTC_OFFSET_HOURS = 6    # Asia/Dhaka, fixed (Bangladesh has no daylight saving)
+OFF_HOURS_START = 23          # an event at/after 23:00 LOCAL ...
+OFF_HOURS_END = 6             # ... or before 06:00 LOCAL is "off hours"
 REPEATED_CHANGE_MIN = 3       # >= this many RBD/class changes on one ticket
 REFUND_VOID_BURST_PER_DAY = 8  # >= this many refunds+voids by one agent in a day
 
@@ -136,10 +141,16 @@ def classify_action(event: HistoryEvent) -> str:
     return "modify"
 
 
+def _local(ts: datetime) -> datetime:
+    """GMT/UTC corpus timestamp -> Asia/Dhaka local (for hour-of-day reasoning)."""
+    return ts + timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
+
+
 def _is_off_hours(ts: datetime | None) -> bool:
     if ts is None:
         return False
-    return ts.hour >= OFF_HOURS_START or ts.hour < OFF_HOURS_END
+    h = _local(ts).hour
+    return h >= OFF_HOURS_START or h < OFF_HOURS_END
 
 
 def _excluded(event: HistoryEvent, whitelist: set[str]) -> bool:
@@ -228,7 +239,8 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
                     detector="off_hours_value", severity="medium", confidence=1.0,
                     pnr=e.pnr, ticket_number=key, agent_user_id=e.agent.user_id,
                     agent_department=e.agent.department, timestamp=e.timestamp,
-                    reason=f"{act.title()} at {e.timestamp.strftime('%H:%M')} (off-hours).",
+                    reason=f"{act.title()} at {_local(e.timestamp).strftime('%H:%M')} DAC "
+                           "(off-hours).",
                     evidence=_evidence(e)))
 
             # Downgrade vs the previous NON-excluded class on a REAL ticket.

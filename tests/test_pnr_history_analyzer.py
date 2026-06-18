@@ -66,12 +66,19 @@ class TestDetectors:
         assert sod and sod[0].agent_user_id == "same1"
 
     def test_off_hours_refund(self) -> None:
-        rep = run_pnr_misuse_audit([_ev(new_status="Refunded", hour=2)])
+        # Hours are GMT (corpus is excel-exported); DAC = +6. 20:00 GMT == 02:00 DAC = off-hours.
+        rep = run_pnr_misuse_audit([_ev(new_status="Refunded", hour=20)])
         assert "off_hours_value" in _detectors(rep)
 
     def test_business_hours_refund_not_off_hours(self) -> None:
-        rep = run_pnr_misuse_audit([_ev(new_status="Refunded", hour=14)])
+        # 06:00 GMT == 12:00 DAC = midday business hours.
+        rep = run_pnr_misuse_audit([_ev(new_status="Refunded", hour=6)])
         assert "off_hours_value" not in _detectors(rep)
+
+    def test_off_hours_uses_dhaka_local_not_gmt(self) -> None:
+        # Regression: 04:00 GMT == 10:00 DAC must NOT be off-hours (the v1.16.16 bug).
+        assert "off_hours_value" not in _detectors(
+            run_pnr_misuse_audit([_ev(new_status="Voided", hour=4)]))
 
     def test_downgrade_flagged_with_severity(self) -> None:
         evs = [
@@ -118,11 +125,11 @@ class TestRiskAndTrends:
         # One PNR/ticket lit by THREE families: flown->refund (crit), self-refund (high),
         # off-hours (med) — should top the worklist over a single-family PNR.
         hot = [
-            _ev(pnr="HOT001", new_status="Issued", agent=a, hour=2),
+            _ev(pnr="HOT001", new_status="Issued", agent=a, hour=20),
             _ev(pnr="HOT001", new_status="Flown", agent=a, hour=21, day=15),
-            _ev(pnr="HOT001", new_status="Refunded", agent=a, hour=2, day=16),
+            _ev(pnr="HOT001", new_status="Refunded", agent=a, hour=20, day=16),  # 02:00 DAC
         ]
-        mild = [_ev(pnr="MILD01", ticket="7792999999999", new_status="Refunded", hour=2)]
+        mild = [_ev(pnr="MILD01", ticket="7792999999999", new_status="Refunded", hour=20)]
         rep = run_pnr_misuse_audit(hot + mild)
         pnr_rows = [r for r in rep.risk_worklist if r.grain == "pnr"]
         assert pnr_rows[0].entity == "HOT001"
