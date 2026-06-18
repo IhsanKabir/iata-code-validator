@@ -100,6 +100,12 @@ class PNRMisuseReport:
     flags: tuple[PNRFlag, ...]
     agent_activity: tuple[AgentActivityRow, ...]
     risk_worklist: tuple[RiskRow, ...]   # PNR + agent grains, highest score first
+    # Corpus coverage — so the workbook can show whether the ticket-lifecycle detectors
+    # could even run. flown_events==0 means refund_of_flown is inactive on this corpus;
+    # a high fallback_groups share means most groups lacked a parseable ticket number.
+    flown_events: int = 0
+    real_ticket_groups: int = 0
+    fallback_groups: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -174,76 +180,88 @@ def _by_ticket(events: list[HistoryEvent]) -> dict[str, list[HistoryEvent]]:
 def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list[PNRFlag]:
     evs = [e for e in events if e.pnr]
     flags: list[PNRFlag] = []
-    by_ticket = _by_ticket(evs)
 
-    for ticket, tevs in by_ticket.items():
+    for key, tevs in _by_ticket(evs).items():
+        # A group keyed by a REAL ticket number is one coupon's lifecycle. A PNR-fallback
+        # group (the ticket number didn't parse) can span several passengers/tickets, so
+        # cross-lifecycle detectors (refund-of-flown, self-refund, downgrade, churn) would
+        # falsely link one passenger's flown coupon to another's refund — they only run on
+        # real-ticket groups. Per-event detectors (off-hours, burst) are safe on any group.
+        is_real_ticket = bool(tevs and tevs[0].ticket_number)
         actions = [classify_action(e) for e in tevs]
-        statuses = [(_norm(e.old_status), _norm(e.new_status)) for e in tevs]
-        flown_seen_idx = next(
-            (i for i, (o, n) in enumerate(statuses) if _FLOWN in (o, n)), None)
+        # Issuer set + flown index from NON-excluded events only — never attribute a
+        # system-set Flown or a whitelisted issue to a human refunder.
         issuers = {e.agent.user_id for e, a in zip(tevs, actions)
-                   if a == "issue" and e.agent.user_id}
-        rbd_changes = 0
+                   if a == "issue" and e.agent.user_id and not _excluded(e, whitelist)}
+        flown_idx = next((i for i, e in enumerate(tevs)
+                          if not _excluded(e, whitelist)
+                          and _FLOWN in (_norm(e.old_status), _norm(e.new_status))), None)
 
+        prev_rbd = ""
+        rbd_changes = 0
+        rbd_agents: set[str] = set()
         for i, (e, act) in enumerate(zip(tevs, actions)):
             if _excluded(e, whitelist):
+                if e.rbd_class:
+                    prev_rbd = e.rbd_class          # keep the class chain continuous
                 continue
 
-            # 1. Refund of a coupon that was Flown (critical, cross-event on ticket).
-            if act == "refund" and flown_seen_idx is not None and i >= flown_seen_idx:
+            if is_real_ticket and act == "refund" and flown_idx is not None and i >= flown_idx:
                 flags.append(PNRFlag(
-                    detector="refund_of_flown", severity="critical", confidence=0.9,
-                    pnr=e.pnr, ticket_number=ticket, agent_user_id=e.agent.user_id,
+                    detector="refund_of_flown", severity="critical", confidence=0.7,
+                    pnr=e.pnr, ticket_number=key, agent_user_id=e.agent.user_id,
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason="Refund on a coupon that was Flown — verify it isn't an involuntary refund.",
                     evidence=_evidence(e)))
 
-            # 2. Self-refund / segregation-of-duties: same agent issued AND refunded/voided.
-            if act in ("refund", "void") and e.agent.user_id in issuers:
+            if is_real_ticket and act in ("refund", "void") and e.agent.user_id in issuers:
                 flags.append(PNRFlag(
                     detector="self_refund_sod", severity="high", confidence=1.0,
-                    pnr=e.pnr, ticket_number=ticket, agent_user_id=e.agent.user_id,
+                    pnr=e.pnr, ticket_number=key, agent_user_id=e.agent.user_id,
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason=f"Same login ({e.agent.user_id}) both issued and {act}ed this ticket "
                            "(no segregation of duties).",
                     evidence=_evidence(e)))
 
-            # 3. Off-hours value-moving event (refund/void outside shift hours).
             if act in ("refund", "void") and _is_off_hours(e.timestamp):
                 flags.append(PNRFlag(
                     detector="off_hours_value", severity="medium", confidence=1.0,
-                    pnr=e.pnr, ticket_number=ticket, agent_user_id=e.agent.user_id,
+                    pnr=e.pnr, ticket_number=key, agent_user_id=e.agent.user_id,
                     agent_department=e.agent.department, timestamp=e.timestamp,
                     reason=f"{act.title()} at {e.timestamp.strftime('%H:%M')} (off-hours).",
                     evidence=_evidence(e)))
 
-            # 4. Downgrade across consecutive RBD on the ticket (severity-scaled).
-            if i > 0:
-                prev = tevs[i - 1]
-                if prev.rbd_class and e.rbd_class and prev.rbd_class != e.rbd_class:
-                    rbd_changes += 1
-                    sev = downgrade_severity(prev.rbd_class, e.rbd_class)
-                    if sev > 0:
-                        flags.append(PNRFlag(
-                            detector="downgrade", severity="high" if sev >= 6 else "medium",
-                            confidence=1.0, pnr=e.pnr, ticket_number=ticket,
-                            agent_user_id=e.agent.user_id, agent_department=e.agent.department,
-                            timestamp=e.timestamp,
-                            reason=f"Class downgrade {prev.rbd_class}->{e.rbd_class} ({sev} tiers).",
-                            evidence=_evidence(e)))
+            # Downgrade vs the previous NON-excluded class on a REAL ticket.
+            if prev_rbd and e.rbd_class and prev_rbd != e.rbd_class:
+                rbd_changes += 1
+                if e.agent.user_id:
+                    rbd_agents.add(e.agent.user_id)
+                sev = downgrade_severity(prev_rbd, e.rbd_class)
+                if is_real_ticket and sev > 0:
+                    flags.append(PNRFlag(
+                        detector="downgrade", severity="high" if sev >= 6 else "medium",
+                        confidence=1.0, pnr=e.pnr, ticket_number=key,
+                        agent_user_id=e.agent.user_id, agent_department=e.agent.department,
+                        timestamp=e.timestamp,
+                        reason=f"Class downgrade {prev_rbd}->{e.rbd_class} ({sev} tiers).",
+                        evidence=_evidence(e)))
+            if e.rbd_class:
+                prev_rbd = e.rbd_class
 
-        # 5. Repeated class changes on one ticket (reissue churn proxy).
-        if rbd_changes >= REPEATED_CHANGE_MIN:
-            last = tevs[-1]
-            if not _excluded(last, whitelist):
-                flags.append(PNRFlag(
-                    detector="repeated_class_change", severity="high", confidence=0.7,
-                    pnr=last.pnr, ticket_number=ticket, agent_user_id=last.agent.user_id,
-                    agent_department=last.agent.department, timestamp=last.timestamp,
-                    reason=f"{rbd_changes} class changes on one ticket — possible reissue churn.",
-                    evidence=_evidence(last)))
+        # Repeated class changes on one ticket — attribute to the agent(s) who drove it.
+        if is_real_ticket and rbd_changes >= REPEATED_CHANGE_MIN:
+            last = next((e for e in reversed(tevs) if not _excluded(e, whitelist)), tevs[-1])
+            multi = len(rbd_agents) > 1
+            flags.append(PNRFlag(
+                detector="repeated_class_change", severity="high", confidence=0.7,
+                pnr=last.pnr, ticket_number=key,
+                agent_user_id="(multiple)" if multi else next(iter(rbd_agents), last.agent.user_id),
+                agent_department=last.agent.department, timestamp=last.timestamp,
+                reason=f"{rbd_changes} class changes on one ticket by {len(rbd_agents)} agent(s) "
+                       "— possible reissue churn.",
+                evidence=f"agents: {', '.join(sorted(rbd_agents))} · {_evidence(last)}"))
 
-    # 6. Refund/void burst by one agent in a day.
+    # Refund/void burst by one agent in a day (per-event; safe on any grouping).
     burst: Counter[tuple[str, str]] = Counter()
     burst_ex: dict[tuple[str, str], HistoryEvent] = {}
     for e in evs:
@@ -257,10 +275,11 @@ def detect_flags(events: Iterable[HistoryEvent], *, whitelist: set[str]) -> list
         if n >= REFUND_VOID_BURST_PER_DAY:
             ex = burst_ex[(uid, day)]
             flags.append(PNRFlag(
-                detector="refund_void_burst", severity="high", confidence=0.8,
+                detector="refund_void_burst", severity="medium", confidence=0.7,
                 pnr="(multiple)", ticket_number="(multiple)", agent_user_id=uid,
                 agent_department=ex.agent.department, timestamp=ex.timestamp,
-                reason=f"{n} refunds/voids by {uid} on {day}.",
+                reason=f"{n} refunds/voids by {uid} on {day} — verify "
+                       "(central desks / group ops do this legitimately).",
                 evidence=_evidence(ex)))
 
     flags.sort(key=lambda f: (
@@ -281,14 +300,13 @@ def agent_activity(events: Iterable[HistoryEvent]) -> list[AgentActivityRow]:
     for uid, evs in by_agent.items():
         acts = Counter(classify_action(e) for e in evs)
         downgrades = 0
-        for tevs in _by_ticket(evs).values():
+        reissues = 0
+        for tevs in _by_ticket(evs).values():       # one pass: count both
             for prev, curr in zip(tevs, tevs[1:]):
-                if is_downgrade(prev.rbd_class, curr.rbd_class):
-                    downgrades += 1
-        reissues = sum(
-            1 for tevs in _by_ticket(evs).values()
-            for prev, curr in zip(tevs, tevs[1:])
-            if prev.rbd_class and curr.rbd_class and prev.rbd_class != curr.rbd_class)
+                if prev.rbd_class and curr.rbd_class and prev.rbd_class != curr.rbd_class:
+                    reissues += 1
+                    if is_downgrade(prev.rbd_class, curr.rbd_class):
+                        downgrades += 1
         rows.append(AgentActivityRow(
             agent_user_id=uid,
             agent_display_name=evs[0].agent.display_name,
@@ -314,8 +332,9 @@ def _score_grain(grain: str, key_fn, flags: list[PNRFlag]) -> list[RiskRow]:
     for entity, fs in groups.items():
         base = sum(_SEV_WEIGHT.get(f.severity, 1) * f.confidence for f in fs)
         families = sorted({f.detector for f in fs})
-        # Cross-family corroboration: many distinct detectors > one noisy one.
-        score = base * (1.0 + 0.5 * (len(families) - 1))
+        # Cross-family corroboration: many distinct detectors > one noisy one. Capped so
+        # an entity lit by overlapping detectors on the same events can't run away.
+        score = base * min(2.0, 1.0 + 0.5 * (len(families) - 1))
         top = tuple(f.reason for f in sorted(
             fs, key=lambda f: _SEV_WEIGHT.get(f.severity, 1) * f.confidence,
             reverse=True)[:3])
@@ -340,6 +359,10 @@ def run_pnr_misuse_audit(
     worklist.sort(key=lambda r: r.score, reverse=True)
 
     times = [e.timestamp for e in evs if e.timestamp]
+    groups = _by_ticket([e for e in evs if e.pnr])
+    real_groups = sum(1 for g in groups.values() if g and g[0].ticket_number)
+    flown_events = sum(
+        1 for e in evs if _FLOWN in (_norm(e.old_status), _norm(e.new_status)))
     return PNRMisuseReport(
         event_count=len(evs),
         pnr_count=len({e.pnr for e in evs if e.pnr}),
@@ -348,4 +371,7 @@ def run_pnr_misuse_audit(
         flags=tuple(flags),
         agent_activity=tuple(activity),
         risk_worklist=tuple(worklist),
+        flown_events=flown_events,
+        real_ticket_groups=real_groups,
+        fallback_groups=len(groups) - real_groups,
     )

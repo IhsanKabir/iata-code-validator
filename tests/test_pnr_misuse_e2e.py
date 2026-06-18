@@ -25,7 +25,9 @@ def _row(date, by, desc, pnr, flight="BS 100 DAC DXB 01/01/2026 19:00",
 
 
 def _coupon(ticket, rbd, status) -> str:
-    return (f"Coupon information: [x] {ticket}C1 BS 100 /{rbd} DAC DXB 01/01/2026 "
+    # Bare 13-digit ticket (word-bounded) so _TICKET_NUMBER_RE extracts it and the
+    # group is a REAL-ticket group — that's where the cross-lifecycle detectors run.
+    return (f"Coupon information: [x] {ticket} BS 100 /{rbd} DAC DXB 01/01/2026 "
             f"| Coupon status :{status}")
 
 

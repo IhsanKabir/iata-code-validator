@@ -144,3 +144,73 @@ class TestRiskAndTrends:
         rep = run_pnr_misuse_audit([_ev(new_status="Issued")])
         assert rep.event_count == 1 and rep.pnr_count == 1 and rep.agent_count == 1
         assert rep.date_range[0] is not None
+
+
+class TestFalsePositiveGuards:
+    def test_pnr_fallback_does_not_false_link_across_tickets(self) -> None:
+        # Two passengers on one PNR with UNPARSEABLE ticket numbers collapse to a PNR
+        # group. Passenger A flew; passenger B refunded. The critical refund_of_flown
+        # (and self_refund) must NOT fire — they'd be linking different tickets.
+        a, b = _agent(uid="paxA"), _agent(uid="paxB")
+        evs = [
+            _ev(pnr="SHARED", ticket="", new_status="Issued", agent=a, day=1, hour=9),
+            _ev(pnr="SHARED", ticket="", new_status="Flown", agent=a, day=2, hour=8),
+            _ev(pnr="SHARED", ticket="", new_status="Issued", agent=b, day=1, hour=9),
+            _ev(pnr="SHARED", ticket="", new_status="Refunded", agent=b, day=3, hour=10),
+        ]
+        rep = run_pnr_misuse_audit(evs)
+        dets = {f.detector for f in rep.flags}
+        assert "refund_of_flown" not in dets
+        assert "self_refund_sod" not in dets
+        assert rep.fallback_groups == 1 and rep.real_ticket_groups == 0
+
+    def test_real_ticket_self_refund_still_fires(self) -> None:
+        # The same agent issuing AND refunding a REAL ticket must still flag.
+        a = _agent(uid="solo1")
+        evs = [
+            _ev(ticket="7792000000009", new_status="Issued", agent=a),
+            _ev(ticket="7792000000009", new_status="Refunded", agent=a, day=16),
+        ]
+        rep = run_pnr_misuse_audit(evs)
+        assert "self_refund_sod" in {f.detector for f in rep.flags}
+        assert rep.real_ticket_groups == 1
+
+    def test_excluded_flown_not_attributed_to_human_refunder(self) -> None:
+        # A system-set Flown must not make a later human refund a refund_of_flown.
+        sysagent = Agent(raw="System (system)", display_name="System",
+                         user_id="system", department="")
+        human = _agent(uid="human1")
+        evs = [
+            _ev(ticket="7792000000010", new_status="Issued", agent=human, hour=9),
+            _ev(ticket="7792000000010", new_status="Flown", agent=sysagent, hour=21, day=15),
+            _ev(ticket="7792000000010", new_status="Refunded", agent=human, hour=10, day=16),
+        ]
+        rep = run_pnr_misuse_audit(evs)
+        assert "refund_of_flown" not in {f.detector for f in rep.flags}
+
+    def test_none_timestamps_do_not_crash(self) -> None:
+        import dataclasses
+        evs = [
+            _ev(new_status="Issued"),
+            dataclasses.replace(_ev(new_status="Refunded", hour=2), timestamp=None),
+        ]
+        rep = run_pnr_misuse_audit(evs)        # must not raise
+        assert isinstance(rep.flags, tuple)
+
+    def test_corpus_coverage_counts_flown(self) -> None:
+        rep = run_pnr_misuse_audit([
+            _ev(ticket="7792000000011", new_status="Flown"),
+            _ev(ticket="7792000000011", new_status="Refunded", day=16),
+        ])
+        assert rep.flown_events == 1
+
+    def test_zero_flag_report_exports_valid_workbook(self, tmp_path) -> None:
+        from openpyxl import load_workbook
+        from src.excel_io import write_zenith_pnr_misuse_audit
+        rep = run_pnr_misuse_audit([_ev(new_status="Issued", hour=11)])
+        assert rep.flags == ()
+        out = tmp_path / "zero.xlsx"
+        write_zenith_pnr_misuse_audit(out, rep)
+        wb = load_workbook(out)
+        assert wb.sheetnames == ["Cover", "Risk Worklist", "Flags", "Agent Activity"]
+        assert wb["Flags"].max_row == 1        # header only, no crash on empty flags

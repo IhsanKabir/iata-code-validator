@@ -3905,6 +3905,7 @@ class App:
             self.btn_zenith_fh_run.configure(state="normal")
             self.btn_zenith_fh_export.configure(state="normal")
             self.btn_zenith_fh_pnr.configure(state="normal")
+            self.btn_zenith_fh_misuse.configure(state="normal")
             self.zenith_fh_status_label.configure(
                 text=(
                     f"Done — {report.event_count:,} events / "
@@ -3913,10 +3914,12 @@ class App:
             )
         elif kind == MSG_ZENITH_FH_ERROR:
             self.btn_zenith_fh_run.configure(state="normal")
+            self.btn_zenith_fh_misuse.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("Flight History Analyzer — Error", str(payload))
         elif kind == MSG_ZENITH_PNRMISUSE_DONE:
             self.btn_zenith_fh_misuse.configure(state="normal")
+            self.btn_zenith_fh_run.configure(state="normal")
             p = payload
             self.zenith_fh_status_label.configure(
                 text=f"PNR misuse: {p['flags']} flag(s) → {Path(p['path']).name}")
@@ -3933,6 +3936,7 @@ class App:
                     pass
         elif kind == MSG_ZENITH_PNRMISUSE_ERROR:
             self.btn_zenith_fh_misuse.configure(state="normal")
+            self.btn_zenith_fh_run.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("PNR Misuse audit — Error", str(payload))
         # ----- Flight History downloader (Phase 3) -----
@@ -5865,6 +5869,7 @@ class App:
         self._zenith_fh_last_report = None
         self.btn_zenith_fh_export.configure(state="disabled")
         self.btn_zenith_fh_run.configure(state="disabled")
+        self.btn_zenith_fh_misuse.configure(state="disabled")
         self.zenith_fh_status_label.configure(text="Parsing files…")
         self.zenith_fh_progress.configure(value=0, maximum=1)
 
@@ -5943,6 +5948,7 @@ class App:
             messagebox.showinfo("PNR Misuse audit", "An audit is already running.")
             return
         self.btn_zenith_fh_misuse.configure(state="disabled")
+        self.btn_zenith_fh_run.configure(state="disabled")
         self.zenith_fh_status_label.configure(text="Running PNR misuse audit…")
 
         def worker() -> None:
