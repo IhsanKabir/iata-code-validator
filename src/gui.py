@@ -5954,6 +5954,15 @@ class App:
         def worker() -> None:
             try:
                 events = zenith_history_parser.collect_history(folder)
+                if not events:
+                    self._post(MSG_ZENITH_PNRMISUSE_ERROR, (
+                        f"No ModificationHistory*.xls flight logs found in:\n{folder}\n\n"
+                        "The PNR Misuse audit reads the raw flight-history .xls files that the "
+                        "Flight History Analyzer downloads from Zenith — NOT report spreadsheets "
+                        "(e.g. a Reissues_by_Counter .xlsx has no agent/coupon-status/time detail "
+                        "to audit). Download the flight history first, then point this folder at "
+                        "those ModificationHistory*.xls files."))
+                    return
                 report = zenith_pnr_history_analyzer.run_pnr_misuse_audit(events)
                 out_path = excel_io.build_zenith_pnr_misuse_output_path(Path(out_dir))
                 excel_io.write_zenith_pnr_misuse_audit(out_path, report)
