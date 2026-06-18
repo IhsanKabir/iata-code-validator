@@ -179,3 +179,50 @@ class TestDownloader:
             _FakeZenith(_changes_html()), ["AAA", "BBB"], cache=cache, delay_s=0,
             stop_flag=lambda: True)
         assert stats.aborted is True and stats.requested == 0
+
+
+# --------------------------------------------------------------------------- excel header row
+class TestExcelHeaderRow:
+    """The Reissues 'All Reissues (detail)' sheet puts a title + blank above the header."""
+
+    def _make(self, tmp_path, *, title: bool):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        if title:
+            ws.append(["ALL REISSUES — MASTER DETAIL"])
+            ws.append([None, None, None, None])
+        ws.append(["Date", "Counter", "Original Ticket #", "PNR"])
+        ws.append(["2026-01-01 00:00:00", "BO-1", "7792000000001", "14631077"])
+        ws.append(["2026-01-02 00:00:00", "BO-2", "7792000000002", "14852997"])
+        p = tmp_path / "r.xlsx"
+        wb.save(p)
+        return p
+
+    def test_finds_pnr_under_title_rows(self, tmp_path) -> None:
+        from src.excel_io import list_columns, read_pnr_codes_from_excel
+        p = self._make(tmp_path, title=True)
+        assert "PNR" in list_columns(p, "Sheet")           # combo now shows real headers
+        assert read_pnr_codes_from_excel(p, column_name="PNR") == ["14631077", "14852997"]
+
+    def test_normal_header_row0_still_works(self, tmp_path) -> None:
+        from src.excel_io import read_pnr_codes_from_excel
+        p = self._make(tmp_path, title=False)
+        assert read_pnr_codes_from_excel(p, column_name="PNR") == ["14631077", "14852997"]
+
+    def test_wrong_column_does_not_return_dates(self, tmp_path) -> None:
+        # The old bug: column not found -> fell back to col 0 (Date). Now col 0 of the real
+        # header is "Date" only if explicitly chosen; an unknown name still falls to col 0,
+        # but col 0 is now the real header's first column, not a title/date column.
+        from src.excel_io import read_pnr_codes_from_excel
+        p = self._make(tmp_path, title=True)
+        got = read_pnr_codes_from_excel(p, column_name="PNR")
+        assert all(":" not in c for c in got)              # never date-like
+
+    def test_numeric_pnr_trailing_zero_stripped(self, tmp_path) -> None:
+        import openpyxl
+        from src.excel_io import read_pnr_codes_from_excel
+        wb = openpyxl.Workbook(); ws = wb.active
+        ws.append(["PNR"]); ws.append([14631077.0])
+        p = tmp_path / "n.xlsx"; wb.save(p)
+        assert read_pnr_codes_from_excel(p, column_name="PNR") == ["14631077"]

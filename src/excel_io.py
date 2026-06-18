@@ -33,14 +33,34 @@ def list_sheet_names(path: Path) -> list[str]:
         wb.close()
 
 
+def _find_header_row(rows: list) -> int:
+    """Index of the most header-like row within the first 20 (skips title/banner rows).
+
+    Report exports often put a merged title (and a blank line) above the real header —
+    e.g. the Reissues_by_Counter "All Reissues (detail)" sheet has its
+    Date|…|PNR header on row 3. A header row is many short *string* cells and few
+    number/date cells; data rows have dates/numbers, title rows have one cell. Falls back
+    to row 0 when nothing looks like a multi-column header (the normal case).
+    """
+    best_i, best_score = 0, -10 ** 9
+    for i, row in enumerate(rows[:20]):
+        strs = sum(1 for c in row if isinstance(c, str) and c.strip() and len(c.strip()) <= 40)
+        # number or datetime/date cells make a row look like DATA, not a header
+        data = sum(1 for c in row if isinstance(c, (int, float)) or hasattr(c, "year"))
+        if strs >= 2 and (strs - data) > best_score:
+            best_score, best_i = strs - data, i
+    return best_i
+
+
 def list_columns(path: Path, sheet: str) -> list[str]:
-    """Return header row values for the chosen sheet (row 1)."""
+    """Return the header values for the chosen sheet, finding the real header row."""
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb[sheet]
-        first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        preview = list(ws.iter_rows(min_row=1, max_row=20, values_only=True))
+        header = preview[_find_header_row(preview)] if preview else ()
         cols: list[str] = []
-        for idx, val in enumerate(first_row):
+        for idx, val in enumerate(header):
             label = str(val).strip() if val is not None else ""
             if not label:
                 label = f"Column {get_column_letter(idx + 1)}"
@@ -1771,40 +1791,45 @@ def read_pnr_codes_from_excel(
 ) -> list[str]:
     """Read a column of PNR codes from a user-provided Excel.
 
-    If `column_name` is given we look it up by header; otherwise we take
-    the first non-empty column. Empty rows and the header itself are
-    skipped. PNR codes are upper-cased.
+    The real header row is located even when the sheet has a merged title / blank rows
+    above it (e.g. the Reissues "All Reissues (detail)" sheet — header on row 3). If
+    `column_name` is given we look it up by header in that row; otherwise we take the
+    first column. Empty rows are skipped; codes are upper-cased and a trailing Excel
+    ".0" (numeric PNRs read as floats) is stripped.
     """
     wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-    rows = ws.iter_rows(values_only=True)
     try:
-        header = list(next(rows))
-    except StopIteration:
+        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+        header_idx = _find_header_row(rows)
+        header = list(rows[header_idx])
+
+        col_idx: int | None = None
+        if column_name:
+            for i, h in enumerate(header):
+                if h is not None and str(h).strip().lower() == column_name.strip().lower():
+                    col_idx = i
+                    break
+        if col_idx is None:
+            col_idx = 0
+
+        out: list[str] = []
+        for row in rows[header_idx + 1:]:
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx]
+            if val is None:
+                continue
+            code = str(val).strip().upper()
+            if code.endswith(".0") and code[:-2].isdigit():  # 14631077.0 -> 14631077
+                code = code[:-2]
+            if code:
+                out.append(code)
+        return out
+    finally:
         wb.close()
-        return []
-
-    col_idx: int | None = None
-    if column_name:
-        for i, h in enumerate(header):
-            if h is not None and str(h).strip().lower() == column_name.strip().lower():
-                col_idx = i
-                break
-    if col_idx is None:
-        col_idx = 0
-
-    out: list[str] = []
-    for row in rows:
-        if col_idx >= len(row):
-            continue
-        val = row[col_idx]
-        if val is None:
-            continue
-        code = str(val).strip().upper()
-        if code:
-            out.append(code)
-    wb.close()
-    return out
 
 
 def write_zenith_pnr_bulk(

@@ -5737,6 +5737,15 @@ class App:
             messagebox.showerror(
                 "Dossier audit", f"No PNRs found in column {column!r} of {Path(input_path).name}.")
             return
+        sample = codes[:50]
+        weird = sum(1 for c in sample if ":" in c or " " in c or len(c) > 12)
+        if weird > len(sample) // 2:
+            if not messagebox.askyesno(
+                "Dossier audit",
+                f"These don't look like PNR codes — e.g. {codes[0]!r}.\n\n"
+                "You probably picked the wrong sheet/column (pick the 'PNR' column on the "
+                "detail sheet). Continue anyway?"):
+                return
         if not messagebox.askyesno(
             "Dossier audit",
             f"Scrape dossier payment/contact history for {len(codes)} PNRs from Zenith?\n\n"
