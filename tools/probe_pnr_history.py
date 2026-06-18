@@ -35,7 +35,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-from src.zenith_client import BASE_URL, ZenithSession  # noqa: E402
+from src.zenith_client import BASE_URL, ZenithSession, _backoff_with_jitter  # noqa: E402
 from src.zenith_pnr_client import QUICK_SEARCH_URL, lookup_pnr  # noqa: E402
 from src.zenith_history_downloader import HISTORY_VIEW_URL  # noqa: E402
 
@@ -45,6 +45,9 @@ except Exception:  # pragma: no cover - the parser import is best-effort for pre
     _TableReader = None
 
 FIXTURES = _REPO / "tests" / "fixtures" / "pnr_history"
+# Ticket history is a DIFFERENT endpoint from the changes/events log (confirmed from
+# the real browser URLs): recettesco/HistoBillet.asp?haction=SEARCH&id_Dossier=<id>.
+HISTOBILLET_URL = f"{BASE_URL}/newui/aerien/recettesco/HistoBillet.asp"
 DELAY_S = 1.5
 # Patterns that reveal the event-history endpoints inside the Dossier page HTML/JS.
 _EVENT_URL_RE = re.compile(r"""search_event\.asp[^"'\s<>)]*""", re.IGNORECASE)
@@ -74,15 +77,37 @@ def _preview_table(html: str) -> tuple[list[str], list[list[str]]]:
         return [f"<table preview failed: {exc}>"], []
 
 
+def _resilient_get(sess, url: str, params: dict | None, *, tries: int = 5, timeout: int = 90):
+    """GET that rides through Zenith's intermittent 504/5xx overload (the storm).
+
+    Returns the Response, or None if every attempt was a 5xx / network failure.
+    Raises SystemExit on a real session loss (401/403/login redirect).
+    """
+    last = "?"
+    for attempt in range(1, tries + 1):
+        try:
+            resp = sess.session.get(url, params=params, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            last = f"network {exc}"
+            time.sleep(_backoff_with_jitter(attempt, base_s=2.0, cap_s=12.0))
+            continue
+        if resp.status_code in (401, 403) or "/otds/" in resp.url:
+            raise SystemExit(f"session expired (HTTP {resp.status_code}) — re-login and retry.")
+        if resp.status_code >= 500 and attempt < tries:
+            last = f"HTTP {resp.status_code}"
+            time.sleep(_backoff_with_jitter(attempt, base_s=2.0, cap_s=12.0))
+            continue
+        return resp
+    print(f"        (gave up after {tries} tries — last: {last})")
+    return None
+
+
 def _get(sess, url: str, params: dict | None, label: str) -> None:
-    """One polite GET; print a summary and save the raw HTML."""
-    try:
-        resp = sess.session.get(url, params=params, timeout=60)
-    except Exception as exc:  # noqa: BLE001
-        print(f"    {label}: NETWORK ERROR {exc}")
+    """One polite, 504-resilient GET; print a summary and save the raw HTML."""
+    resp = _resilient_get(sess, url, params)
+    if resp is None:
+        print(f"    {label}: FAILED (Zenith 5xx/overload after retries)")
         return
-    if resp.status_code in (401, 403) or "/otds/" in resp.url:
-        raise SystemExit(f"    {label}: session expired (HTTP {resp.status_code}) — re-login and retry.")
     body = resp.text
     header, sample = _preview_table(body)
     results = _RESULTS_RE.search(body)
@@ -107,33 +132,50 @@ def probe_pnr(sess, pnr: str) -> None:
         print("  !! no dossier_id parsed — cannot probe history. Check lookup_pnr output.")
         return
 
-    # 1) Fetch the Dossier page HTML and scrape the event-history button targets.
-    raw = sess.session.get(QUICK_SEARCH_URL,
-                           params={"vaction": "VERIF", "Id": pnr.strip().upper(),
-                                   "id_langue": "2", "GDSCRSPartnerRCIRLoc": ""},
-                           timeout=60)
-    _save(f"{pnr}_dossier_page", raw.text)
-    found = sorted(set(_EVENT_URL_RE.findall(raw.text)))
+    # 1) Fetch the Dossier page HTML (504-resilient) and scrape the event-history targets.
+    raw = _resilient_get(sess, QUICK_SEARCH_URL,
+                         {"vaction": "VERIF", "Id": pnr.strip().upper(),
+                          "id_langue": "2", "GDSCRSPartnerRCIRLoc": ""})
+    dossier_html = raw.text if raw is not None else ""
+    if dossier_html:
+        _save(f"{pnr}_dossier_page", dossier_html)
+    found = sorted(set(_EVENT_URL_RE.findall(dossier_html)))
     print(f"  search_event.asp references in Dossier page: {len(found)}")
     for u in found:
         print(f"    -> {u[:160]}")
-    params_seen = sorted(set(f"{k}={v}" for k, v in _PARAM_RE.findall(raw.text)))
+    # The button may build its URL in JS — surface any event/history/recap references too.
+    js_refs = sorted(set(re.findall(
+        r"[^\n;{]{0,120}(?:search_event|CategorieEvent|recap_dossier|histor|event)[^\n;{]{0,80}",
+        dossier_html, re.IGNORECASE)))[:12]
+    for j in js_refs:
+        snippet = " ".join(j.split())
+        if snippet:
+            print(f"    js> {snippet[:150]}")
+    params_seen = sorted(set(f"{k}={v}" for k, v in _PARAM_RE.findall(dossier_html)))
     if params_seen:
         print(f"  params seen near event refs: {', '.join(params_seen)}")
     time.sleep(DELAY_S)
 
-    # 2) Probe contexte=recap_dossier across CategorieEvent codes (HTML view, no excel).
-    print("  -- probing recap_dossier CategorieEvent=1..6 (HTML view) --")
-    for n in range(1, 7):
+    # 2) CHANGES history — the events log carrying PAX CONTACT / BKASH payment comments.
+    #    REAL param is id_dossier_vol (NOT id_dossier) — confirmed from the browser URL;
+    #    that wrong name is what triggered the earlier 500. Sweep CategorieEvent to find
+    #    every category (3 is the known-good "File Modification" one).
+    print("  -- CHANGES history: search_event.asp recap_dossier CategorieEvent=1..8 --")
+    for n in range(1, 9):
         _get(sess, HISTORY_VIEW_URL,
-             {"contexte": "recap_dossier", "id_dossier": dossier_id, "CategorieEvent": str(n)},
-             label=f"{pnr}_recap_cat{n}")
-
-    # 3) One excel=1 comparison on the known category 3, to decide HTML-paging vs export-all.
-    print("  -- excel=1 comparison on CategorieEvent=3 --")
+             {"contexte": "recap_dossier", "CategorieEvent": str(n), "id_dossier_vol": dossier_id},
+             label=f"{pnr}_changes_cat{n}")
+    print("  -- CHANGES history excel=1 on CategorieEvent=3 --")
     _get(sess, HISTORY_VIEW_URL,
-         {"contexte": "recap_dossier", "id_dossier": dossier_id, "CategorieEvent": "3", "excel": "1"},
-         label=f"{pnr}_recap_cat3_excel")
+         {"contexte": "recap_dossier", "CategorieEvent": "3", "id_dossier_vol": dossier_id, "excel": "1"},
+         label=f"{pnr}_changes_cat3_excel")
+
+    # 3) TICKET history — a DIFFERENT endpoint: recettesco/HistoBillet.asp, id_Dossier.
+    print("  -- TICKET history: HistoBillet.asp haction=SEARCH --")
+    _get(sess, HISTOBILLET_URL, {"haction": "SEARCH", "id_Dossier": dossier_id},
+         label=f"{pnr}_tickets")
+    _get(sess, HISTOBILLET_URL, {"haction": "SEARCH", "id_Dossier": dossier_id, "excel": "1"},
+         label=f"{pnr}_tickets_excel")
 
 
 def main(argv: list[str]) -> int:
