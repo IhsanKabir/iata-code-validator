@@ -76,13 +76,23 @@ history is a secondary corroboration source, not a blocker.
 - Per dossier we need **2 GETs** (changes `cat3&excel=1`, ticket history) — far cheaper than the
   8-category sweep the probe does for discovery.
 
-## What's still needed before building Phase 2 detectors
-1. **More real samples** — especially PNRs with an actual **reissue / refund / void**, a **real
-   contact change** (old≠new), and **multiple payments**, so the cross-PNR detectors
-   (payment-txn reuse, contact churn) can be built *and tested* against misuse-shaped data.
-   (`09AHEA` is a clean/normal booking — good for format, not for detector validation.)
-2. **Map `HistoBillet`'s table** (read the saved raw HTML).
-3. Then: `zenith_pnr_history_downloader` (2 GETs/dossier, governor + budget, per-dossier checkpoint)
-   → parser (above regexes) → payment-txn-reuse + contact-churn detectors folded into the existing
-   `run_pnr_misuse_audit` → GUI sub-tab. Tests use inline synthetic HTML (repo convention; the
-   `tests/fixtures/` dir is git-ignored).
+## Phase 2 — BUILT (v1.17.0)
+Shipped against the formats above, fully unit-tested offline:
+- `zenith_pnr_history_parser.parse_dossier_changes` — CHANGES excel → `DossierEvent` (payment
+  method/txn, contact old/new, reissue I→E, coupon transition).
+- `zenith_pnr_history_analyzer.run_dossier_audit` — `payment_txn_reuse` / `contact_churn` /
+  `contact_funnel`, actor-tagged + risk-scored.
+- `zenith_pnr_history_downloader.scrape_dossier_events` — 1 GET/uncached dossier (CHANGES tab),
+  request budget + 504-retry + stop flag + raw-HTML cache (parse-on-read).
+- GUI: "Dossier audit (payment/contact)" button on the PNR Bulk tab (reuses its PNR-list Excel +
+  session + output folder) → `excel_io.write_zenith_dossier_audit`.
+
+## Still open (post-v1.17.0)
+1. **Live canary** — the downloader is wired + mock-tested but not yet run against live Zenith
+   at scale. Run a small batch first (Zenith 504-storms; off-peak).
+2. **Richer real samples** — `09AHEA` is a clean booking; validating the cross-PNR detectors on
+   real misuse-shaped data needs PNRs with actual reissue/refund/void + real contact changes +
+   reused payments. The Reissues_by_Counter detail sheet's PNR column is the natural seed list.
+3. **Map `HistoBillet`'s ticket table** (secondary — reissue already covered via coupon I→E).
+4. **PII masking** — flag evidence currently carries the raw comment (contact/txn). Local-only for
+   now; mask (hash/last-4) before any shared export.
