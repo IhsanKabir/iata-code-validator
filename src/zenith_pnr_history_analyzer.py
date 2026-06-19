@@ -446,6 +446,23 @@ def run_pnr_misuse_audit(
 # ---------------------------------------------------------------------------
 PAYMENT_TXN_REUSE_MIN_PNRS = 2     # same transaction id across >= this many PNRs
 CONTACT_FUNNEL_MIN_PNRS = 5        # one contact value across >= this many PNRs
+# Conservative — a couple of reissues is normal (schedule changes / IRROPS). The live
+# canary saw 2-3 reissues on normal reissued PNRs, so 5+ is the "churn" lead. Tune once a
+# real population baseline exists (the Per-PNR Summary sheet shows the distribution).
+REISSUE_CHURN_MIN = 5              # >= this many exchange/reissue events on one PNR
+
+
+@dataclass(frozen=True)
+class DossierPNRSummary:
+    """Descriptive per-PNR counts — the calibration view (not a verdict)."""
+    pnr: str
+    dossier_id: str
+    events: int
+    reissues: int
+    distinct_agents: int
+    fee_waivers: int
+    payments: int
+    contact_changes: int
 
 
 @dataclass(frozen=True)
@@ -459,6 +476,8 @@ class DossierAuditReport:
     contacts_changed: int = 0
     reissues_seen: int = 0
     distinct_txn: int = 0
+    waivers_seen: int = 0
+    pnr_summary: tuple[DossierPNRSummary, ...] = ()
 
 
 def _dossier_evidence(e) -> str:
@@ -526,9 +545,60 @@ def detect_payment_contact_flags(events, *, whitelist: set[str]) -> list[PNRFlag
                 reason=f"One contact appears on {len(pnrs)} PNRs — possible broker funnel.",
                 evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
 
+    # 4) Reissue churn — many exchange/reissue (coupon I->E) events on one PNR. Conservative;
+    #    schedule changes / IRROPS legitimately reissue, so this is a lead, not a verdict.
+    reissue_by_pnr: dict[str, list] = defaultdict(list)
+    for e in evs:
+        if e.is_reissue and e.pnr:
+            reissue_by_pnr[e.pnr].append(e)
+    for pnr, revs in reissue_by_pnr.items():
+        if len(revs) >= REISSUE_CHURN_MIN:
+            ex = revs[-1]
+            flags.append(PNRFlag(
+                detector="reissue_churn", severity="medium", confidence=0.6,
+                pnr=pnr, ticket_number="", agent_user_id=ex.agent.user_id,
+                agent_department=ex.agent.department, timestamp=ex.timestamp,
+                reason=f"{len(revs)} reissues/exchanges on {pnr} — verify "
+                       "(schedule changes / IRROPS reissue legitimately).",
+                evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
+
+    # 5) Fee/charge waiver — a discrete revenue event worth a look (categorical, not count-based).
+    waiver_by_pnr: dict[str, list] = defaultdict(list)
+    for e in evs:
+        if "waiv" in e.raw_description.lower() and e.pnr:
+            waiver_by_pnr[e.pnr].append(e)
+    for pnr, wevs in waiver_by_pnr.items():
+        ex = wevs[-1]
+        flags.append(PNRFlag(
+            detector="fee_waiver", severity="medium", confidence=0.5,
+            pnr=pnr, ticket_number="", agent_user_id=ex.agent.user_id,
+            agent_department=ex.agent.department, timestamp=ex.timestamp,
+            reason=f"Fee/charge waived on {pnr}"
+                   + (f" ({len(wevs)}x)" if len(wevs) > 1 else "")
+                   + " — verify it was authorised.",
+            evidence=_dossier_evidence(ex), actor_type=classify_actor(ex.agent)))
+
     flags.sort(key=lambda f: ({"critical": 0, "high": 1, "medium": 2, "low": 3}.get(f.severity, 4),
                               f.timestamp or datetime.min))
     return flags
+
+
+def dossier_pnr_summaries(events) -> list[DossierPNRSummary]:
+    """Descriptive per-PNR counts (the calibration view), busiest first."""
+    by_pnr: dict[str, list] = defaultdict(list)
+    for e in events:
+        if e.pnr:
+            by_pnr[e.pnr].append(e)
+    rows = [DossierPNRSummary(
+        pnr=pnr, dossier_id=pevs[0].dossier_id, events=len(pevs),
+        reissues=sum(1 for e in pevs if e.is_reissue),
+        distinct_agents=len({e.agent.user_id for e in pevs if e.agent.user_id}),
+        fee_waivers=sum(1 for e in pevs if "waiv" in e.raw_description.lower()),
+        payments=sum(1 for e in pevs if e.payment_txn_id),
+        contact_changes=sum(1 for e in pevs if e.contact_changed),
+    ) for pnr, pevs in by_pnr.items()]
+    rows.sort(key=lambda s: (s.reissues, s.distinct_agents, s.fee_waivers, s.events), reverse=True)
+    return rows
 
 
 def run_dossier_audit(events, *, whitelist_user_ids: Iterable[str] = ()) -> DossierAuditReport:
@@ -548,4 +618,6 @@ def run_dossier_audit(events, *, whitelist_user_ids: Iterable[str] = ()) -> Doss
         contacts_changed=sum(1 for e in evs if e.contact_changed),
         reissues_seen=sum(1 for e in evs if e.is_reissue),
         distinct_txn=len({e.payment_txn_id for e in evs if e.payment_txn_id}),
+        waivers_seen=sum(1 for e in evs if "waiv" in e.raw_description.lower()),
+        pnr_summary=tuple(dossier_pnr_summaries(evs)),
     )

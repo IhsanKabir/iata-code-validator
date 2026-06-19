@@ -68,12 +68,14 @@ class TestParser:
 
 
 # --------------------------------------------------------------------------- detectors
-def _de(pnr, *, txn="", cold="", cnew="", uid="agt1", dept="DAC-02 Customer Service", day=1):
+def _de(pnr, *, txn="", cold="", cnew="", uid="agt1", dept="DAC-02 Customer Service",
+        day=1, reissue=False, desc="d"):
     return DossierEvent(
         dossier_id=f"D{pnr}", row_index=0, raw_date="", timestamp=datetime(2026, 6, day, 10, 0),
         agent=Agent(raw=f"X ({uid}/{dept})", display_name="X", user_id=uid, department=dept),
-        raw_description="d", event_type="File Modification", pnr=pnr, customer="C",
-        raw_flight="", passenger="", payment_txn_id=txn, contact_old=cold, contact_new=cnew)
+        raw_description=desc, event_type="File Modification", pnr=pnr, customer="C",
+        raw_flight="", passenger="", payment_txn_id=txn, contact_old=cold, contact_new=cnew,
+        is_reissue=reissue)
 
 
 class TestDetectors:
@@ -115,6 +117,24 @@ class TestDetectors:
     def test_coverage_counts(self) -> None:
         rep = run_dossier_audit([_de("P1", txn="TX1", cold="1", cnew="2")])
         assert rep.payments_seen == 1 and rep.contacts_changed == 1 and rep.distinct_txn == 1
+
+    def test_reissue_churn_fires_at_threshold(self) -> None:
+        evs = [_de("R1", reissue=True, day=d) for d in range(1, 6)]   # 5 reissues
+        assert "reissue_churn" in {f.detector for f in run_dossier_audit(evs).flags}
+
+    def test_few_reissues_not_churn(self) -> None:
+        evs = [_de("R1", reissue=True, day=d) for d in range(1, 4)]   # only 3
+        assert "reissue_churn" not in {f.detector for f in run_dossier_audit(evs).flags}
+
+    def test_fee_waiver_is_categorical(self) -> None:
+        rep = run_dossier_audit([_de("W1", desc="-> First time reissue charges waived")])
+        assert "fee_waiver" in {f.detector for f in rep.flags}
+        assert rep.waivers_seen == 1
+
+    def test_pnr_summary_populated(self) -> None:
+        rep = run_dossier_audit([_de("P1", reissue=True), _de("P1", desc="charges waived")])
+        s = next(s for s in rep.pnr_summary if s.pnr == "P1")
+        assert s.events == 2 and s.reissues == 1 and s.fee_waivers == 1 and s.distinct_agents == 1
 
 
 # --------------------------------------------------------------------------- downloader (mocked)

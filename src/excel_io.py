@@ -1723,6 +1723,10 @@ def write_zenith_dossier_audit(path: Path, report) -> None:
     cover.append(["Distinct transaction ids", getattr(report, "distinct_txn", 0)])
     cover.append(["Contact changes seen", getattr(report, "contacts_changed", 0)])
     cover.append(["Reissues (coupon I->E) seen", getattr(report, "reissues_seen", 0)])
+    cover.append(["Fee/charge waivers seen", getattr(report, "waivers_seen", 0)])
+    cover.append([])
+    cover.append(["Tip: reissued PNRs carry reissue/waiver signals, not payments/contacts —"])
+    cover.append(["those appear on fresh bookings. See the Per-PNR Summary to calibrate."])
     cover.append([])
     sev_counts: dict[str, int] = {}
     for f in report.flags:
@@ -1755,6 +1759,16 @@ def write_zenith_dossier_audit(path: Path, report) -> None:
             f.timestamp.strftime("%Y-%m-%d %H:%M") if f.timestamp else "",
             f.reason, f.evidence,
         ])
+
+    # Per-PNR Summary — descriptive counts so you can see the distribution + tune thresholds.
+    summary = getattr(report, "pnr_summary", ())
+    if summary:
+        ws = wb.create_sheet("Per-PNR Summary")
+        ws.append(["PNR", "Dossier", "Events", "Reissues", "Distinct Agents",
+                   "Fee Waivers", "Payments", "Contact Changes"])
+        for s in summary:
+            ws.append([s.pnr, s.dossier_id, s.events, s.reissues, s.distinct_agents,
+                       s.fee_waivers, s.payments, s.contact_changes])
 
     wb.save(path)
 
