@@ -3825,6 +3825,8 @@ class App:
                 self._zenith_log(
                     f"{r.checked_at}  {r.customer_id}  ERROR  {r.error}",
                 )
+        elif kind == MSG_ZENITH_LOG:
+            self._zenith_log(str(payload))
         elif kind == MSG_ZENITH_DONE:
             path = str(payload)
             self._zenith_log(f"Done. Wrote {path}")
@@ -6664,10 +6666,20 @@ class App:
         ids = cfg["ids"]
         total = len(ids)
         ok = nf = err = 0
+        seen_status: dict[str, str] = {}     # last reported status per id (retry-aware counts)
 
         def progress_cb(result, completed: int, total_n: int) -> None:
             nonlocal ok, nf, err
             self._zenith_cache.save_result(result)
+            prev = seen_status.get(result.customer_id)
+            if prev is not None:             # a retry sweep corrected an earlier outcome
+                if prev == zenith_client.STATUS_OK:
+                    ok -= 1
+                elif prev == zenith_client.STATUS_NOT_FOUND:
+                    nf -= 1
+                else:
+                    err -= 1
+            seen_status[result.customer_id] = result.status
             if result.status == zenith_client.STATUS_OK:
                 ok += 1
             elif result.status == zenith_client.STATUS_NOT_FOUND:
@@ -6685,6 +6697,7 @@ class App:
                 progress_cb=progress_cb,
                 stop_event=self._zenith_stop_flag,
                 pause_event=self._zenith_pause_flag,
+                on_notice=lambda msg: self._post(MSG_ZENITH_LOG, msg),
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Zenith run crashed")

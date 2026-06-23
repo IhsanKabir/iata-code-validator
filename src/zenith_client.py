@@ -451,6 +451,9 @@ def fetch_many(
     stop_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
     on_session_expired: Callable[[], bool] | None = None,
+    retry_passes: int = 2,
+    retry_cooldown_s: float = 30.0,
+    on_notice: Callable[[str], None] | None = None,
 ) -> list[LookupResult]:
     """Look up many customer IDs concurrently.
 
@@ -555,6 +558,67 @@ def fetch_many(
                     if not remaining.done():
                         remaining.cancel()
                 break
+
+    # --- Automatic retry sweeps for transient (504/network) failures ----------
+    # Zenith's origin 504-storms intermittently; a record that timed out now often
+    # succeeds a minute later. So instead of dropping it, we cool down (let the origin
+    # recover) and re-sweep ONLY the transient failures, up to `retry_passes` times.
+    # Re-firing progress_cb lets the caller's cache flip ERROR->OK, so the final output
+    # (written from that cache) self-corrects. Not-found / session-loss / cancelled are
+    # NOT retried. The cooldown escalates (30s, 60s, ...) to give a longer storm time.
+    def _notice(msg: str) -> None:
+        log.info(msg)
+        if on_notice is not None:
+            try:
+                on_notice(msg)
+            except Exception:  # noqa: BLE001 — never let a callback kill the run
+                log.exception("on_notice raised")
+
+    def _is_retryable(r: LookupResult) -> bool:
+        if r.status != STATUS_ERROR:
+            return False
+        err = r.error or ""
+        return "cancelled" not in err and "SessionExpired" not in err
+
+    by_id: dict[str, LookupResult] = {}
+    for r in results:
+        by_id[r.customer_id] = r          # keep the latest outcome per id
+
+    for sweep in range(1, max(0, int(retry_passes)) + 1):
+        if stop_event is not None and stop_event.is_set():
+            break
+        retry_ids = [cid for cid, r in by_id.items() if _is_retryable(r)]
+        if not retry_ids:
+            break
+        cooldown = retry_cooldown_s * sweep
+        _notice(f"{len(retry_ids)} transient failure(s) — cooling down {cooldown:.0f}s, "
+                f"then retry sweep {sweep}/{retry_passes}…")
+        waited = 0.0
+        while waited < cooldown:
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(0.5)
+            waited += 0.5
+        if stop_event is not None and stop_event.is_set():
+            break
+        _notice(f"Retry sweep {sweep}/{retry_passes}: re-attempting {len(retry_ids)} ID(s)…")
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_worker, cid): cid for cid in retry_ids}
+            for fut in as_completed(futures):
+                r = fut.result()
+                by_id[r.customer_id] = r
+                results.append(r)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(r, total, total)   # bar stays full; row self-corrects
+                    except Exception:  # noqa: BLE001
+                        log.exception("progress callback raised")
+                if stop_event is not None and stop_event.is_set():
+                    for remaining in futures:
+                        if not remaining.done():
+                            remaining.cancel()
+                    break
+
     return results
 
 

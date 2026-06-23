@@ -100,3 +100,75 @@ def test_persistent_no_form_raises_not_found(monkeypatch):
     with pytest.raises(zenith_client.CustomerNotFoundError):
         sess.fetch_customer("99999999", max_attempts=4)
     assert sess.session.calls == 4          # retried each time, then declared not-found
+
+
+# --- fetch_many automatic retry sweeps (storm resilience) --------------------
+from collections import Counter  # noqa: E402
+
+
+class _FakeSession:
+    """Stands in for ZenithSession.fetch_customer — sequenced outcomes per id."""
+
+    def __init__(self, plan: dict) -> None:
+        self.plan = {k: list(v) for k, v in plan.items()}
+        self.calls: Counter = Counter()
+
+    def fetch_customer(self, cid, **_kw):
+        self.calls[cid] += 1
+        outcomes = self.plan.get(cid, ["ok"])
+        outcome = outcomes.pop(0) if outcomes else "ok"
+        if outcome == "504":
+            raise ZenithError(f"Zenith returned 504 for ID {cid} after 4 attempts.")
+        if outcome == "notfound":
+            raise zenith_client.CustomerNotFoundError(f"not found {cid}")
+        return zenith_client.parse_customer_html(_OK_HTML, cid)
+
+
+def _final(results):
+    by_id = {}
+    for r in results:
+        by_id[r.customer_id] = r        # last outcome per id wins
+    return by_id
+
+
+def test_fetch_many_retry_sweep_recovers(monkeypatch):
+    """A 504 in the main pass is recovered by a retry sweep — not left as an error."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _FakeSession({"A": ["504", "ok"], "B": ["ok"]})
+    results = zenith_client.fetch_many(
+        sess, ["A", "B"], concurrency=1, delay_s=0, retry_passes=2, retry_cooldown_s=1)
+    final = _final(results)
+    assert final["A"].status == zenith_client.STATUS_OK   # recovered on sweep 1
+    assert final["B"].status == zenith_client.STATUS_OK
+    assert sess.calls["A"] == 2                            # main pass + one retry
+
+
+def test_fetch_many_not_found_not_retried(monkeypatch):
+    """NOT_FOUND is terminal — sweeps must not re-attempt it."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _FakeSession({"X": ["notfound", "ok"]})        # would 'recover' IF retried
+    results = zenith_client.fetch_many(
+        sess, ["X"], concurrency=1, delay_s=0, retry_passes=2, retry_cooldown_s=1)
+    assert _final(results)["X"].status == zenith_client.STATUS_NOT_FOUND
+    assert sess.calls["X"] == 1                            # not retried
+
+
+def test_fetch_many_retry_passes_zero_disables_sweeps(monkeypatch):
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _FakeSession({"A": ["504", "ok"]})
+    results = zenith_client.fetch_many(sess, ["A"], concurrency=1, delay_s=0, retry_passes=0)
+    assert _final(results)["A"].status == zenith_client.STATUS_ERROR   # no sweep
+    assert sess.calls["A"] == 1
+
+
+def test_fetch_many_stop_skips_cooldown_and_sweeps(monkeypatch):
+    import threading
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    stop = threading.Event()
+    sess = _FakeSession({"A": ["504", "ok"]})
+    # stop set before the call -> main pass returns cancelled, no sweep attempted
+    stop.set()
+    results = zenith_client.fetch_many(
+        sess, ["A"], concurrency=1, delay_s=0, stop_event=stop, retry_passes=2)
+    # the id was cancelled (never really fetched); no successful recovery
+    assert _final(results)["A"].status == zenith_client.STATUS_ERROR
