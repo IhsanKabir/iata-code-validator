@@ -416,9 +416,18 @@ class ZenithSession:
                     )
                 time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
                 continue
-            # 2xx/3xx (not a login redirect) — parse it. A not-found page
-            # raises CustomerNotFoundError from here and is NOT retried.
-            return parse_customer_html(resp.text, str(customer_id))
+            # 2xx/3xx (not a login redirect) — parse it. A page with NO customer form
+            # at all is almost always a degraded/error response under overload: a genuinely
+            # missing ID returns an EMPTY FORM (markers present, fields blank), so "no markers"
+            # means we didn't get the form. Retry it like any transient; only the final
+            # attempt lets CustomerNotFoundError through (so a real miss is still reported).
+            try:
+                return parse_customer_html(resp.text, str(customer_id))
+            except CustomerNotFoundError:
+                if is_last:
+                    raise
+                time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+                continue
         # The loop always returns or raises on the final attempt; guard anyway.
         raise ZenithError(f"Exhausted retries fetching {customer_id}.")
 

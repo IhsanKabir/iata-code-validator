@@ -75,3 +75,28 @@ def test_session_loss_not_retried(monkeypatch):
     with pytest.raises(zenith_client.SessionExpiredError):
         sess.fetch_customer("12604657")
     assert sess.session.calls == 1
+
+
+# A 200 whose body has none of the form markers — what overload serves (an error page
+# rendered as 200, a partial response). A genuinely missing ID returns an EMPTY FORM
+# (markers present), so "no markers" is a degraded page, not a real not-found.
+_NO_FORM_HTML = "<html><body>504 Gateway Timeout — origin overloaded</body></html>"
+
+
+def test_no_form_page_retried_then_recovers(monkeypatch):
+    """A valid customer that came back as a degraded no-form page must be RETRIED, not
+    dropped as NOT_FOUND (the 12499484 'BANGLADESH BANK' case during a 504 storm)."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _session([_Resp(200, _NO_FORM_HTML), _Resp(200, _OK_HTML)])
+    rec = sess.fetch_customer("12499484")
+    assert isinstance(rec, CustomerRecord) and rec.first_name == "John"
+    assert sess.session.calls == 2          # no-form retried, second got the real form
+
+
+def test_persistent_no_form_raises_not_found(monkeypatch):
+    """If the form never appears across every attempt, it's a real not-found."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _session([_Resp(200, _NO_FORM_HTML)] * 4)
+    with pytest.raises(zenith_client.CustomerNotFoundError):
+        sess.fetch_customer("99999999", max_attempts=4)
+    assert sess.session.calls == 4          # retried each time, then declared not-found
