@@ -5888,12 +5888,14 @@ class App:
         sess = self._zenith_session
         stop = self._zenith_bulk_stop_flag
 
-        # Bounded concurrency + in-worker 504 retry beats the old serial loop:
-        # transient 504s are now retried (recovered) instead of lost, and the
-        # slow Dossier waits overlap across workers. 3 workers is the same
-        # proven range as the customer-lookup bulk path (fetch_many).
-        _BULK_CONCURRENCY = 3
-        _BULK_DELAY_S = 0.8
+        # GENTLE by default: the PNR→Dossier render is HEAVY (a full booking + history),
+        # far heavier than a customer-form fetch. Real-world proof: at concurrency=3 the
+        # PNR lookup 504'd ~80% while the customer lookup at concurrency=1 ran ~99.8% on
+        # the SAME Zenith — 3 concurrent heavy renders overwhelm the origin. So we match
+        # the proven-gentle customer config (1 worker, slower pace); the retry sweeps in
+        # lookup_many then mop up the intermittent 504s.
+        _BULK_CONCURRENCY = 1
+        _BULK_DELAY_S = 1.5
 
         def worker() -> None:
             try:
