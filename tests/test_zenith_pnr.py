@@ -444,7 +444,7 @@ class TestLookupMany:
         seen: dict = {}
         out = zpc.lookup_many(
             object(), ["AAA111", "NOPE01", "ERR001", "BBB222"],
-            concurrency=2, delay_s=0.0,
+            concurrency=2, delay_s=0.0, retry_cooldown_s=0,
             on_result=lambda c, d, s: seen.__setitem__(c, s),
         )
         assert set(out) == {"AAA111", "BBB222"}
@@ -469,7 +469,9 @@ class TestLookupMany:
         assert "MISS01" in fetched
         assert out["HIT001"].pnr_code == "HIT001"
 
-    def test_governor_aborts_on_sustained_5xx(self, monkeypatch) -> None:
+    def test_hard_down_attempts_all_no_abort_then_sweeps(self, monkeypatch) -> None:
+        # No more hard abort: a fully-down Zenith attempts every PNR, then the retry
+        # sweeps re-attempt the failures (still nothing if it never recovers).
         monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
         calls = {"n": 0}
 
@@ -478,35 +480,59 @@ class TestLookupMany:
             raise zpc.ZenithError("504")
 
         monkeypatch.setattr(zpc, "lookup_pnr", boom)
-        codes = [f"P{i:04d}" for i in range(60)]
-        out = zpc.lookup_many(object(), codes, concurrency=3, delay_s=0.0)
+        codes = [f"P{i:04d}" for i in range(20)]
+        out = zpc.lookup_many(object(), codes, concurrency=3, delay_s=0.0,
+                              retry_passes=1, retry_cooldown_s=0)
         assert out == {}
-        # The breaker stops the run well before all 60 are attempted.
-        assert calls["n"] < 60
+        assert calls["n"] == 40                            # 20 main pass + 20 in one sweep
 
-    def test_governor_aborts_on_high_failure_rate_despite_sparse_success(self, monkeypatch) -> None:
-        # The real-world 504-storm: a success every ~10 PNRs keeps a *consecutive*-
-        # streak breaker resetting forever; the windowed failure-RATE breaker must
-        # still abort. Without the fix this would grind through all 400.
+    def test_retry_sweep_recovers_transient_failures(self, monkeypatch) -> None:
+        # The 504-storm fix: each PNR 504s on its first attempt, succeeds on the retry.
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        seen: dict = {}
+
+        def flaky(_session, code, **_kw):
+            seen[code] = seen.get(code, 0) + 1
+            if seen[code] == 1:                            # fail once, then succeed
+                raise zpc.ZenithError("504")
+            return parse_dossier_html(_build_dossier_html(pnr=code))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", flaky)
+        codes = [f"P{i:04d}" for i in range(10)]
+        notices: list = []
+        out = zpc.lookup_many(object(), codes, concurrency=2, delay_s=0.0,
+                              retry_passes=2, retry_cooldown_s=0,
+                              on_notice=notices.append)
+        assert len(out) == 10                              # all recovered on the sweep
+        assert any("retry sweep" in n.lower() for n in notices)
+
+    def test_sweep_does_not_retry_not_found(self, monkeypatch) -> None:
         monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
         calls = {"n": 0}
 
-        def flaky(_session, _code, **_kw):
+        def fake(_session, code, **_kw):
             calls["n"] += 1
-            if calls["n"] % 10 == 0:                       # ~10% succeed, scattered
-                return parse_dossier_html(_build_dossier_html(pnr=f"OK{calls['n']:05d}"))
+            raise zpc.PNRNotFoundError("nope")
+
+        monkeypatch.setattr(zpc, "lookup_pnr", fake)
+        out = zpc.lookup_many(object(), ["X1"], concurrency=1, delay_s=0.0,
+                              retry_passes=2, retry_cooldown_s=0)
+        assert out == {} and calls["n"] == 1               # not-found never re-swept
+
+    def test_retry_passes_zero_disables_sweeps(self, monkeypatch) -> None:
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        calls = {"n": 0}
+
+        def fail_once(_session, code, **_kw):
+            calls["n"] += 1
             raise zpc.ZenithError("504")
 
-        monkeypatch.setattr(zpc, "lookup_pnr", flaky)
-        codes = [f"P{i:05d}" for i in range(400)]
-        out = zpc.lookup_many(object(), codes, concurrency=1, delay_s=0.0)
-        # Aborts once the window fills at a high failure rate — not after all 400.
-        assert calls["n"] < 120
-        # The handful that succeeded before the abort were still collected.
-        assert len(out) >= 1
+        monkeypatch.setattr(zpc, "lookup_pnr", fail_once)
+        out = zpc.lookup_many(object(), ["A", "B"], concurrency=1, delay_s=0.0,
+                              retry_passes=0)
+        assert out == {} and calls["n"] == 2               # main pass only, no sweep
 
-    def test_governor_does_not_abort_a_mostly_healthy_run(self, monkeypatch) -> None:
-        # A low failure rate must never trip the breaker — all PNRs get attempted.
+    def test_mostly_healthy_run_all_attempted(self, monkeypatch) -> None:
         monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
         calls = {"n": 0}
 
@@ -518,8 +544,9 @@ class TestLookupMany:
 
         monkeypatch.setattr(zpc, "lookup_pnr", mostly_ok)
         codes = [f"P{i:05d}" for i in range(80)]
-        out = zpc.lookup_many(object(), codes, concurrency=1, delay_s=0.0)
-        assert calls["n"] == 80                            # every PNR attempted
+        out = zpc.lookup_many(object(), codes, concurrency=1, delay_s=0.0,
+                              retry_passes=0)                # main-pass-only for a clean count
+        assert calls["n"] == 80                            # every PNR attempted, no abort
         assert len(out) == 76                              # 4 of 80 failed (the 20ths)
 
     def test_session_loss_raises_after_checkpointing(self, monkeypatch) -> None:

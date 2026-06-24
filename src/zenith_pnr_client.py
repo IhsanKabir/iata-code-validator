@@ -462,6 +462,9 @@ def lookup_many(
     on_result=None,
     progress_cb=None,
     stop_event=None,
+    retry_passes: int = 2,
+    retry_cooldown_s: float = 30.0,
+    on_notice=None,
 ) -> dict[str, PNRDetails]:
     """Look up many PNRs with bounded concurrency + per-result checkpointing.
 
@@ -492,10 +495,19 @@ def lookup_many(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     out: dict[str, PNRDetails] = {}
+    status_by_code: dict[str, str] = {}     # latest status per code (drives retry sweeps)
     codes = [c.strip().upper() for c in pnr_codes if c and c.strip()]
     total = len(codes)
     if total == 0:
         return out
+
+    def _notice(msg: str) -> None:
+        log.info(msg)
+        if on_notice is not None:
+            try:
+                on_notice(msg)
+            except Exception:  # noqa: BLE001 — never let a callback kill the run
+                log.exception("on_notice raised")
     concurrency = max(1, min(int(concurrency), 10))
     delay_s = max(0.0, float(delay_s))
 
@@ -505,19 +517,15 @@ def lookup_many(
     # we never block draining thousands of doomed calls (mirrors fetch_many).
     _stop = stop_event if stop_event is not None else threading.Event()
 
-    # Adaptive governor. Two independent ABORT triggers so a 504-storm can't grind:
-    #   * a sliding-window FAILURE RATE — catches a storm sprinkled with the odd
-    #     success, where a consecutive-streak counter keeps resetting and never trips;
-    #   * a long CONSECUTIVE streak — a fast path for a hard-down, before the window
-    #     even fills.
-    # SLOW raises the per-worker backoff once failures dominate; both are reset by any
-    # success. Aborting is safe: every completed PNR is already checkpointed via
-    # on_result, so a re-run resumes from the cache.
+    # Adaptive governor: a sliding-window FAILURE RATE raises the per-worker backoff
+    # (SLOW) once failures dominate — politeness during a storm. It no longer ABORTS the
+    # run; the retry SWEEPS below ride the storm out instead (recovering far more than an
+    # abort ever did). Session-loss is the only hard stop. Every completed PNR is
+    # checkpointed via on_result, so a re-run still resumes from the cache.
     WINDOW = 30
-    SLOW_RATE, ABORT_RATE = 0.4, 0.8
-    ABORT_STREAK = 40
+    SLOW_RATE = 0.4
     recent: "collections.deque" = collections.deque(maxlen=WINDOW)
-    gov = {"streak": 0, "slow": False, "aborted": False, "session_lost": None}
+    gov = {"streak": 0, "slow": False, "session_lost": None}
     gov_lock = threading.Lock()
 
     def _record(transient_fail: bool) -> None:
@@ -528,9 +536,9 @@ def lookup_many(
             n = len(recent)
             rate = sum(recent) / n if n else 0.0
             gov["slow"] = n >= (WINDOW // 2) and rate >= SLOW_RATE
-            if (n >= WINDOW and rate >= ABORT_RATE) or gov["streak"] >= ABORT_STREAK:
-                gov["aborted"] = True
-                _stop.set()
+            # No hard abort: a 504-storm is now ridden out by the retry SWEEPS below
+            # (mirrors zenith_client.fetch_many) instead of killing the run. SLOW still
+            # throttles politely; session-loss remains the only hard stop.
 
     def _worker(code: str):
         if _stop.is_set():
@@ -539,8 +547,6 @@ def lookup_many(
         if cached is not None:
             return code, cached, "CACHED"
         with gov_lock:
-            if gov["aborted"]:
-                return code, None, "ERROR: Zenith overloaded — run aborted"
             slow = gov["slow"]
         if slow:
             time.sleep(_backoff_with_jitter(2, base_s=2.0, cap_s=8.0))
@@ -575,6 +581,7 @@ def lookup_many(
         for fut in as_completed(futures):
             code, details, status = fut.result()
             completed += 1
+            status_by_code[code] = status
             if status in ("OK", "CACHED") and details is not None:
                 out[code] = details
             if on_result is not None:
@@ -592,6 +599,59 @@ def lookup_many(
                     if not rem.done():
                         rem.cancel()
                 break
+
+    # --- Retry sweeps — ride out intermittent 504-storms (mirrors fetch_many) ---
+    # The PNR/Dossier endpoint 504s under load just like the customer one; a PNR that
+    # timed out now often resolves a minute later. Re-sweep ONLY transient ERROR failures
+    # (not NOT_FOUND / session-loss / cancelled) after an escalating cooldown, re-firing
+    # on_result so the caller's cache flips ERROR->OK and the output self-corrects.
+    def _is_transient(s: str) -> bool:
+        return isinstance(s, str) and s.startswith("ERROR") and "SESSION" not in s.upper()
+
+    for sweep in range(1, max(0, int(retry_passes)) + 1):
+        if _stop.is_set() or gov["session_lost"] is not None:
+            break
+        retry_codes = [c for c, s in status_by_code.items() if _is_transient(s)]
+        if not retry_codes:
+            break
+        cooldown = retry_cooldown_s * sweep
+        _notice(f"{len(retry_codes)} transient failure(s) — cooling down {cooldown:.0f}s, "
+                f"then retry sweep {sweep}/{retry_passes}…")
+        waited = 0.0
+        while waited < cooldown:
+            if _stop.is_set():
+                break
+            time.sleep(0.5)
+            waited += 0.5
+        if _stop.is_set():
+            break
+        with gov_lock:                      # fresh window for the sweep
+            recent.clear()
+            gov["streak"] = 0
+            gov["slow"] = False
+        _notice(f"Retry sweep {sweep}/{retry_passes}: re-attempting {len(retry_codes)} PNR(s)…")
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_worker, c): c for c in retry_codes}
+            for fut in as_completed(futures):
+                code, details, status = fut.result()
+                status_by_code[code] = status
+                if status in ("OK", "CACHED") and details is not None:
+                    out[code] = details
+                if on_result is not None:
+                    try:
+                        on_result(code, details, status)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_result raised for %s", code)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(total, total, code, status)
+                    except Exception:  # noqa: BLE001
+                        log.exception("progress_cb raised")
+                if _stop.is_set():
+                    for rem in futures:
+                        if not rem.done():
+                            rem.cancel()
+                    break
 
     # Surface a lost session to the caller AFTER the pool is cleanly drained,
     # so the GUI's SessionExpiredError handler still fires (re-login + resume).

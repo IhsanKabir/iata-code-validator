@@ -132,6 +132,7 @@ MSG_ZENITH_PNR_ERROR = "zenith_pnr_error"
 MSG_ZENITH_BULK_PROGRESS = "zenith_bulk_progress"  # (i, total, code, status)
 MSG_ZENITH_BULK_DONE = "zenith_bulk_done"          # payload: dict (path, counts)
 MSG_ZENITH_BULK_ERROR = "zenith_bulk_error"
+MSG_ZENITH_BULK_LOG = "zenith_bulk_log"            # payload: str (a log line)
 # Bulk Mailer
 MSG_MAIL_PROGRESS = "mail_progress"   # (i, total, to, status)
 MSG_MAIL_DONE = "mail_done"           # payload: dict (drafted/sent/failed/skipped)
@@ -4050,6 +4051,11 @@ class App:
             self.zenith_bulk_progress.configure(maximum=total, value=idx)
             # Live counters so users see exactly where the money is going.
             counters = self._zenith_bulk_counters
+            seen = self._zenith_bulk_seen
+            prev = seen.get(code)
+            if prev is not None and counters.get(prev, 0) > 0:
+                counters[prev] -= 1          # a retry sweep corrected an earlier outcome
+            seen[code] = status_code
             counters[status_code] = counters.get(status_code, 0) + 1
             ok = counters.get("OK", 0)
             cached = counters.get("CACHED", 0)
@@ -4075,6 +4081,8 @@ class App:
                 style="Hint.TLabel",
             )
             self._zenith_bulk_log_line(f"  {idx}/{total} {code}: {status_code}")
+        elif kind == MSG_ZENITH_BULK_LOG:
+            self._zenith_bulk_log_line(str(payload))
         elif kind == MSG_ZENITH_BULK_DONE:
             info = payload  # type: ignore[assignment]
             self.btn_zenith_bulk_run.configure(state="normal")
@@ -5580,6 +5588,7 @@ class App:
         self._zenith_bulk_stop_flag = threading.Event()
         # Live progress counters for the status line (E enhancement).
         self._zenith_bulk_counters: dict[str, int] = {}
+        self._zenith_bulk_seen: dict[str, str] = {}
         self._zenith_bulk_started_at: float | None = None
 
     def _zenith_bulk_pick_input(self) -> None:
@@ -5865,6 +5874,7 @@ class App:
         # Reset live counters + start-time at the top of every fresh run
         # so the throughput / ETA display starts from zero each time.
         self._zenith_bulk_counters = {}
+        self._zenith_bulk_seen = {}
         import time as _t
         self._zenith_bulk_started_at = _t.monotonic()
         self.btn_zenith_bulk_run.configure(state="disabled")
@@ -5893,7 +5903,9 @@ class App:
                 def on_result(code, details, status) -> None:
                     # Fires as each PNR lands (serially, in this thread) — so we
                     # checkpoint every success to the cache immediately, making
-                    # a Stop / crash / session-expiry resume-safe on re-run.
+                    # a Stop / crash / session-expiry resume-safe on re-run. A retry
+                    # SWEEP can re-fire this for a previously-failed code, so success /
+                    # not-found must CLEAR any earlier error so the output self-corrects.
                     if status == "OK":
                         if details is not None:
                             try:
@@ -5901,10 +5913,13 @@ class App:
                             except Exception:  # noqa: BLE001
                                 log.exception("cache.put failed for %s", code)
                             got[code] = details
+                            errors.pop(code, None)
                     elif status == "CACHED":
                         got[code] = details
+                        errors.pop(code, None)
                     elif status == "NOT_FOUND":
                         got[code] = None
+                        errors.pop(code, None)
                     elif isinstance(status, str) and status.startswith("ERROR"):
                         got[code] = None
                         errors[code] = status.split("ERROR:", 1)[-1].strip() or status
@@ -5922,6 +5937,7 @@ class App:
                     on_result=on_result,
                     progress_cb=progress,
                     stop_event=stop,
+                    on_notice=lambda msg: self._post(MSG_ZENITH_BULK_LOG, msg),
                 )
 
                 # Rebuild output rows in INPUT order (completion order is
