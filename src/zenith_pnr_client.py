@@ -462,7 +462,7 @@ def lookup_many(
     on_result=None,
     progress_cb=None,
     stop_event=None,
-    retry_passes: int = 2,
+    retry_passes: int = 8,          # MAX retry sweeps (loop-until-dry stops early on no progress)
     retry_cooldown_s: float = 30.0,
     on_notice=None,
 ) -> dict[str, PNRDetails]:
@@ -608,15 +608,23 @@ def lookup_many(
     def _is_transient(s: str) -> bool:
         return isinstance(s, str) and s.startswith("ERROR") and "SESSION" not in s.upper()
 
-    for sweep in range(1, max(0, int(retry_passes)) + 1):
+    # Loop-until-dry: a 504-storm is intermittent (different PNRs time out each pass), so keep
+    # re-sweeping the transient failures until NONE remain, a sweep recovers NOTHING (origin
+    # genuinely down — stop, re-run later/off-peak), Stop is pressed, or the safety cap is hit.
+    # Cooldown is capped so a long storm doesn't escalate forever. The cache checkpoints every
+    # success, so a Stop/crash and a later Skip-cached re-run pick up exactly where this left off.
+    sweep = 0
+    empty_sweeps = 0
+    while sweep < max(0, int(retry_passes)):
         if _stop.is_set() or gov["session_lost"] is not None:
             break
         retry_codes = [c for c, s in status_by_code.items() if _is_transient(s)]
         if not retry_codes:
             break
-        cooldown = retry_cooldown_s * sweep
-        _notice(f"{len(retry_codes)} transient failure(s) — cooling down {cooldown:.0f}s, "
-                f"then retry sweep {sweep}/{retry_passes}…")
+        sweep += 1
+        cooldown = min(90.0, retry_cooldown_s * sweep)
+        _notice(f"{len(retry_codes)} transient failure(s) left — cooling down {cooldown:.0f}s, "
+                f"then retry sweep {sweep}…")
         waited = 0.0
         while waited < cooldown:
             if _stop.is_set():
@@ -629,7 +637,8 @@ def lookup_many(
             recent.clear()
             gov["streak"] = 0
             gov["slow"] = False
-        _notice(f"Retry sweep {sweep}/{retry_passes}: re-attempting {len(retry_codes)} PNR(s)…")
+        _notice(f"Retry sweep {sweep}: re-attempting {len(retry_codes)} PNR(s)…")
+        recovered = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(_worker, c): c for c in retry_codes}
             for fut in as_completed(futures):
@@ -637,6 +646,7 @@ def lookup_many(
                 status_by_code[code] = status
                 if status in ("OK", "CACHED") and details is not None:
                     out[code] = details
+                    recovered += 1
                 if on_result is not None:
                     try:
                         on_result(code, details, status)
@@ -652,6 +662,11 @@ def lookup_many(
                         if not rem.done():
                             rem.cancel()
                     break
+        empty_sweeps = empty_sweeps + 1 if recovered == 0 else 0
+        if empty_sweeps >= 2:               # two sweeps in a row recovered nothing -> down
+            _notice("Two retry sweeps recovered nothing — Zenith still overloaded; stopping. "
+                    "Re-run with Skip-cached on (later / off-peak) to pick up the rest.")
+            break
 
     # Surface a lost session to the caller AFTER the pool is cleanly drained,
     # so the GUI's SessionExpiredError handler still fires (re-login + resume).

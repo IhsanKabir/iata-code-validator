@@ -5888,14 +5888,13 @@ class App:
         sess = self._zenith_session
         stop = self._zenith_bulk_stop_flag
 
-        # GENTLE by default: the PNR→Dossier render is HEAVY (a full booking + history),
-        # far heavier than a customer-form fetch. Real-world proof: at concurrency=3 the
-        # PNR lookup 504'd ~80% while the customer lookup at concurrency=1 ran ~99.8% on
-        # the SAME Zenith — 3 concurrent heavy renders overwhelm the origin. So we match
-        # the proven-gentle customer config (1 worker, slower pace); the retry sweeps in
-        # lookup_many then mop up the intermittent 504s.
-        _BULK_CONCURRENCY = 1
-        _BULK_DELAY_S = 1.5
+        # The PNR→Dossier render is HEAVY (a full booking + history) and 504s under load;
+        # pacing alone can't fix that (concurrency=1 still 504'd, just slower). The real
+        # lever is PERSISTENCE: lookup_many now loops-until-dry, re-sweeping the failures
+        # until the storm lets them through (resume-safe via the cache). So we keep a
+        # reasonable throughput here rather than crippling it.
+        _BULK_CONCURRENCY = 3
+        _BULK_DELAY_S = 0.8
 
         def worker() -> None:
             try:

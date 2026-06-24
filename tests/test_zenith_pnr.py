@@ -519,6 +519,38 @@ class TestLookupMany:
                               retry_passes=2, retry_cooldown_s=0)
         assert out == {} and calls["n"] == 1               # not-found never re-swept
 
+    def test_loop_until_dry_recovers_over_multiple_sweeps(self, monkeypatch) -> None:
+        # Each PNR fails its first TWO attempts (main + sweep 1), succeeds on sweep 2 —
+        # loop-until-dry must keep going past one sweep to recover them.
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        seen: dict = {}
+
+        def flaky(_session, code, **_kw):
+            seen[code] = seen.get(code, 0) + 1
+            if seen[code] <= 2:
+                raise zpc.ZenithError("504")
+            return parse_dossier_html(_build_dossier_html(pnr=code))
+
+        monkeypatch.setattr(zpc, "lookup_pnr", flaky)
+        out = zpc.lookup_many(object(), ["P1", "P2"], concurrency=1, delay_s=0.0,
+                              retry_passes=8, retry_cooldown_s=0)
+        assert len(out) == 2                               # recovered by the 2nd sweep
+
+    def test_loop_stops_when_a_sweep_recovers_nothing(self, monkeypatch) -> None:
+        # A genuinely-down endpoint: one sweep recovers nothing -> stop (don't grind 8x).
+        monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
+        calls = {"n": 0}
+
+        def boom(_session, _code, **_kw):
+            calls["n"] += 1
+            raise zpc.ZenithError("504")
+
+        monkeypatch.setattr(zpc, "lookup_pnr", boom)
+        out = zpc.lookup_many(object(), ["A", "B", "C"], concurrency=1, delay_s=0.0,
+                              retry_passes=8, retry_cooldown_s=0)
+        assert out == {}
+        assert calls["n"] == 9                             # main(3) + TWO empty sweeps(3+3), then stop
+
     def test_retry_passes_zero_disables_sweeps(self, monkeypatch) -> None:
         monkeypatch.setattr(zpc, "_backoff_with_jitter", lambda *a, **k: 0.0)
         calls = {"n": 0}
