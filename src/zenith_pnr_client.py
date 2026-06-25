@@ -373,7 +373,7 @@ def lookup_pnr(
     session: ZenithSession,
     pnr_code: str,
     *,
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
     max_attempts: int = 3,
 ) -> PNRDetails:
     """Resolve `pnr_code` to a parsed PNRDetails record, retrying transients.

@@ -59,6 +59,12 @@ BD_CACHE_STALE_AFTER_DAYS = 7  # warn the user when the cached list is older
 
 OEP_PRESET_FILE = APP_DIR / "oep_presets.json"
 
+# Optional Zenith host override (one line, e.g. https://asia.ttinteractive.com). The
+# default `usba.` host is CloudFront-fronted and 504s on slow Dossier renders; the direct
+# `asia.` origin waits them out. main.py reads this BEFORE the Zenith client modules import
+# and sets ZENITH_BASE_URL so every endpoint URL picks it up.
+ZENITH_HOST_FILE = APP_DIR / "zenith_host.txt"
+
 BD_OUTPUT_COLUMNS_LOOKUP = [
     "Searched Input",
     "Match Method",

@@ -27,6 +27,7 @@ delay × N workers = effective rate. Tests at N=1 first, then dial up.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import threading
@@ -44,12 +45,16 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Zenith serves each carrier from its OWN tenant subdomain — US-Bangla's is
-# `usba.ttinteractive.com` (it matches the company code). Login ONLY completes
-# on the tenant host: posting credentials to a different host (e.g. the old
-# `asia.` regional gateway) just bounces back to /otds/index.asp, which the
-# UI shows as "Login rejected by Zenith — landed at …action=TESTLOGIN".
-BASE_URL = "https://usba.ttinteractive.com"
+# HOST. `usba.ttinteractive.com` (the tenant subdomain) is fronted by CloudFront, which
+# returns 504 Gateway Timeout the moment the legacy ASP.NET 2.0 Dossier render exceeds its
+# origin timeout — the entire bulk-lookup "504 storm". A captured browser HAR proved the
+# regional host `asia.ttinteractive.com` is the DIRECT origin (NO CloudFront): it patiently
+# waits a slow render out — a 55-second render returned 200 + 123 KB — exactly how the
+# browser avoids 504s. Override the host with the ZENITH_BASE_URL env var to route around
+# CloudFront (set it to https://asia.ttinteractive.com and restart). All endpoint URLs and
+# both client modules derive from this, so one switch covers everything.
+BASE_URL = os.environ.get(
+    "ZENITH_BASE_URL", "https://usba.ttinteractive.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/otds/index.asp?action=TESTLOGIN"
 LANDING_URL = f"{BASE_URL}/NewUI/aerien/f_index.asp"
 INIT_CONTEXT_URL = (
@@ -360,7 +365,7 @@ class ZenithSession:
         return cls(session=sess, state_values=state_values, company_code=company_code)
 
     def fetch_customer(
-        self, customer_id: str, *, timeout_s: float = 45.0, max_attempts: int = 4,
+        self, customer_id: str, *, timeout_s: float = 90.0, max_attempts: int = 4,
     ) -> CustomerRecord:
         """Fetch and parse one customer record, retrying transient failures.
 

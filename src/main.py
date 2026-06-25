@@ -13,6 +13,23 @@ import sys
 from . import config
 
 
+def _apply_zenith_host_override() -> None:
+    """Set ZENITH_BASE_URL from the saved host file BEFORE the Zenith modules import.
+
+    Lets the user route around the CloudFront-fronted `usba.` host (which 504-storms on
+    slow Dossier renders) to the direct `asia.` origin — chosen once in the GUI, persisted
+    here. An explicit env var always wins over the saved file.
+    """
+    if os.environ.get("ZENITH_BASE_URL"):
+        return
+    try:
+        saved = config.ZENITH_HOST_FILE.read_text(encoding="utf-8").strip()
+    except (OSError, AttributeError):
+        saved = ""
+    if saved:
+        os.environ["ZENITH_BASE_URL"] = saved
+
+
 def _configure_bundled_browser_path() -> None:
     """When frozen by PyInstaller, point patchright at the bundled Chromium.
 
@@ -84,6 +101,7 @@ def main() -> int:
 
     _configure_bundled_browser_path()
     config.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _apply_zenith_host_override()   # MUST precede the gui import (which imports zenith_client)
 
     # Late import so PLAYWRIGHT_BROWSERS_PATH is set before any
     # patchright/playwright import touches the browser path resolver.

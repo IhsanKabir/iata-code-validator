@@ -133,6 +133,14 @@ MSG_ZENITH_BULK_PROGRESS = "zenith_bulk_progress"  # (i, total, code, status)
 MSG_ZENITH_BULK_DONE = "zenith_bulk_done"          # payload: dict (path, counts)
 MSG_ZENITH_BULK_ERROR = "zenith_bulk_error"
 MSG_ZENITH_BULK_LOG = "zenith_bulk_log"            # payload: str (a log line)
+
+# Zenith host options. The default usba host is CloudFront-fronted and 504-storms on slow
+# Dossier renders; the direct asia origin waits them out. "" = no override (default usba).
+ZENITH_HOST_OPTIONS = {
+    "Default — usba.ttinteractive.com (via CloudFront)": "",
+    "Direct origin — asia.ttinteractive.com (avoids 504 storms)": "https://asia.ttinteractive.com",
+}
+
 # Bulk Mailer
 MSG_MAIL_PROGRESS = "mail_progress"   # (i, total, to, status)
 MSG_MAIL_DONE = "mail_done"           # payload: dict (drafted/sent/failed/skipped)
@@ -4831,6 +4839,22 @@ class App:
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
 
+        # ----- Server (route around the CloudFront 504 storm) -----
+        host_row = ttk.Frame(login_body)
+        host_row.pack(fill="x", padx=2, pady=(2, 0))
+        ttk.Label(host_row, text="Server:").pack(side="left", padx=(0, 4))
+        self.zenith_host_choice = tk.StringVar(value=self._zenith_host_saved_label())
+        host_combo = ttk.Combobox(
+            host_row, textvariable=self.zenith_host_choice, state="readonly", width=52,
+            values=list(ZENITH_HOST_OPTIONS.keys()),
+        )
+        host_combo.pack(side="left", padx=(0, 8))
+        host_combo.bind("<<ComboboxSelected>>", lambda _e: self._zenith_save_host())
+        ttk.Label(
+            host_row, style="Hint.TLabel",
+            text="Pick 'Direct origin' if you hit 504 storms, then restart the app.",
+        ).pack(side="left")
+
         # Compact one-line strip shown in place of the login form once
         # the user is authenticated. Hidden by default — the
         # `_refresh_zenith_login_collapse` method swaps the two views.
@@ -6687,6 +6711,37 @@ class App:
                 fill="x", padx=4, pady=(8, 4),
                 before=getattr(self, "zenith_inner_notebook", None),
             )
+
+    def _zenith_host_saved_label(self) -> str:
+        """The dropdown label matching the persisted host override (default if none/unknown)."""
+        try:
+            saved = config.ZENITH_HOST_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            saved = ""
+        for label, url in ZENITH_HOST_OPTIONS.items():
+            if url == saved:
+                return label
+        return next(iter(ZENITH_HOST_OPTIONS))      # unknown custom value -> show default
+
+    def _zenith_save_host(self) -> None:
+        """Persist the chosen Zenith host; it's applied on next launch (main.py reads it
+        before the Zenith modules import, so a restart is required)."""
+        url = ZENITH_HOST_OPTIONS.get(self.zenith_host_choice.get(), "")
+        try:
+            if url:
+                config.ZENITH_HOST_FILE.parent.mkdir(parents=True, exist_ok=True)
+                config.ZENITH_HOST_FILE.write_text(url, encoding="utf-8")
+            elif config.ZENITH_HOST_FILE.exists():
+                config.ZENITH_HOST_FILE.unlink()
+        except OSError as exc:
+            messagebox.showerror("Zenith server", f"Couldn't save the setting:\n{exc}")
+            return
+        messagebox.showinfo(
+            "Zenith server",
+            f"Server set to:\n  {url or 'Default (usba — via CloudFront)'}\n\n"
+            "Restart the app for this to take effect, then sign in again.\n\n"
+            "Direct origin (asia) avoids the CloudFront 504 timeout — it waits the slow "
+            "Dossier render out instead of failing (slower per PNR, but it resolves).")
 
     def _zenith_login(self) -> None:
         user = self.zenith_username.get().strip()
