@@ -32,6 +32,7 @@ import random
 import re
 import threading
 import time
+from html import unescape as _html_unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
@@ -45,16 +46,15 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# HOST. `usba.ttinteractive.com` (the tenant subdomain) is fronted by CloudFront, which
-# returns 504 Gateway Timeout the moment the legacy ASP.NET 2.0 Dossier render exceeds its
-# origin timeout — the entire bulk-lookup "504 storm". A captured browser HAR proved the
-# regional host `asia.ttinteractive.com` is the DIRECT origin (NO CloudFront): it patiently
-# waits a slow render out — a 55-second render returned 200 + 123 KB — exactly how the
-# browser avoids 504s. Override the host with the ZENITH_BASE_URL env var to route around
-# CloudFront (set it to https://asia.ttinteractive.com and restart). All endpoint URLs and
-# both client modules derive from this, so one switch covers everything.
+# HOST. DEFAULT is `asia.ttinteractive.com` — the DIRECT origin. The tenant subdomain
+# `usba.ttinteractive.com` is fronted by CloudFront, which returns 504 Gateway Timeout the
+# moment the legacy ASP.NET 2.0 Dossier render exceeds its origin timeout (the entire
+# bulk-lookup "504 storm"). A captured browser HAR + a live run proved `asia` (no CloudFront)
+# waits a slow render out — a 55-second render returned 200 — eliminating the storm. Override
+# with the ZENITH_BASE_URL env var (or the GUI Server picker) to fall back to usba if needed.
+# All endpoint URLs and both client modules derive from this, so one switch covers everything.
 BASE_URL = os.environ.get(
-    "ZENITH_BASE_URL", "https://usba.ttinteractive.com").rstrip("/")
+    "ZENITH_BASE_URL", "https://asia.ttinteractive.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/otds/index.asp?action=TESTLOGIN"
 LANDING_URL = f"{BASE_URL}/NewUI/aerien/f_index.asp"
 INIT_CONTEXT_URL = (
@@ -62,6 +62,14 @@ INIT_CONTEXT_URL = (
 )
 CUSTOMER_LOOKUP_URL = (
     f"{BASE_URL}/TTIDOTNET/TRANSPORT/TRANSPORTNETBO2/SALES2/CustomerViews/FinalCustomer.ashx"
+)
+# A Zenith customer can be a Final Customer (person) OR a Travel Agency — different .ashx
+# handlers that render the SAME Customer.aspx but with different forms. FinalCustomer returns
+# an empty page (no form) for an agency id, so the app must fall back to TravelAgency.ashx,
+# whose form carries the agency name (txtCompanyName) + IATA number (txtIATANumber). Verified
+# from a browser HAR. Both derive from BASE_URL so the host override covers them.
+TRAVEL_AGENCY_LOOKUP_URL = (
+    f"{BASE_URL}/TTIDOTNET/TRANSPORT/TRANSPORTNETBO2/SALES2/CustomerViews/TravelAgency.ashx"
 )
 FLIGHT_LOAD_URL = f"{BASE_URL}/newui/aerien/commercial/Sale_ListeVols_NewStock.asp"
 
@@ -140,6 +148,12 @@ class CustomerRecord:
     """
 
     customer_id: str
+    # Travel-agency customers (vs Final Customers/persons): the form carries an agency name
+    # + IATA number instead of first/last name. Empty for person customers.
+    customer_type: str = ""          # "Travel Agency" | "Final Customer"
+    company_name: str = ""           # agency name (txtCompanyName)
+    administrative_name: str = ""    # txtAdministrativeName
+    iata_number: str = ""            # txtIATANumber — the key field for tagging agencies
     title: str = ""
     first_name: str = ""
     middle_name: str = ""
@@ -195,9 +209,12 @@ _REG_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A NOT_FOUND page typically lacks any txtFirstName / txtLastName field.
-# We treat "no first AND no last name AND no email" as missing.
-_MARKERS_OF_PRESENCE = ("txtFirstName", "txtLastName", "txtEmail")
+# A NOT_FOUND page lacks any of these fields. Persons carry txtFirstName/txtLastName;
+# travel agencies carry txtCompanyName/txtIATANumber; both carry txtEmail. "None present"
+# means we didn't get a real customer form (empty/degraded/wrong-handler page).
+_MARKERS_OF_PRESENCE = (
+    "txtFirstName", "txtLastName", "txtEmail", "txtCompanyName", "txtIATANumber",
+)
 
 
 def parse_customer_html(html: str, customer_id: str) -> CustomerRecord:
@@ -221,7 +238,9 @@ def parse_customer_html(html: str, customer_id: str) -> CustomerRecord:
     registration_date = reg_date_match.group(1).strip() if reg_date_match else ""
 
     def t(name: str) -> str:
-        return text_fields.get(name, "").strip()
+        # Decode HTML entities so agency names like "Biswas Travels &amp; Tours" and
+        # addresses come out clean ("&", not "&amp;").
+        return _html_unescape(text_fields.get(name, "")).strip()
 
     def s(name: str) -> str:
         v = select_fields.get(name, "").strip()
@@ -232,8 +251,18 @@ def parse_customer_html(html: str, customer_id: str) -> CustomerRecord:
     # the dropdown form uses ddlCountry. Prefer the dropdown when set.
     country = s("ddlCountry") or t("txtCountry")
 
+    # Travel-agency fields (empty on a person form). Their presence => agency.
+    company_name = t("txtCompanyName")
+    iata_number = t("txtIATANumber")
+    administrative_name = t("txtAdministrativeName")
+    is_agency = bool(company_name or iata_number)
+
     record = CustomerRecord(
         customer_id=customer_id,
+        customer_type="Travel Agency" if is_agency else "Final Customer",
+        company_name=company_name,
+        administrative_name=administrative_name,
+        iata_number=iata_number,
         title=s("ddlTitle"),
         first_name=t("txtFirstName"),
         middle_name=t("txtMiddleName"),
@@ -367,14 +396,34 @@ class ZenithSession:
     def fetch_customer(
         self, customer_id: str, *, timeout_s: float = 90.0, max_attempts: int = 4,
     ) -> CustomerRecord:
-        """Fetch and parse one customer record, retrying transient failures.
+        """Fetch one customer, trying the Final-Customer handler then the Travel-Agency one.
 
-        Zenith intermittently returns 502/503/504 (gateway timeout / overload)
-        on bulk runs; those — and network blips — are retried with capped
-        backoff + jitter instead of failing the ID on the first hiccup.
-        Session loss (401/403 or a login redirect) is NOT retried; it needs a
-        fresh login. Raises CustomerNotFoundError, SessionExpiredError,
-        RateLimitedError, or ZenithError once retries are exhausted.
+        A Zenith customer is either a Final Customer (person) or a Travel Agency; they use
+        different .ashx handlers. FinalCustomer.ashx returns an empty page for an agency id,
+        so we fall back to TravelAgency.ashx (which carries the agency name + IATA number).
+        Transient 5xx/network are retried per endpoint; session loss is never retried.
+        Raises CustomerNotFoundError only when BOTH handlers come up empty.
+        """
+        try:
+            # Final-customer first; don't burn no-form retries here — fall straight through
+            # to the agency handler (the empty page IS the "try the other handler" signal).
+            return self._fetch_customer_via(
+                CUSTOMER_LOOKUP_URL, customer_id,
+                timeout_s=timeout_s, max_attempts=max_attempts, retry_no_form=False)
+        except CustomerNotFoundError:
+            return self._fetch_customer_via(
+                TRAVEL_AGENCY_LOOKUP_URL, customer_id,
+                timeout_s=timeout_s, max_attempts=max_attempts, retry_no_form=True)
+
+    def _fetch_customer_via(
+        self, url: str, customer_id: str, *, timeout_s: float, max_attempts: int,
+        retry_no_form: bool,
+    ) -> CustomerRecord:
+        """Fetch + parse from ONE handler, retrying transient failures.
+
+        `retry_no_form` retries a no-form page (a degraded/overloaded response can render as
+        a 200 with no fields) — used on the LAST handler so a storm artifact isn't mistaken
+        for a real miss; the first handler fails fast so an agency falls through quickly.
         """
         params = {"IdCustomer": str(customer_id).strip()}
         attempts = max(1, int(max_attempts))
@@ -382,58 +431,40 @@ class ZenithSession:
             is_last = attempt >= attempts
             try:
                 resp = self.session.get(
-                    CUSTOMER_LOOKUP_URL,
-                    params=params,
-                    allow_redirects=True,
-                    timeout=timeout_s,
-                )
+                    url, params=params, allow_redirects=True, timeout=timeout_s)
             except requests.RequestException as exc:
                 if is_last:
                     raise ZenithError(
                         f"Network error fetching {customer_id} after "
-                        f"{attempts} attempts: {exc}"
-                    ) from exc
+                        f"{attempts} attempts: {exc}") from exc
                 time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
                 continue
 
-            # Session loss — never retry; the caller must re-login.
             if resp.status_code in (401, 403) or "/otds/" in resp.url:
                 raise SessionExpiredError(
                     f"Zenith returned {resp.status_code} for ID {customer_id} — "
-                    "session expired or never authenticated."
-                )
-            # Rate limited / temporarily unavailable — back off (longer) + retry.
+                    "session expired or never authenticated.")
             if resp.status_code in (429, 503):
                 if is_last:
                     raise RateLimitedError(
                         f"Zenith returned {resp.status_code} for ID "
-                        f"{customer_id} after {attempts} attempts — back off."
-                    )
+                        f"{customer_id} after {attempts} attempts — back off.")
                 time.sleep(_backoff_with_jitter(attempt, base_s=4.0, cap_s=12.0))
                 continue
-            # Transient gateway/server errors — the 502/503/504 (and 500) seen
-            # on bulk runs. Retry; only fail the ID if it sticks.
             if resp.status_code >= 500:
                 if is_last:
                     raise ZenithError(
                         f"Zenith returned {resp.status_code} for ID "
-                        f"{customer_id} after {attempts} attempts."
-                    )
+                        f"{customer_id} after {attempts} attempts.")
                 time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
                 continue
-            # 2xx/3xx (not a login redirect) — parse it. A page with NO customer form
-            # at all is almost always a degraded/error response under overload: a genuinely
-            # missing ID returns an EMPTY FORM (markers present, fields blank), so "no markers"
-            # means we didn't get the form. Retry it like any transient; only the final
-            # attempt lets CustomerNotFoundError through (so a real miss is still reported).
             try:
                 return parse_customer_html(resp.text, str(customer_id))
             except CustomerNotFoundError:
-                if is_last:
+                if is_last or not retry_no_form:
                     raise
                 time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
                 continue
-        # The loop always returns or raises on the final attempt; guard anyway.
         raise ZenithError(f"Exhausted retries fetching {customer_id}.")
 
 

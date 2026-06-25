@@ -137,8 +137,9 @@ MSG_ZENITH_BULK_LOG = "zenith_bulk_log"            # payload: str (a log line)
 # Zenith host options. The default usba host is CloudFront-fronted and 504-storms on slow
 # Dossier renders; the direct asia origin waits them out. "" = no override (default usba).
 ZENITH_HOST_OPTIONS = {
-    "Default — usba.ttinteractive.com (via CloudFront)": "",
-    "Direct origin — asia.ttinteractive.com (avoids 504 storms)": "https://asia.ttinteractive.com",
+    "Direct origin — asia.ttinteractive.com (default, avoids 504 storms)": "",
+    "usba.ttinteractive.com (via CloudFront — only if asia is unavailable)":
+        "https://usba.ttinteractive.com",
 }
 
 # Bulk Mailer

@@ -29,13 +29,13 @@ def test_env_override_flows_to_every_url():
     assert "usba" not in r.stdout
 
 
-def test_default_host_is_usba():
+def test_default_host_is_asia():
     code = "import src.zenith_client as z; print(z.BASE_URL)"
     env = {k: v for k, v in os.environ.items() if k != "ZENITH_BASE_URL"}
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        cwd=str(_REPO), env=env)
     assert r.returncode == 0, r.stderr
-    assert "usba.ttinteractive.com" in r.stdout
+    assert "asia.ttinteractive.com" in r.stdout      # asia is now the default (direct origin)
 
 
 def test_main_applies_saved_host_file(tmp_path, monkeypatch):

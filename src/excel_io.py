@@ -845,6 +845,10 @@ def write_zenith_results(path: Path, results: Iterable) -> None:
         ws.append([
             r.customer_id,
             r.status,
+            rec.customer_type if rec else "",
+            rec.company_name if rec else "",
+            rec.iata_number if rec else "",
+            rec.administrative_name if rec else "",
             rec.title if rec else "",
             rec.first_name if rec else "",
             rec.middle_name if rec else "",

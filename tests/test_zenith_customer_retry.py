@@ -93,13 +93,45 @@ def test_no_form_page_retried_then_recovers(monkeypatch):
     assert sess.session.calls == 2          # no-form retried, second got the real form
 
 
+# An agency page: no person fields, but txtCompanyName + txtIATANumber present.
+_AGENCY_HTML = (
+    '<input name="m$txtCompanyName" value="Biswas Travels &amp; Tours">'
+    '<input name="m$txtAdministrativeName" value="Biswas Travels">'
+    '<input name="m$txtIATANumber" value="42311242">'
+    '<input name="m$txtEmail" value="biswas@x.com">'
+)
+
+
 def test_persistent_no_form_raises_not_found(monkeypatch):
-    """If the form never appears across every attempt, it's a real not-found."""
+    """If neither handler ever returns a form, it's a real not-found. The Final-Customer
+    handler fails fast (1 call); the Travel-Agency handler retries no-form (max_attempts)."""
     monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
-    sess = _session([_Resp(200, _NO_FORM_HTML)] * 4)
+    sess = _session([_Resp(200, _NO_FORM_HTML)] * 5)   # 1 final-customer + 4 agency tries
     with pytest.raises(zenith_client.CustomerNotFoundError):
         sess.fetch_customer("99999999", max_attempts=4)
-    assert sess.session.calls == 4          # retried each time, then declared not-found
+    assert sess.session.calls == 5
+
+
+def test_agency_id_falls_back_to_travelagency_handler(monkeypatch):
+    """The 'Untagged BD Agencies' case: Final-Customer returns an empty page, the agency
+    handler returns the agency form -> we read the agency name + IATA number."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _session([_Resp(200, _NO_FORM_HTML), _Resp(200, _AGENCY_HTML)])
+    rec = sess.fetch_customer("10717062")
+    assert rec.customer_type == "Travel Agency"
+    assert rec.company_name == "Biswas Travels & Tours"
+    assert rec.iata_number == "42311242"
+    assert rec.first_name == "" and rec.email == "biswas@x.com"
+    assert sess.session.calls == 2          # final-customer (empty) then agency (hit)
+
+
+def test_person_id_resolves_on_first_handler(monkeypatch):
+    """A real person resolves on the Final-Customer handler — no agency fallback call."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _session([_Resp(200, _OK_HTML)])
+    rec = sess.fetch_customer("11000000")
+    assert rec.customer_type == "Final Customer" and rec.first_name == "John"
+    assert sess.session.calls == 1          # no fallback needed
 
 
 # --- fetch_many automatic retry sweeps (storm resilience) --------------------

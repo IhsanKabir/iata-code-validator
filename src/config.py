@@ -150,6 +150,10 @@ OEP_OUTPUT_COLUMNS_GENDER_SUMMARY = [
 ZENITH_OUTPUT_COLUMNS = [
     "Customer ID",
     "Status",
+    "Customer Type",
+    "Agency Name",
+    "IATA Number",
+    "Administrative Name",
     "Title",
     "First Name",
     "Middle Name",
