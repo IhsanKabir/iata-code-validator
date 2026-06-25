@@ -5515,8 +5515,9 @@ class App:
         self._section(
             parent, "PNR Bulk Lookup  ·  paste a list, get every detail",
             help_text=(
-                "Reads a column of PNR codes from an Excel file, looks up "
-                "each one against Zenith, and writes the route, customer, "
+                "Reads a column of PNR codes (08TXEG) OR numeric dossier IDs "
+                "(14501079) from an Excel file — it auto-detects which — looks "
+                "each one up against Zenith, and writes the route, customer, "
                 "status, fares, and per-segment breakdown back to a new "
                 "workbook. Cached locally so re-runs are instant."
             ),

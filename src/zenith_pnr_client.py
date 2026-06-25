@@ -76,6 +76,13 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 QUICK_SEARCH_URL = f"{BASE_URL}/newui/dash/quickSearchRights.json.asp"
+# Direct dossier entry by numeric Id_Dossier (skips the PNR-code search). The quickSearch
+# 302s here for a PNR code; for a dossier ID we hit it directly. Verified from a browser HAR:
+# SyntheseDossier.aspx?Id_Dossier=<id> 302s straight to the rendered Dossier.aspx (it mints
+# the taskId itself), and resolves cancelled bookings the code-search skips.
+SYNTHESE_DOSSIER_URL = (
+    f"{BASE_URL}/TTIDotNet/Transport/TransportNetBO2/Sales/SyntheseDossier.aspx"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +376,15 @@ def parse_dossier_html(html: str) -> PNRDetails:
 # ---------------------------------------------------------------------------
 
 
+def _is_dossier_id(code: str) -> bool:
+    """A numeric internal dossier id (e.g. 14501079) vs a PNR code (e.g. 08TXEG).
+
+    Dossier ids are all-digit and 7+ chars; PNR codes are 6-char alphanumeric. The
+    length floor keeps an all-numeric 6-char PNR from being misread as a dossier id.
+    """
+    return code.isdigit() and len(code) >= 7
+
+
 def lookup_pnr(
     session: ZenithSession,
     pnr_code: str,
@@ -376,41 +392,69 @@ def lookup_pnr(
     timeout_s: float = 120.0,
     max_attempts: int = 3,
 ) -> PNRDetails:
-    """Resolve `pnr_code` to a parsed PNRDetails record, retrying transients.
+    """Resolve a PNR CODE (e.g. 08TXEG) or a numeric DOSSIER ID (e.g. 14501079) to PNRDetails.
 
-    Goes through the same quickSearch redirect chain the Zenith UI uses — that
-    gives us automatic 302-following to the Dossier page without us needing the
-    internal Id_Dossier ahead of time.
+    PNR codes go through the quickSearch redirect chain the Zenith UI uses (it resolves the
+    code, then 302s to SyntheseDossier -> Dossier.aspx). A numeric dossier id is resolved
+    DIRECTLY via SyntheseDossier.aspx?Id_Dossier=<id> — skipping the code-search, which can't
+    match a dossier id and also misses cancelled bookings. A dossier id additionally falls
+    back to the code-search on a clean not-found (VERIF resolves some numeric ids too), so a
+    misclassified or odd id still resolves. Mirrors fetch_customer's two-handler fallback.
 
-    Zenith intermittently returns 502/503/504 (gateway timeout / overload) on
-    bulk PNR runs; those — and network blips — are retried with capped backoff
-    + jitter instead of failing the PNR on the first hiccup (the dominant cause
-    of bulk-run errors). Session loss (401/403 or a login redirect) is NOT
-    retried — it needs a fresh login. The read timeout stays generous because
-    the Dossier page is a large, slow ASPX render. Mirrors fetch_customer.
+    Transient 502/503/504 + network blips are retried with capped backoff + jitter; session
+    loss (401/403 / login redirect) is never retried. The read timeout stays generous because
+    the Dossier page is a large, slow ASPX render.
     """
     if not pnr_code:
         raise ValueError("pnr_code must be a non-empty string")
-    sess = session.session
-    sess.headers.setdefault("User-Agent", USER_AGENT)
+    session.session.headers.setdefault("User-Agent", USER_AGENT)
+    code = pnr_code.strip().upper()
 
-    params = {
-        "id_langue": "2",
-        "GDSCRSPartnerRCIRLoc": "",
-        "vaction": "VERIF",
-        "Id": pnr_code.strip().upper(),
-    }
+    qs = (QUICK_SEARCH_URL, {
+        "id_langue": "2", "GDSCRSPartnerRCIRLoc": "", "vaction": "VERIF", "Id": code,
+    })
+    syn = (SYNTHESE_DOSSIER_URL, {"Id_Dossier": code})
+    # Dossier ids: direct entry first, code-search as fallback. PNR codes: code-search only
+    # (a 6-char code is not a numeric Id_Dossier, so SyntheseDossier can't help it).
+    endpoints = [syn, qs] if _is_dossier_id(code) else [qs]
+
+    last_not_found: PNRNotFoundError | None = None
+    for url, params in endpoints:
+        try:
+            return _lookup_dossier_via(
+                session, url, params, code, timeout_s=timeout_s, max_attempts=max_attempts)
+        except PNRNotFoundError as exc:
+            last_not_found = exc        # try the next endpoint before declaring not-found
+            continue
+    raise last_not_found or PNRNotFoundError(f"Zenith couldn't resolve {code!r}.")
+
+
+def _lookup_dossier_via(
+    session: ZenithSession,
+    url: str,
+    params: dict,
+    code: str,
+    *,
+    timeout_s: float,
+    max_attempts: int,
+) -> PNRDetails:
+    """One endpoint's retry loop: GET (following 302s to Dossier.aspx) + parse.
+
+    Retries transient 5xx / network blips with capped backoff. Raises PNRNotFoundError on a
+    dashboard/empty page (so the caller can try the other endpoint), SessionExpiredError /
+    RateLimitedError / ZenithError on session loss / rate-limit / stuck-5xx.
+    """
+    sess = session.session
     import time as _t
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         is_last = attempt >= attempts
         try:
-            resp = sess.get(QUICK_SEARCH_URL, params=params, timeout=timeout_s)
+            resp = sess.get(url, params=params, timeout=timeout_s)
         except requests.RequestException as exc:
             if is_last:
                 raise ZenithError(
-                    f"Network error looking up PNR {pnr_code} after "
-                    f"{attempts} attempts: {exc}"
+                    f"Network error looking up {code} after {attempts} attempts: {exc}"
                 ) from exc
             _t.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
             continue
@@ -418,38 +462,34 @@ def lookup_pnr(
         # Session loss — never retry; the caller must re-login.
         if resp.status_code in (401, 403) or "/otds/" in resp.url:
             raise SessionExpiredError(
-                f"Zenith returned {resp.status_code} for PNR {pnr_code} — "
+                f"Zenith returned {resp.status_code} for {code} — "
                 "session expired or never authenticated."
             )
         # Rate limited / unavailable — back off longer + retry.
         if resp.status_code in (429, 503):
             if is_last:
                 raise RateLimitedError(
-                    f"Zenith returned {resp.status_code} for PNR {pnr_code} "
+                    f"Zenith returned {resp.status_code} for {code} "
                     f"after {attempts} attempts — back off."
                 )
             _t.sleep(_backoff_with_jitter(attempt, base_s=4.0, cap_s=12.0))
             continue
-        # Transient gateway/server errors — the 502/503/504/500 storm seen on
-        # bulk runs. Retry; only fail this PNR if it sticks.
+        # Transient gateway/server errors — the 502/503/504/500 storm seen on bulk runs.
         if resp.status_code >= 500:
             if is_last:
                 raise ZenithError(
-                    f"Zenith returned {resp.status_code} for PNR {pnr_code} "
-                    f"after {attempts} attempts."
+                    f"Zenith returned {resp.status_code} for {code} after {attempts} attempts."
                 )
             _t.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
             continue
 
-        # 2xx/3xx (not a login redirect). The dashboard HTML (no Dossier
-        # fields) means the PNR is unknown — NOT a transient, do not retry.
+        # 2xx/3xx (not a login redirect). The dashboard HTML (no Dossier fields) means this
+        # endpoint couldn't resolve it — NOT a transient, do not retry (the caller may fall
+        # back to the other endpoint).
         if "_lblPNRCode" not in resp.text and "PNR :" not in resp.text:
-            raise PNRNotFoundError(
-                f"Zenith couldn't resolve PNR {pnr_code!r}.",
-            )
+            raise PNRNotFoundError(f"Zenith couldn't resolve {code!r}.")
         return parse_dossier_html(resp.text)
-    # The loop always returns or raises on the final attempt; guard anyway.
-    raise ZenithError(f"Exhausted retries looking up PNR {pnr_code}.")
+    raise ZenithError(f"Exhausted retries looking up {code}.")
 
 
 def lookup_many(

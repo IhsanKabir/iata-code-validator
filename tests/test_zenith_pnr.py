@@ -341,7 +341,11 @@ def test_apply_pnr_enrichment_keeps_old_report_immutable() -> None:
 # ---------------------------------------------------------------------------
 
 import src.zenith_pnr_client as zpc  # noqa: E402
-from src.zenith_pnr_client import QUICK_SEARCH_URL  # noqa: E402
+from src.zenith_pnr_client import (  # noqa: E402
+    QUICK_SEARCH_URL,
+    SYNTHESE_DOSSIER_URL,
+    _is_dossier_id,
+)
 
 
 class _Resp:
@@ -429,6 +433,63 @@ class TestLookupPnrRetry:
         with pytest.raises(zpc.PNRNotFoundError):
             zpc.lookup_pnr(_Sess(inner), "X")
         assert inner.calls == 1  # NOT_FOUND is terminal, not a transient
+
+
+class _RecordingInner(_Inner):
+    """_Inner that also records the URL of every .get() — to assert which endpoint was hit."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.urls: list[str] = []
+
+    def get(self, url, params=None, timeout=None):
+        self.urls.append(url)
+        return super().get(url, params=params, timeout=timeout)
+
+
+class TestLookupPnrByDossierId:
+    """Input can be a PNR code (08TXEG) OR a numeric dossier id (14501079). Dossier ids are
+    resolved DIRECTLY via SyntheseDossier.aspx, skipping the code-search that can't match them
+    (and misses cancelled bookings) — the user's 'Untagged_BD_Agencies_REMAINING_PNRs' case."""
+
+    def test_is_dossier_id_detection(self) -> None:
+        assert _is_dossier_id("14501079")        # 8-digit dossier id
+        assert _is_dossier_id("1234567")         # 7-digit
+        assert not _is_dossier_id("08TXEG")      # PNR code (has letters)
+        assert not _is_dossier_id("08MT3R")
+        assert not _is_dossier_id("123456")      # 6 digits -> treat as a PNR code, not a dossier
+
+    def test_dossier_id_resolves_via_synthese_directly(self) -> None:
+        html = _build_dossier_html(pnr="08MT3R", dossier_id="14501079")
+        inner = _RecordingInner([_Resp(200, html)])
+        d = zpc.lookup_pnr(_Sess(inner), "14501079")
+        assert d.pnr_code == "08MT3R"
+        assert inner.calls == 1                            # direct hit, no code-search hop
+        assert inner.urls == [SYNTHESE_DOSSIER_URL]        # used the dossier endpoint
+
+    def test_dossier_id_falls_back_to_quicksearch_on_not_found(self) -> None:
+        # SyntheseDossier comes up empty -> fall back to the code-search (VERIF resolves some ids).
+        html = _build_dossier_html(pnr="08MT3R", dossier_id="14501079")
+        inner = _RecordingInner([
+            _Resp(200, "<html>dashboard only</html>"),     # SyntheseDossier: not found
+            _Resp(200, html),                              # quickSearch: resolves
+        ])
+        d = zpc.lookup_pnr(_Sess(inner), "14501079")
+        assert d.pnr_code == "08MT3R"
+        assert inner.calls == 2
+        assert inner.urls == [SYNTHESE_DOSSIER_URL, QUICK_SEARCH_URL]
+
+    def test_dossier_id_not_found_on_both_raises(self) -> None:
+        inner = _RecordingInner([_Resp(200, "<html>dashboard</html>")])  # both endpoints empty
+        with pytest.raises(zpc.PNRNotFoundError):
+            zpc.lookup_pnr(_Sess(inner), "14501079")
+        assert inner.urls == [SYNTHESE_DOSSIER_URL, QUICK_SEARCH_URL]     # tried both, then gave up
+
+    def test_pnr_code_uses_quicksearch_only(self) -> None:
+        inner = _RecordingInner([_Resp(200, _build_dossier_html(pnr="08TXEG"))])
+        d = zpc.lookup_pnr(_Sess(inner), "08TXEG")
+        assert d.pnr_code == "08TXEG"
+        assert inner.urls == [QUICK_SEARCH_URL]            # no SyntheseDossier for a 6-char code
 
 
 class TestLookupMany:
