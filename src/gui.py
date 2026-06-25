@@ -4791,14 +4791,31 @@ class App:
     def _build_zenith_tab(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
 
-        self._section(
-            parent, "Zenith  ·  usba.ttinteractive.com",
+        host = zenith_client.BASE_URL.split("://", 1)[-1].rstrip("/")
+        sec = self._section(
+            parent, f"Zenith  ·  {host}",
             help_text=(
                 "Four sub-tabs: Customer Lookup, Flight Loads, "
                 "Flight History Analyzer, PNR Bulk Lookup. "
                 "Sign in once below; the session is shared across all four."
             ),
         )
+
+        # ----- Server (always visible — the login form collapses once signed in) -----
+        server_row = ttk.Frame(sec)
+        server_row.pack(fill="x", padx=2, pady=(0, 4))
+        ttk.Label(server_row, text="Server:").pack(side="left", padx=(0, 4))
+        self.zenith_host_choice = tk.StringVar(value=self._zenith_host_saved_label())
+        host_combo = ttk.Combobox(
+            server_row, textvariable=self.zenith_host_choice, state="readonly", width=52,
+            values=list(ZENITH_HOST_OPTIONS.keys()),
+        )
+        host_combo.pack(side="left", padx=(0, 8))
+        host_combo.bind("<<ComboboxSelected>>", lambda _e: self._zenith_save_host())
+        ttk.Label(
+            server_row, style="Hint.TLabel",
+            text="Pick 'Direct origin' if you hit 504 storms, then restart the app.",
+        ).pack(side="left")
 
         # ----- Login -----
         # Wrap the login section in its own frame so we can collapse it
@@ -4838,22 +4855,6 @@ class App:
             login_body, text="Not signed in", style="Hint.TLabel",
         )
         self.zenith_login_status.pack(anchor="w", padx=2, pady=(0, 4))
-
-        # ----- Server (route around the CloudFront 504 storm) -----
-        host_row = ttk.Frame(login_body)
-        host_row.pack(fill="x", padx=2, pady=(2, 0))
-        ttk.Label(host_row, text="Server:").pack(side="left", padx=(0, 4))
-        self.zenith_host_choice = tk.StringVar(value=self._zenith_host_saved_label())
-        host_combo = ttk.Combobox(
-            host_row, textvariable=self.zenith_host_choice, state="readonly", width=52,
-            values=list(ZENITH_HOST_OPTIONS.keys()),
-        )
-        host_combo.pack(side="left", padx=(0, 8))
-        host_combo.bind("<<ComboboxSelected>>", lambda _e: self._zenith_save_host())
-        ttk.Label(
-            host_row, style="Hint.TLabel",
-            text="Pick 'Direct origin' if you hit 504 storms, then restart the app.",
-        ).pack(side="left")
 
         # Compact one-line strip shown in place of the login form once
         # the user is authenticated. Hidden by default — the
