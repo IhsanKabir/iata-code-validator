@@ -4049,20 +4049,24 @@ class App:
         elif kind == MSG_ZENITH_BULK_PROGRESS:
             idx, total, code, status_code = payload  # type: ignore[misc]
             self.zenith_bulk_progress.configure(maximum=total, value=idx)
-            # Live counters so users see exactly where the money is going.
+            # Coarse status bucket: per-attempt "ERROR: <text>" strings vary, so without
+            # this the counters dict explodes AND the errors tally is wrong. (Bug fix:
+            # the old math added NOT_FOUND twice and counted STOPPED/SESSION_EXPIRED as
+            # errors via a 'CANCELLED' literal the PNR worker never emits.)
+            raw = str(status_code)
+            bucket = raw if raw in (
+                "OK", "CACHED", "NOT_FOUND", "STOPPED", "SESSION_EXPIRED") else "ERROR"
             counters = self._zenith_bulk_counters
             seen = self._zenith_bulk_seen
             prev = seen.get(code)
             if prev is not None and counters.get(prev, 0) > 0:
                 counters[prev] -= 1          # a retry sweep corrected an earlier outcome
-            seen[code] = status_code
-            counters[status_code] = counters.get(status_code, 0) + 1
+            seen[code] = bucket
+            counters[bucket] = counters.get(bucket, 0) + 1
             ok = counters.get("OK", 0)
             cached = counters.get("CACHED", 0)
-            errors = counters.get("NOT_FOUND", 0) + sum(
-                v for k, v in counters.items()
-                if k not in ("OK", "CACHED", "CANCELLED")
-            )
+            not_found = counters.get("NOT_FOUND", 0)
+            errors = counters.get("ERROR", 0)
             # Throughput + ETA from a sliding wall clock.
             import time
             now = time.monotonic()
@@ -4075,14 +4079,21 @@ class App:
             self.zenith_bulk_status_label.configure(
                 text=(
                     f"{idx:,}/{total:,}  ·  "
-                    f"{ok:,} fetched · {cached:,} cached · {errors:,} errors  ·  "
+                    f"{ok:,} fetched · {cached:,} cached · "
+                    f"{not_found:,} not found · {errors:,} errors  ·  "
                     f"{rate:.1f}/s  ·  ETA {eta}"
                 ),
                 style="Hint.TLabel",
             )
             self._zenith_bulk_log_line(f"  {idx}/{total} {code}: {status_code}")
         elif kind == MSG_ZENITH_BULK_LOG:
-            self._zenith_bulk_log_line(str(payload))
+            msg = str(payload)
+            self._zenith_bulk_log_line(msg)
+            # Mirror loop-until-dry sweep/cooldown notices to the always-visible label so a
+            # multi-minute cooldown reads as "deliberately waiting", not "wedged".
+            low = msg.lower()
+            if "cooling down" in low or "retry sweep" in low or "recovered nothing" in low:
+                self.zenith_bulk_status_label.configure(text=msg, style="Hint.TLabel")
         elif kind == MSG_ZENITH_BULK_DONE:
             info = payload  # type: ignore[assignment]
             self.btn_zenith_bulk_run.configure(state="normal")
@@ -5493,6 +5504,9 @@ class App:
         self.zenith_bulk_output_dir = tk.StringVar(
             value=str(Path.home() / "Documents"),
         )
+        self.zenith_bulk_concurrency = tk.IntVar(value=3)
+        self.zenith_bulk_delay_s = tk.DoubleVar(value=0.8)
+        self.zenith_bulk_skip_cached = tk.BooleanVar(value=True)
 
         input_entry = ttk.Entry(io_body, textvariable=self.zenith_bulk_input_path)
         input_btn = ttk.Button(
@@ -5538,6 +5552,43 @@ class App:
         )
         self._form_row(io_body, 3, "Output folder:", out_entry, suffix=out_btn)
 
+        # ----- Throughput -----
+        speed_body = self._section(parent, "Throughput")
+        ttk.Label(
+            speed_body, style="Hint.TLabel", wraplength=900, justify="left",
+            text=("A PNR lookup is a HEAVY Dossier render that 504s under load — pacing "
+                  "can't fix that (the app loops-until-dry + caches instead). Lower these "
+                  "only to be polite during a storm; raise them off-peak for speed."),
+        ).pack(anchor="w", padx=2, pady=(0, 6))
+        knobs = ttk.Frame(speed_body)
+        knobs.pack(fill="x", padx=2)
+        ttk.Label(knobs, text="Concurrency:").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
+        ttk.Scale(
+            knobs, from_=1, to=10, orient="horizontal", length=180,
+            variable=self.zenith_bulk_concurrency,
+            command=lambda _v: self.zenith_bulk_concurrency.set(
+                int(self.zenith_bulk_concurrency.get())),
+        ).grid(row=0, column=1, padx=(0, 8), pady=4)
+        self.zenith_bulk_conc_label = ttk.Label(knobs, text="3 workers")
+        self.zenith_bulk_conc_label.grid(row=0, column=2, padx=(0, 24), pady=4)
+        self.zenith_bulk_concurrency.trace_add(
+            "write", lambda *_a: self.zenith_bulk_conc_label.configure(
+                text=f"{int(self.zenith_bulk_concurrency.get())} workers"))
+        ttk.Label(knobs, text="Delay (sec):").grid(row=0, column=3, padx=(0, 4), pady=4, sticky="w")
+        ttk.Scale(
+            knobs, from_=0.1, to=3.0, orient="horizontal", length=180,
+            variable=self.zenith_bulk_delay_s,
+        ).grid(row=0, column=4, padx=(0, 8), pady=4)
+        self.zenith_bulk_delay_label = ttk.Label(knobs, text="0.8 s")
+        self.zenith_bulk_delay_label.grid(row=0, column=5, padx=(0, 4), pady=4)
+        self.zenith_bulk_delay_s.trace_add(
+            "write", lambda *_a: self.zenith_bulk_delay_label.configure(
+                text=f"{float(self.zenith_bulk_delay_s.get()):.1f} s"))
+        ttk.Checkbutton(
+            speed_body, text="Skip PNRs already in local cache (re-runs only re-try the failures)",
+            variable=self.zenith_bulk_skip_cached,
+        ).pack(anchor="w", padx=2, pady=(8, 0))
+
         # ----- Controls -----
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -5551,6 +5602,11 @@ class App:
             state="disabled", style="Danger.TButton",
         )
         self.btn_zenith_bulk_stop.pack(side="left", padx=(8, 0))
+        self.btn_zenith_bulk_export = ttk.Button(
+            ctl, text="Export cached to Excel",
+            command=self._zenith_bulk_export_cache,
+        )
+        self.btn_zenith_bulk_export.pack(side="left", padx=(8, 0))
         self.btn_zenith_dossier = ttk.Button(
             ctl, text="Dossier audit (payment/contact)",
             command=self._zenith_dossier_run,
@@ -5720,6 +5776,61 @@ class App:
         self._zenith_bulk_stop_flag.set()
         self.zenith_bulk_status_label.configure(text="Stopping…")
 
+    def _zenith_bulk_emergency_export(self, codes, folder) -> str:
+        """Worker-thread safe: dump the cached subset of `codes` to a workbook so a
+        crash / session-expiry mid-storm STILL yields a usable sheet. Returns a message
+        fragment for the error dialog, or '' if nothing was cached / it failed."""
+        try:
+            cache = self._zenith_pnr_cache
+            details = [d for d in (cache.get(str(c).strip().upper()) for c in codes) if d]
+            if not details:
+                return ""
+            out_path = excel_io.build_zenith_pnr_bulk_output_path(Path(folder))
+            n = excel_io.write_zenith_pnr_bulk_from_details(out_path, details)
+            return f"\n\n{n} already-fetched PNRs were saved to:\n{out_path}"
+        except Exception:  # noqa: BLE001 — never let the safety-net itself crash the run
+            log.exception("emergency cache export failed")
+            return ""
+
+    def _zenith_bulk_export_cache(self) -> None:
+        """Turn the always-checkpointed PNR cache into a workbook on demand — so a
+        partial / storm-interrupted run is usable WITHOUT re-running. Exports the cached
+        subset of the loaded input file (if any), else the whole cache."""
+        out_folder = Path(self.zenith_bulk_output_dir.get().strip() or str(Path.home()))
+        input_path = self.zenith_bulk_input_path.get().strip()
+        try:
+            if input_path and Path(input_path).is_file():
+                codes = excel_io.read_pnr_codes_from_excel(
+                    Path(input_path),
+                    sheet_name=self.zenith_bulk_sheet_name.get().strip() or None,
+                    column_name=self.zenith_bulk_column_name.get().strip() or None)
+                details = [d for d in (self._zenith_pnr_cache.get(c) for c in codes) if d]
+                scope = f"{len(details)} of {len(codes)} input PNRs (cached)"
+            else:
+                details = self._zenith_pnr_cache.iter_all()
+                scope = f"all {len(details)} cached PNRs"
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export cached", f"Couldn't read the cache/input:\n{exc}")
+            return
+        if not details:
+            messagebox.showinfo(
+                "Export cached", "No cached PNRs yet — run a lookup first (even a partial "
+                "one leaves its successes in the cache).")
+            return
+        try:
+            out_path = excel_io.build_zenith_pnr_bulk_output_path(out_folder)
+            excel_io.write_zenith_pnr_bulk_from_details(out_path, details)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export cached", f"Write failed:\n{type(exc).__name__}: {exc}")
+            return
+        self._zenith_bulk_log_line(f"Exported {scope} → {out_path.name}")
+        if messagebox.askyesno("Export cached", f"Wrote {scope} to:\n{out_path}\n\nOpen it now?"):
+            try:
+                import os
+                os.startfile(out_path)  # noqa: S606
+            except Exception:  # noqa: BLE001
+                pass
+
     def _zenith_dossier_run(self) -> None:
         """Phase-2 dossier audit: scrape each PNR's CHANGES history for payment-txn reuse
         and contact churn/funnel. Reuses this tab's input Excel + session + output folder."""
@@ -5887,14 +5998,12 @@ class App:
         cache = self._zenith_pnr_cache
         sess = self._zenith_session
         stop = self._zenith_bulk_stop_flag
-
-        # The PNR→Dossier render is HEAVY (a full booking + history) and 504s under load;
-        # pacing alone can't fix that (concurrency=1 still 504'd, just slower). The real
-        # lever is PERSISTENCE: lookup_many now loops-until-dry, re-sweeping the failures
-        # until the storm lets them through (resume-safe via the cache). So we keep a
-        # reasonable throughput here rather than crippling it.
-        _BULK_CONCURRENCY = 3
-        _BULK_DELAY_S = 0.8
+        # Read throughput knobs on the MAIN thread (Tk vars aren't thread-safe). The
+        # PNR→Dossier render is heavy and 504s under load — pacing can't fix that (the
+        # engine loops-until-dry + caches instead), so these are just a politeness lever.
+        concurrency = max(1, int(self.zenith_bulk_concurrency.get()))
+        delay_s = max(0.0, float(self.zenith_bulk_delay_s.get()))
+        skip_fn = cache.get if self.zenith_bulk_skip_cached.get() else None
 
         def worker() -> None:
             try:
@@ -5932,9 +6041,9 @@ class App:
 
                 zenith_pnr_client.lookup_many(
                     sess, codes,
-                    concurrency=_BULK_CONCURRENCY,
-                    delay_s=_BULK_DELAY_S,
-                    skip_cached=cache.get,
+                    concurrency=concurrency,
+                    delay_s=delay_s,
+                    skip_cached=skip_fn,
                     on_result=on_result,
                     progress_cb=progress,
                     stop_event=stop,
@@ -5962,15 +6071,17 @@ class App:
                 }
                 self._post(MSG_ZENITH_BULK_DONE, summary)
             except zenith_client.SessionExpiredError as exc:
+                saved = self._zenith_bulk_emergency_export(codes, out_folder)
                 self._post(
                     MSG_ZENITH_BULK_ERROR,
-                    "Session expired — sign in again and re-run. PNRs already "
-                    f"fetched are cached and will be skipped. ({exc})",
+                    "Session expired — sign in again and re-run (cached PNRs are skipped)."
+                    f"{saved} ({exc})",
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("PNR bulk lookup failed")
+                saved = self._zenith_bulk_emergency_export(codes, out_folder)
                 self._post(
-                    MSG_ZENITH_BULK_ERROR, f"{type(exc).__name__}: {exc}",
+                    MSG_ZENITH_BULK_ERROR, f"{type(exc).__name__}: {exc}{saved}",
                 )
 
         self._zenith_bulk_worker = threading.Thread(target=worker, daemon=True)

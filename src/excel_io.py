@@ -1947,3 +1947,14 @@ def build_zenith_pnr_bulk_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"zenith_pnr_lookup_{timestamp}.xlsx"
+
+
+def write_zenith_pnr_bulk_from_details(path: Path, details: list) -> int:
+    """Write the bulk PNR workbook straight from a list[PNRDetails] (the cache export).
+
+    Used to turn the always-checkpointed PNR cache into a usable sheet even when a run was
+    killed mid-storm. Returns the number of PNRs written.
+    """
+    results = [(d.pnr_code, d) for d in details if getattr(d, "pnr_code", "")]
+    write_zenith_pnr_bulk(path, results, errors={})
+    return len(results)

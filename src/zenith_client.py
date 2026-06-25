@@ -619,7 +619,10 @@ def fetch_many(
                             remaining.cancel()
                     break
 
-    return results
+    # Retry sweeps append a corrected result per recovered id, so `results` can hold an id
+    # more than once. The GUI writes from its cache (so it's unaffected), but a non-GUI
+    # caller iterating the return would double-process — so collapse to the LATEST per id.
+    return list({r.customer_id: r for r in results}.values())
 
 
 # ---------------------------------------------------------------------------

@@ -482,11 +482,10 @@ def lookup_many(
     code, status)` gets a running completion count. `stop_event` cancels the
     rest.
 
-    An adaptive governor watches the transient-failure RATE over a sliding window
-    (with a long consecutive streak as a fast path): it slows the workers once
-    failures dominate and ABORTS the run rather than grinding for hours if Zenith
-    stays down — even when the storm is sprinkled with the odd success, which would
-    defeat a consecutive-streak-only breaker. Every completed PNR is already
+    An adaptive governor watches the transient-failure RATE over a sliding window and
+    SLOWS the workers (longer backoff) once failures dominate — politeness during a
+    storm. It does NOT abort; instead the run loops-until-dry, re-sweeping the failures
+    until they resolve, two sweeps recover nothing, or a cap is hit. Every completed PNR is
     reported via on_result, so a re-run resumes from the cache.
     """
     import collections

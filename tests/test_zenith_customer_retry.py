@@ -153,6 +153,17 @@ def test_fetch_many_not_found_not_retried(monkeypatch):
     assert sess.calls["X"] == 1                            # not retried
 
 
+def test_fetch_many_return_is_deduped_after_sweep(monkeypatch):
+    """A recovered id is appended again across sweeps; the RETURN must be one-per-id."""
+    monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
+    sess = _FakeSession({"A": ["504", "ok"], "B": ["ok"]})
+    results = zenith_client.fetch_many(
+        sess, ["A", "B"], concurrency=1, delay_s=0, retry_passes=2, retry_cooldown_s=1)
+    ids = [r.customer_id for r in results]
+    assert ids.count("A") == 1 and ids.count("B") == 1      # no duplicate rows
+    assert {r.customer_id: r.status for r in results}["A"] == zenith_client.STATUS_OK
+
+
 def test_fetch_many_retry_passes_zero_disables_sweeps(monkeypatch):
     monkeypatch.setattr(zenith_client.time, "sleep", lambda *_a, **_k: None)
     sess = _FakeSession({"A": ["504", "ok"]})

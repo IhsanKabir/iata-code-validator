@@ -83,6 +83,22 @@ class ZenithPNRCache:
                 "SELECT COUNT(*) FROM pnr_details",
             ).fetchone()[0]
 
+    def iter_all(self) -> list[PNRDetails]:
+        """Every cached PNRDetails, ordered by PNR code — the source of truth for an
+        export-from-cache (a storm-killed run still yields a usable sheet). Unreadable
+        rows are skipped, never fatal."""
+        out: list[PNRDetails] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM pnr_details ORDER BY pnr_code",
+            ).fetchall()
+        for (payload,) in rows:
+            try:
+                out.append(_details_from_dict(json.loads(payload)))
+            except (json.JSONDecodeError, TypeError) as exc:
+                log.warning("Skipping unreadable PNR cache row: %s", exc)
+        return out
+
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
