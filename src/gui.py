@@ -116,6 +116,10 @@ MSG_ZENITH_FH_DONE = "zenith_fh_done"          # payload: HistoryAuditReport
 MSG_ZENITH_FH_ERROR = "zenith_fh_error"
 MSG_ZENITH_PNRMISUSE_DONE = "zenith_pnrmisuse_done"    # payload: summary dict
 MSG_ZENITH_PNRMISUSE_ERROR = "zenith_pnrmisuse_error"  # payload: str
+# Flight Load Inspection — per-flight load-factor diagnosis across the same logs
+MSG_ZENITH_LFI_PROGRESS = "zenith_lfi_progress"   # (i, total, name)
+MSG_ZENITH_LFI_DONE = "zenith_lfi_done"           # payload: summary dict
+MSG_ZENITH_LFI_ERROR = "zenith_lfi_error"         # payload: str
 MSG_ZENITH_DOSSIER_DONE = "zenith_dossier_done"        # payload: summary dict
 MSG_ZENITH_DOSSIER_ERROR = "zenith_dossier_error"      # payload: str
 MSG_ZENITH_DOSSIER_PROGRESS = "zenith_dossier_progress"  # payload: (i, n, pnr)
@@ -3956,6 +3960,34 @@ class App:
             self.btn_zenith_fh_run.configure(state="normal")
             self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
             messagebox.showerror("PNR Misuse audit — Error", str(payload))
+        # ----- Flight Load Inspection -----
+        elif kind == MSG_ZENITH_LFI_PROGRESS:
+            i, n, name = payload
+            self.zenith_fh_progress.configure(maximum=max(1, n), value=i)
+            self.zenith_fh_status_label.configure(text=f"Inspecting {i}/{n}: {name}")
+        elif kind == MSG_ZENITH_LFI_DONE:
+            self.btn_zenith_fh_inspect.configure(state="normal")
+            self.btn_zenith_fh_run.configure(state="normal")
+            p = payload
+            self.zenith_fh_status_label.configure(
+                text=f"Load inspection: {p['flights']} flights, {p['flagged']} flagged "
+                     f"→ {Path(p['path']).name}")
+            if messagebox.askyesno(
+                    "Flight Load Inspection",
+                    f"Inspected {p['flights']} flights — {p['flagged']} flagged with a reason.\n\n"
+                    "The 'Flights' sheet ranks every flight with plain-language flags "
+                    "(LOW_LF, LATE_CURVE, HIGH_NOSHOW, …); flagged flights get a detail sheet.\n\n"
+                    f"Saved to:\n{p['path']}\n\nOpen the workbook now?"):
+                try:
+                    import os
+                    os.startfile(p["path"])  # noqa: S606
+                except Exception:  # noqa: BLE001
+                    pass
+        elif kind == MSG_ZENITH_LFI_ERROR:
+            self.btn_zenith_fh_inspect.configure(state="normal")
+            self.btn_zenith_fh_run.configure(state="normal")
+            self.zenith_fh_status_label.configure(text=f"⚠ {payload}")
+            messagebox.showerror("Flight Load Inspection — Error", str(payload))
         # ----- PNR Dossier audit (Phase 2: payment / contact) -----
         elif kind == MSG_ZENITH_DOSSIER_PROGRESS:
             i, n, pnr = payload
@@ -5366,7 +5398,12 @@ class App:
                 "Zenith's Inventory → Flight List → History view. "
                 "Builds a 7-sheet audit: class downgrades, downgrade "
                 "leaders, G-class issuance, agent activity, revenue "
-                "mgmt, suspicious activity, and raw events."
+                "mgmt, suspicious activity, and raw events.  "
+                "‘Inspect load factor’ adds a per-flight load-factor "
+                "diagnosis across the same logs — why each flight filled "
+                "the way it did (flown vs capacity, no-shows, cancellations, "
+                "held-seat churn, and the booking curve), each tagged with "
+                "plain-language flags."
             ),
         )
 
@@ -5466,6 +5503,13 @@ class App:
             command=self._zenith_pnr_misuse_run,
         )
         self.btn_zenith_fh_misuse.pack(side="left", padx=(8, 0))
+        # Per-flight load-factor diagnosis across the SAME logs — answers
+        # "why did this flight fill the way it did?" with plain-language flags.
+        self.btn_zenith_fh_inspect = ttk.Button(
+            ctl, text="Inspect load factor",
+            command=self._zenith_fh_inspect_run,
+        )
+        self.btn_zenith_fh_inspect.pack(side="left", padx=(8, 0))
         self.zenith_fh_status_label = ttk.Label(
             ctl,
             text="Browse a logs folder, then Run history audit.",
@@ -6271,6 +6315,61 @@ class App:
             except Exception as exc:  # noqa: BLE001 — surface to UI
                 log.exception("PNR misuse audit failed")
                 self._post(MSG_ZENITH_PNRMISUSE_ERROR, f"{type(exc).__name__}: {exc}")
+
+        self._zenith_fh_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_fh_worker.start()
+
+    def _zenith_fh_inspect_run(self) -> None:
+        """Diagnose every flight log's load factor and write the inspection workbook.
+
+        Reuses the Flight History logs + output folders. No network — parses each
+        ModificationHistory*.xls, derives flown/no-show/cancel/held counts, hold
+        durations, the booking curve, and capacity/LF, then flags WHY each flight
+        behaved as it did and writes a comparison + per-flight detail workbook.
+        """
+        folder = self.zenith_fh_input_dir.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror(
+                "Flight Load Inspection",
+                f"Pick a valid logs folder first.\n\nCurrent: {folder!r}")
+            return
+        out_dir = self.zenith_fh_output_dir.get().strip() or str(Path.home() / "Documents")
+        if self._zenith_fh_worker and self._zenith_fh_worker.is_alive():
+            messagebox.showinfo("Flight Load Inspection", "An analysis is already running.")
+            return
+        self.btn_zenith_fh_inspect.configure(state="disabled")
+        self.btn_zenith_fh_run.configure(state="disabled")
+        self.zenith_fh_status_label.configure(text="Inspecting load factors…")
+        self.zenith_fh_progress.configure(value=0, maximum=1)
+
+        def worker() -> None:
+            try:
+                from datetime import datetime as _dt
+
+                from . import flight_load_diagnostics as fld
+                from .flight_inspection_excel import write_flight_inspection
+
+                def progress(i: int, n: int, name: str) -> None:
+                    self._post(MSG_ZENITH_LFI_PROGRESS, (i, n, name))
+
+                diags = fld.inspect_folder(folder, progress_cb=progress)
+                if not diags:
+                    self._post(MSG_ZENITH_LFI_ERROR, (
+                        f"No flown flights found in:\n{folder}\n\n"
+                        "Flight Load Inspection reads the raw ModificationHistory*.xls flight "
+                        "logs the Flight History Analyzer downloads from Zenith."))
+                    return
+                ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+                path = str(Path(out_dir) / f"Flight_Load_Inspection_{ts}.xlsx")
+                write_flight_inspection(path, diags)
+                self._post(MSG_ZENITH_LFI_DONE, {
+                    "flights": len(diags),
+                    "flagged": sum(1 for d in diags if d.flags),
+                    "path": path,
+                })
+            except Exception as exc:  # noqa: BLE001 — surface to UI
+                log.exception("Flight load inspection failed")
+                self._post(MSG_ZENITH_LFI_ERROR, f"{type(exc).__name__}: {exc}")
 
         self._zenith_fh_worker = threading.Thread(target=worker, daemon=True)
         self._zenith_fh_worker.start()
