@@ -46,6 +46,7 @@ from . import (
 )
 from .mailer_log import MailerLog
 from .traffic_sources import SOURCES as TRAFFIC_SOURCES
+from .whatsapp_gui import WhatsAppMixin
 from .zenith_pnr_cache import ZenithPNRCache
 from .zenith_pnr_history_cache import ZenithPNRHistoryCache
 from .bd_agency_client import Agency, fetch_all_agencies, filter_status
@@ -209,7 +210,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
 }
 
 
-class App:
+class App(WhatsAppMixin):
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Travel Ops Console")
@@ -1641,6 +1642,9 @@ class App:
         prog = self._section(parent, "Progress")
         self.mail_progress = ttk.Progressbar(prog, mode="determinate", maximum=1)
         self.mail_progress.pack(fill="x", padx=2, pady=2)
+
+        # ----- WhatsApp Blast (free, sends from the user's own number) -----
+        self._build_whatsapp_section(parent)
 
         # Show the credential block matching the default transport — layout only;
         # initial=True so we DON'T touch Outlook COM / MSAL at startup (that pops a
@@ -4044,6 +4048,9 @@ class App:
         self.root.after(100, self._poll_queue)
 
     def _handle_msg(self, kind: str, payload: object) -> None:
+        # WhatsApp-blast messages are handled by the shared mixin.
+        if kind.startswith("wa_") and self._wa_handle_msg(kind, payload):
+            return
         # Central usage telemetry — fire for any registered completion message
         # before the feature-specific handling, so a handler that raises can't
         # swallow the event. Best-effort; never affects the UI.

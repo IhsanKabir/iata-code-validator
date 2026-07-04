@@ -39,10 +39,12 @@ def test_all_lazy_tabs_build_without_errors(app):
     for widget in list(app._tab_widgets.values()):
         app._ensure_tab_built(widget)
     assert not app._tab_builders                     # everything built exactly once
-    # Key widgets from each tab exist afterwards:
+    # Key widgets from each tab exist afterwards (incl. the WhatsApp section):
     for attr in ("log_text", "bd_log_text", "mail_tree", "zenith_bulk_log",
-                 "btn_zenith_fh_inspect", "oep_tree"):
+                 "btn_zenith_fh_inspect", "oep_tree", "wa_tree", "btn_wa_send"):
         assert hasattr(app, attr), f"missing {attr} after full build"
+    # WhatsApp mixin dispatch: unknown wa_ kind returns False (not swallowed).
+    assert app._wa_handle_msg("wa_unknown", None) is False
     # Re-running is a no-op, not a rebuild.
     app._ensure_tab_built(app._tab_widgets["bd"])
 
