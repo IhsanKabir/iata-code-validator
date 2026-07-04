@@ -835,6 +835,57 @@ class App:
 
         return inner
 
+    # ------------------------------------------------------------------
+    # Zebra striping for result grids
+    # ------------------------------------------------------------------
+    _STRIPE_LIGHT = "#eef3f8"    # subtle blue-grey on the light theme
+    _STRIPE_DARK = "#23272e"
+
+    def _register_result_tree(self, tree: ttk.Treeview) -> None:
+        """Track a result grid so its stripe color follows theme toggles."""
+        trees = getattr(self, "_striped_trees", None)
+        if trees is None:
+            trees = self._striped_trees = []
+        if tree not in trees:
+            trees.append(tree)
+        self._configure_stripe(tree)
+
+    def _configure_stripe(self, tree: ttk.Treeview) -> None:
+        color = self._STRIPE_DARK if getattr(self, "_theme_is_dark", False) \
+            else self._STRIPE_LIGHT
+        try:
+            tree.tag_configure("stripe", background=color)
+        except tk.TclError:
+            pass
+
+    def _stripe_tree(self, tree: ttk.Treeview) -> None:
+        """(Re)apply zebra tags after a grid is populated. The stripe tag is
+        appended LAST so semantic row tags (bad/verdict/load colors) keep
+        priority — striping only shows on rows with no colored tag."""
+        self._register_result_tree(tree)
+        try:
+            for i, iid in enumerate(tree.get_children()):
+                tags = [t for t in tree.item(iid, "tags") if t != "stripe"]
+                if i % 2:
+                    tags.append("stripe")
+                tree.item(iid, tags=tuple(tags))
+        except tk.TclError:
+            pass
+
+    def _restripe_all(self) -> None:
+        """Re-stripe every registered grid; prune widgets that were destroyed
+        (e.g. trees living in closed dialogs)."""
+        trees = getattr(self, "_striped_trees", [])
+        alive = []
+        for tree in trees:
+            try:
+                if tree.winfo_exists():
+                    self._stripe_tree(tree)
+                    alive.append(tree)
+            except tk.TclError:
+                continue
+        self._striped_trees = alive
+
     def _section(
         self,
         parent: tk.Widget,
@@ -850,8 +901,10 @@ class App:
 
         Returns the inner frame. Caller should `.pack(...)` widgets into it.
         """
+        # Spacing is deliberately tight: long tool tabs (Mailer, Zenith) stack
+        # 5-7 sections and every extra pixel here multiplies into scroll.
         wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x", pady=(8, 4), padx=4)
+        wrapper.pack(fill="x", pady=(6, 2), padx=4)
         header = ttk.Frame(wrapper)
         header.pack(fill="x")
         ttk.Label(header, text=title, style="Section.TLabel").pack(side="left")
@@ -864,7 +917,7 @@ class App:
             )
             info.pack(side="left", padx=(6, 0))
             self._attach_tooltip(info, help_text)
-        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(2, 6))
+        ttk.Separator(wrapper, orient="horizontal").pack(fill="x", pady=(1, 4))
         body = ttk.Frame(wrapper)
         body.pack(fill="x")
         return body
@@ -881,11 +934,11 @@ class App:
     ) -> None:
         """Add a `Label: [widget]` row to a 2- or 3-column grid in `parent`."""
         ttk.Label(parent, text=label, width=label_width, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=(2, 8), pady=4
+            row=row, column=0, sticky="w", padx=(2, 8), pady=2
         )
-        widget.grid(row=row, column=1, sticky="ew", padx=(0, 4), pady=4)
+        widget.grid(row=row, column=1, sticky="ew", padx=(0, 4), pady=2)
         if suffix is not None:
-            suffix.grid(row=row, column=2, padx=(4, 2), pady=4)
+            suffix.grid(row=row, column=2, padx=(4, 2), pady=2)
         parent.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------
@@ -1028,7 +1081,14 @@ class App:
             ),
         )
 
-        body = self._section(parent, "Source & filters")
+        body = self._section(
+            parent, "Source & filters",
+            help_text=(
+                "Pick the movement data source, then set the optional date "
+                "range (YYYY-MM-DD). Sources differ in coverage and grain — "
+                "the picker's hint line describes the selected one."
+            ),
+        )
         self._traffic_label_to_id = {s.label: s.id for s in TRAFFIC_SOURCES.values()}
         self.traffic_source_combo = ttk.Combobox(
             body, textvariable=self.traffic_source, state="readonly",
@@ -1096,10 +1156,16 @@ class App:
         self.traffic_tree_frame.pack(fill="both", expand=True)
         self.traffic_tree = ttk.Treeview(
             self.traffic_tree_frame, show="headings", height=14)
+        t_hscroll = ttk.Scrollbar(
+            self.traffic_tree_frame, orient="horizontal",
+            command=self.traffic_tree.xview)
+        t_hscroll.pack(side="bottom", fill="x")
         self.traffic_tree.pack(side="left", fill="both", expand=True)
         t_scroll = ttk.Scrollbar(self.traffic_tree_frame, command=self.traffic_tree.yview)
         t_scroll.pack(side="right", fill="y")
-        self.traffic_tree.configure(yscrollcommand=t_scroll.set)
+        self.traffic_tree.configure(
+            yscrollcommand=t_scroll.set, xscrollcommand=t_hscroll.set)
+        self._register_result_tree(self.traffic_tree)
         self._traffic_set_columns([("#", 40), ("Info", 600)])
         self.traffic_tree.insert("", "end", values=("—", "Pick a source and click Run."))
 
@@ -1563,10 +1629,13 @@ class App:
             self.mail_tree.column(cid, width=w, anchor="w")
         self.mail_tree.tag_configure("bad", background=self._COLOR_ROW_BAD)
         self.mail_tree.tag_configure("ok", background=self._COLOR_ROW_GOOD)
+        mhsb = ttk.Scrollbar(grid, orient="horizontal", command=self.mail_tree.xview)
+        mhsb.pack(side="bottom", fill="x")
         self.mail_tree.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
         msb = ttk.Scrollbar(grid, command=self.mail_tree.yview)
         msb.pack(side="left", fill="y")
-        self.mail_tree.configure(yscrollcommand=msb.set)
+        self.mail_tree.configure(yscrollcommand=msb.set, xscrollcommand=mhsb.set)
+        self._register_result_tree(self.mail_tree)
 
         # ----- Progress -----
         prog = self._section(parent, "Progress")
@@ -1903,6 +1972,7 @@ class App:
                         ", ".join(p.name for p in r.attachments), r.cc, r.bcc, status),
                 tags=("ok",) if r.is_valid else ("bad",))
             valid += 1 if r.is_valid else 0
+        self._stripe_tree(self.mail_tree)
         self.mail_status.configure(
             text=f"Split-loaded {valid} recipient(s) from {Path(path).name} — "
                  "set Subject/Body, then Test or Run.")
@@ -1941,6 +2011,7 @@ class App:
             )
             if r.is_valid:
                 valid += 1
+        self._stripe_tree(self.mail_tree)
         msg = f"{valid} valid / {len(rows)} rows"
         if warnings:
             msg += "  ·  " + "; ".join(warnings)
@@ -2254,6 +2325,7 @@ class App:
         self.bd_status_label.pack(side="left", padx=2)
         self.btn_bd_refresh = ttk.Button(
             row, text="↻  Refresh now", command=self._bd_refresh,
+            style="Primary.TButton",
         )
         self.btn_bd_refresh.pack(side="right")
 
@@ -2273,7 +2345,15 @@ class App:
         ).pack(anchor="w", padx=2, pady=2)
 
         # ----- Input (lookup mode) -----
-        body = self._section(parent, "Input Excel  ·  lookup mode only")
+        body = self._section(
+            parent, "Input Excel  ·  lookup mode only",
+            help_text=(
+                "Lookup mode reads your Excel and matches each row against "
+                "the cached agency register (by name / licence / address, "
+                "per the toggles). Full mode ignores this and exports the "
+                "whole register instead."
+            ),
+        )
         self.bd_input_frm = body
         self.bd_input_entry = ttk.Entry(body, textvariable=self.bd_input_path)
         self.bd_input_btn = ttk.Button(
@@ -2503,10 +2583,17 @@ class App:
 
         self.oep_tree_frame = ttk.Frame(self.oep_results_holder)
         self.oep_tree = ttk.Treeview(self.oep_tree_frame, show="headings", height=14)
+        # Pivot views (country x division x month) run far wider than the
+        # window — horizontal scroll was the missing affordance.
+        oep_hscroll = ttk.Scrollbar(
+            self.oep_tree_frame, orient="horizontal", command=self.oep_tree.xview)
+        oep_hscroll.pack(side="bottom", fill="x")
         self.oep_tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(self.oep_tree_frame, command=self.oep_tree.yview)
         tree_scroll.pack(side="right", fill="y")
-        self.oep_tree.configure(yscrollcommand=tree_scroll.set)
+        self.oep_tree.configure(
+            yscrollcommand=tree_scroll.set, xscrollcommand=oep_hscroll.set)
+        self._register_result_tree(self.oep_tree)
         # Double-click on a country row → category drilldown popup.
         self.oep_tree.bind("<Double-1>", self._oep_on_double_click)
 
@@ -2719,6 +2806,7 @@ class App:
                 rank, c.category_name, f"{c.total_employee:,}",
                 f"{100 * c.total_employee / grand:.2f}",
             ))
+        self._stripe_tree(tree)
 
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
 
@@ -3940,12 +4028,19 @@ class App:
         self._post(MSG_PROGRESS, (idx, total, msg))
 
     def _poll_queue(self) -> None:
+        restripe = False
         try:
             while True:
                 kind, payload = self._msg_queue.get_nowait()
                 self._handle_msg(kind, payload)
+                # Result grids repopulate on completion messages — re-apply
+                # zebra striping once per drain (not per message; progress
+                # messages arrive at high rate during bulk runs).
+                restripe = restripe or kind.endswith("_done")
         except queue.Empty:
             pass
+        if restripe:
+            self._restripe_all()
         self.root.after(100, self._poll_queue)
 
     def _handle_msg(self, kind: str, payload: object) -> None:
@@ -4950,7 +5045,8 @@ class App:
                 status_var.set(f"Unexpected error: {exc}")
                 btn_signin.configure(state="normal", text="Sign in with Google")
 
-        btn_signin = ttk.Button(dlg, text="Sign in with Google", command=do_signin)
+        btn_signin = ttk.Button(dlg, text="Sign in with Google", command=do_signin,
+                                style="Primary.TButton")
         btn_signin.pack(pady=(12, 8))
 
         ttk.Button(dlg, text="Quit", command=dlg.destroy).pack()
@@ -5037,6 +5133,9 @@ class App:
             self._setup_styles()
             # Force a refresh of the auth status chip so its color survives.
             self._refresh_user_label()
+            # Stripe colors are per-theme; recolor every registered grid.
+            for tree in getattr(self, "_striped_trees", []):
+                self._configure_stripe(tree)
         except Exception as exc:  # noqa: BLE001
             log.warning("Theme toggle failed: %s", exc)
 
@@ -5169,7 +5268,7 @@ class App:
         self.zenith_company_entry.grid(row=0, column=5, padx=(0, 12), pady=4)
         self.btn_zenith_login = ttk.Button(
             login_row, text="Sign in to Zenith",
-            command=self._zenith_login, width=18,
+            command=self._zenith_login, width=18, style="Primary.TButton",
         )
         self.btn_zenith_login.grid(row=0, column=6, padx=(0, 4), pady=4)
         self.zenith_login_status = ttk.Label(
@@ -5598,18 +5697,25 @@ class App:
         self.zenith_fl_legs_tree.tag_configure("load_hi", background=self._COLOR_ROW_GOOD)
         self.zenith_fl_legs_tree.tag_configure("load_mid", background=self._COLOR_ROW_WARN)
         self.zenith_fl_legs_tree.tag_configure("load_lo", background=self._COLOR_ROW_BAD)
+        legs_hscroll = ttk.Scrollbar(
+            grid_wrap, orient="horizontal",
+            command=self.zenith_fl_legs_tree.xview)
+        legs_hscroll.pack(side="bottom", fill="x")
         self.zenith_fl_legs_tree.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
         legs_scroll = ttk.Scrollbar(
             grid_wrap, command=self.zenith_fl_legs_tree.yview,
         )
         legs_scroll.pack(side="left", fill="y")
-        self.zenith_fl_legs_tree.configure(yscrollcommand=legs_scroll.set)
+        self.zenith_fl_legs_tree.configure(
+            yscrollcommand=legs_scroll.set, xscrollcommand=legs_hscroll.set)
+        self._register_result_tree(self.zenith_fl_legs_tree)
 
         pax_ctl = ttk.Frame(parent)
         pax_ctl.pack(fill="x", padx=4, pady=(4, 0))
         self.btn_zenith_fl_pax = ttk.Button(
             pax_ctl, text="Pull passenger detail (selected legs)",
             command=self._zenith_fl_pull_pax, state="disabled",
+            style="Primary.TButton",
         )
         self.btn_zenith_fl_pax.pack(side="left")
         self.btn_zenith_fl_pax_all = ttk.Button(
@@ -5825,7 +5931,17 @@ class App:
         for cid, label, width in cols:
             self.zenith_fh_tree.heading(cid, text=label)
             self.zenith_fh_tree.column(cid, width=width, anchor="w")
+        # This grid had NO scrollbars — audits with hundreds of flagged rows
+        # were simply cut off at the window edge.
+        fh_hscroll = ttk.Scrollbar(
+            summary_body, orient="horizontal", command=self.zenith_fh_tree.xview)
+        fh_hscroll.pack(side="bottom", fill="x")
+        fh_vscroll = ttk.Scrollbar(summary_body, command=self.zenith_fh_tree.yview)
+        fh_vscroll.pack(side="right", fill="y")
         self.zenith_fh_tree.pack(fill="both", expand=True, padx=2, pady=4)
+        self.zenith_fh_tree.configure(
+            yscrollcommand=fh_vscroll.set, xscrollcommand=fh_hscroll.set)
+        self._register_result_tree(self.zenith_fh_tree)
 
         # ----- Worker state -----
         self._zenith_fh_worker: threading.Thread | None = None

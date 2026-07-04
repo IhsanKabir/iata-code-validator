@@ -70,3 +70,75 @@ def test_restore_rejects_offscreen_geometry(app, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "WINDOW_GEOMETRY_FILE", geom_file)
     app._apply_initial_geometry()                    # must fall back, not vanish
     assert app.root.winfo_x() < app.root.winfo_screenwidth()
+
+
+# ---------------------------------------------------------------------------
+# Visual-hierarchy + zebra rules (guard the v1.24.0 consistency pass)
+# ---------------------------------------------------------------------------
+
+def _all_buttons(root):
+    from tkinter import ttk as _ttk
+    out = []
+
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, _ttk.Button):
+                out.append(c)
+            walk(c)
+    walk(root)
+    return out
+
+
+def test_button_hierarchy_rules(app):
+    """Stop buttons are Danger; Cancel/Pause/Resume are never Primary/Danger;
+    each tool tab exposes at least one Primary action."""
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    for btn in _all_buttons(app.root):
+        text = str(btn.cget("text")).strip()
+        style = str(btn.cget("style"))
+        if text == "Stop":
+            assert style == "Danger.TButton", f"'Stop' not Danger (is {style!r})"
+        if text in ("Cancel", "Pause", "Resume"):
+            assert style not in ("Primary.TButton", "Danger.TButton"), \
+                f"{text!r} must be a plain secondary button (is {style!r})"
+    for key in ("iata", "bd", "traffic", "zenith", "mailer"):
+        tab = app._tab_widgets[key]
+        styles = {str(b.cget("style")) for b in _all_buttons(tab)}
+        assert "Primary.TButton" in styles, f"tab {key!r} has no primary action"
+
+
+def test_result_grids_registered_and_striped(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    registered = getattr(app, "_striped_trees", [])
+    # All five persistent result grids register at build time.
+    for attr in ("traffic_tree", "mail_tree", "oep_tree",
+                 "zenith_fl_legs_tree", "zenith_fh_tree"):
+        assert getattr(app, attr) in registered, f"{attr} not registered"
+    # Striping alternates and never clobbers semantic tags.
+    tree = app.mail_tree
+    tree.delete(*tree.get_children())
+    for i in range(4):
+        tree.insert("", "end", values=(i, "e", "n", "f", "", "", "OK"),
+                    tags=("bad",) if i == 1 else ())
+    app._stripe_tree(tree)
+    rows = tree.get_children()
+    assert "stripe" not in tree.item(rows[0], "tags")
+    assert set(tree.item(rows[1], "tags")) == {"bad", "stripe"}   # semantic kept
+    assert "stripe" in tree.item(rows[3], "tags")
+    # Re-striping is idempotent (no duplicate stripe tags).
+    app._stripe_tree(tree)
+    assert list(tree.item(rows[1], "tags")).count("stripe") == 1
+
+
+def test_wide_grids_have_horizontal_scrollbars(app):
+    """The OEP pivot / history grids overflow the window — h-scroll required."""
+    from tkinter import ttk as _ttk
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    for attr in ("traffic_tree", "mail_tree", "oep_tree",
+                 "zenith_fl_legs_tree", "zenith_fh_tree"):
+        tree = getattr(app, attr)
+        assert str(tree.cget("xscrollcommand")), f"{attr} lacks xscrollcommand"
+        assert str(tree.cget("yscrollcommand")), f"{attr} lacks yscrollcommand"
