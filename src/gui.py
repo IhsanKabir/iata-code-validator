@@ -36,6 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import (
     __version__, auth, config, excel_io, graph_mailer, mailer_client, mailer_io,
+    mailer_split,
     oep_client, oep_presets, traffic_client, updater, zenith_client,
     zenith_history_analyzer, zenith_history_downloader, zenith_history_parser,
     zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
@@ -324,6 +325,14 @@ class App:
         self._mail_worker: threading.Thread | None = None
         self._mail_stop_flag = threading.Event()
         self._mail_log = MailerLog(config.MAILER_LOG_DB)
+        # Split & Send: one main sheet, filtered per email address in a column.
+        self.mail_split_input = tk.StringVar()
+        self.mail_split_sheet = tk.StringVar()
+        self.mail_split_column = tk.StringVar()
+        self.mail_split_outdir = tk.StringVar()
+        self.mail_split_cc = tk.StringVar()            # applied to EVERY message
+        self.mail_split_bcc = tk.StringVar()
+        self._mail_campaign = ""                       # sent-log campaign label
 
         # ----- Shared message queue -----
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -1257,6 +1266,63 @@ class App:
         ttk.Button(helper, text="Edit in Excel",
                    command=self._mail_edit_mapping).pack(side="left", padx=(8, 0))
 
+        # ----- Split & Send (no mapping / no separate files needed) -----
+        sp_body = self._section(parent, "Split & Send by email column")
+        ttk.Label(
+            sp_body, style="Hint.TLabel", justify="left", wraplength=900,
+            text=(
+                "One main sheet only: put each recipient's email address on their "
+                "rows. The app detects every address in the column you pick, filters "
+                "the sheet, and writes ONE Excel per address into the folder below — "
+                "then each recipient is emailed ONLY their own rows (as an attached "
+                "workbook). Rows with a blank/invalid address are parked in "
+                "_UNMATCHED_ROWS.xlsx, never sent. A cell may hold several addresses "
+                "(; , |) — the row goes to each. CC/BCC below apply to every message. "
+                "Body/subject placeholders: {email} {name} {rows} {file}."
+            ),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=2, pady=(0, 4))
+        split_entry = ttk.Entry(sp_body, textvariable=self.mail_split_input)
+        self._form_row(
+            sp_body, 1, "Main Excel:", split_entry,
+            suffix=ttk.Button(sp_body, text="Browse...",
+                              command=self._mail_split_pick_input),
+        )
+        pick_row = ttk.Frame(sp_body)
+        self.mail_split_sheet_cb = ttk.Combobox(
+            pick_row, textvariable=self.mail_split_sheet, state="readonly", width=28)
+        self.mail_split_sheet_cb.pack(side="left")
+        self.mail_split_sheet_cb.bind(
+            "<<ComboboxSelected>>", lambda _e: self._mail_split_fill_columns())
+        ttk.Label(pick_row, text="  Email column:").pack(side="left")
+        self.mail_split_column_cb = ttk.Combobox(
+            pick_row, textvariable=self.mail_split_column, state="readonly", width=28)
+        self.mail_split_column_cb.pack(side="left", padx=(4, 0))
+        self._form_row(sp_body, 2, "Sheet:", pick_row)
+        out_entry = ttk.Entry(sp_body, textvariable=self.mail_split_outdir)
+        self._form_row(
+            sp_body, 3, "Split files folder:", out_entry,
+            suffix=ttk.Button(sp_body, text="Browse...",
+                              command=self._mail_split_pick_outdir),
+        )
+        ccrow = ttk.Frame(sp_body)
+        ttk.Entry(ccrow, textvariable=self.mail_split_cc, width=34).pack(side="left")
+        ttk.Label(ccrow, text="  BCC (every message):").pack(side="left")
+        ttk.Entry(ccrow, textvariable=self.mail_split_bcc, width=34).pack(
+            side="left", padx=(4, 0))
+        self._form_row(sp_body, 4, "CC (every message):", ccrow)
+        sp_btns = ttk.Frame(sp_body)
+        sp_btns.grid(row=5, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 2))
+        ttk.Button(sp_btns, text="Create split files",
+                   command=lambda: self._mail_split_run(load_into_mailer=False),
+                   ).pack(side="left")
+        ttk.Button(sp_btns, text="Split + load into mailer", style="Primary.TButton",
+                   command=lambda: self._mail_split_run(load_into_mailer=True),
+                   ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            sp_btns, style="Hint.TLabel",
+            text="then use Preview grid + Test / Run below as usual",
+        ).pack(side="left", padx=(10, 0))
+
         # ----- Message -----
         msg_body = self._section(parent, "Message")
         subj_entry = ttk.Entry(msg_body, textvariable=self.mail_subject)
@@ -1675,6 +1741,116 @@ class App:
         if hasattr(os, "startfile"):
             os.startfile(p)            # open the user's own mapping in Excel
 
+    # ----- Split & Send by email column -------------------------------
+
+    def _mail_split_pick_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Pick the main Excel (rows carry an email column)",
+            filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")])
+        if not path:
+            return
+        self.mail_split_input.set(path)
+        if not self.mail_split_outdir.get().strip():
+            self.mail_split_outdir.set(str(Path(path).parent / "split_by_email"))
+        try:
+            sheets = excel_io.list_sheet_names(Path(path))
+        except Exception as exc:  # noqa: BLE001 — bad/locked workbook
+            messagebox.showerror("Split & Send", f"Couldn't read workbook: {exc}")
+            return
+        self.mail_split_sheet_cb.configure(values=sheets)
+        if sheets:
+            self.mail_split_sheet.set(sheets[0])
+        self._mail_split_fill_columns()
+
+    def _mail_split_fill_columns(self) -> None:
+        """Populate the email-column picker from the chosen sheet's header row."""
+        path = self.mail_split_input.get().strip()
+        if not path or not Path(path).is_file():
+            return
+        try:
+            headers = [h for h in mailer_split.read_headers(
+                path, self.mail_split_sheet.get().strip() or None) if h]
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Split & Send", f"Couldn't read headers: {exc}")
+            return
+        self.mail_split_column_cb.configure(values=headers)
+        # Preselect the most email-ish header so most runs are two clicks.
+        guess = next((h for h in headers if "email" in h.lower() or "mail" in h.lower()), "")
+        self.mail_split_column.set(guess or (headers[0] if headers else ""))
+
+    def _mail_split_pick_outdir(self) -> None:
+        chosen = filedialog.askdirectory(title="Folder for the per-recipient files")
+        if chosen:
+            self.mail_split_outdir.set(chosen)
+
+    def _mail_split_run(self, *, load_into_mailer: bool) -> None:
+        """Split the main sheet per email address; optionally arm the mailer.
+
+        Runs inline (not a worker): a few thousand rows split in well under a
+        second, and openpyxl/Tk interplay stays trivially safe.
+        """
+        path = self.mail_split_input.get().strip()
+        column = self.mail_split_column.get().strip()
+        out_dir = self.mail_split_outdir.get().strip()
+        if not path or not Path(path).is_file():
+            messagebox.showerror("Split & Send", "Pick the main Excel first.")
+            return
+        if not column:
+            messagebox.showerror("Split & Send", "Pick the email column.")
+            return
+        if not out_dir:
+            messagebox.showerror("Split & Send", "Pick the split-files folder.")
+            return
+        try:
+            result = mailer_split.split_by_email(
+                path, out_dir, email_column=column,
+                sheet_name=self.mail_split_sheet.get().strip() or None)
+        except ValueError as exc:            # missing column — user-fixable
+            messagebox.showerror("Split & Send", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("split_by_email failed")
+            messagebox.showerror("Split & Send", f"{type(exc).__name__}: {exc}")
+            return
+        if result.warnings:
+            messagebox.showwarning("Split & Send", "\n".join(result.warnings))
+        if not result.groups:
+            self.mail_status.configure(text="Split produced no recipients.")
+            return
+
+        if not load_into_mailer:
+            self.mail_status.configure(
+                text=f"Split {Path(path).name}: {len(result.groups)} recipient file(s) "
+                     f"in {out_dir}")
+            try:
+                import os
+                os.startfile(out_dir)  # noqa: S606 — user asked for the folder
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        rows = mailer_split.build_mail_rows(
+            result, cc=self.mail_split_cc.get(), bcc=self.mail_split_bcc.get())
+        self._mail_rows = rows
+        self._mail_campaign = Path(path).name        # sent-log key for skip-sent
+        for child in self.mail_tree.get_children():
+            self.mail_tree.delete(child)
+        valid = 0
+        for r in rows:
+            status = "OK" if r.is_valid else "; ".join(r.issues)
+            self.mail_tree.insert(
+                "", "end",
+                values=(r.row_index, r.email, r.name,
+                        ", ".join(p.name for p in r.attachments), r.cc, r.bcc, status),
+                tags=("ok",) if r.is_valid else ("bad",))
+            valid += 1 if r.is_valid else 0
+        self.mail_status.configure(
+            text=f"Split-loaded {valid} recipient(s) from {Path(path).name} — "
+                 "set Subject/Body, then Test or Run.")
+        ready = "normal" if valid else "disabled"
+        self.btn_mail_run.configure(state=ready)
+        self.btn_mail_test.configure(state=ready)
+
     def _mail_preview(self) -> None:
         """Read the mapping, resolve files, fill the preview grid."""
         mapping = self.mail_mapping_path.get().strip()
@@ -1692,6 +1868,7 @@ class App:
             messagebox.showerror("Bulk Mailer", f"Couldn't read mapping: {exc}")
             return
         self._mail_rows = rows
+        self._mail_campaign = ""            # mapping flow: campaign = mapping filename
         for child in self.mail_tree.get_children():
             self.mail_tree.delete(child)
         valid = 0
@@ -1797,7 +1974,9 @@ class App:
         send = mode == "send"
         transport = self.mail_transport.get()
         body_tmpl = self.mail_body_text.get("1.0", "end").rstrip("\n")
-        campaign = Path(self.mail_mapping_path.get()).name
+        # Split-loaded runs log under the main sheet's name; mapping runs under
+        # the mapping file's name — so skip-already-sent tracks the right campaign.
+        campaign = self._mail_campaign or Path(self.mail_mapping_path.get()).name
         skip_sent = self.mail_skip_sent.get()
         delay = max(0.0, float(self.mail_delay_s.get()))
 
