@@ -64,6 +64,9 @@ OEP_PRESET_FILE = APP_DIR / "oep_presets.json"
 # `asia.` origin waits them out. main.py reads this BEFORE the Zenith client modules import
 # and sets ZENITH_BASE_URL so every endpoint URL picks it up.
 ZENITH_HOST_FILE = APP_DIR / "zenith_host.txt"
+# Last window size/position — restored on launch so the app reopens where
+# the user left it (multi-monitor friendly; validated against the screen).
+WINDOW_GEOMETRY_FILE = APP_DIR / "window_geometry.txt"
 
 BD_OUTPUT_COLUMNS_LOOKUP = [
     "Searched Input",

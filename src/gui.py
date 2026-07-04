@@ -26,7 +26,9 @@ Layout:
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import re as _re
 import threading
 import time
 import tkinter as tk
@@ -211,7 +213,7 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Travel Ops Console")
-        self.root.geometry("1080x820")
+        self._apply_initial_geometry()
         self.root.minsize(900, 640)
 
         # ----- IATA tab state -----
@@ -343,7 +345,8 @@ class App:
 
         self._setup_styles()
         self._build_ui()
-        self._refresh_bd_status_label()
+        # (BD status label refresh moved into _ensure_tab_built — the BD tab
+        # is lazily built, so its widgets don't exist yet at this point.)
         # Show the correct auth button (Sign in or Sign out) from launch,
         # before `ensure_signed_in` runs.
         self._refresh_user_label()
@@ -381,17 +384,23 @@ class App:
                     )
                 ),
             }
-            cache_counts = {
-                "iata": self._cache.count() if hasattr(self, "_cache") and self._cache else 0,
-                "bd": (
-                    self._bd_cache.count()
-                    if hasattr(self, "_bd_cache") and self._bd_cache else 0
-                ),
-                "zenith": (
-                    self._zenith_pnr_cache.count()
-                    if hasattr(self, "_zenith_pnr_cache") and self._zenith_pnr_cache else 0
-                ),
-            }
+            # Cache counts are cosmetic and only change when a worker finishes —
+            # re-querying three SQLite files every 2s tick on the UI thread was
+            # pure waste. Refresh them at most every 30s.
+            import time as _t
+            now = _t.monotonic()
+            cached = getattr(self, "_tab_counts_cache", None)
+            if cached is None or now - cached[0] > 30.0:
+                counts = {
+                    "iata": self._cache.count() if getattr(self, "_cache", None) else 0,
+                    "bd": self._bd_cache.count() if getattr(self, "_bd_cache", None) else 0,
+                    "zenith": (
+                        self._zenith_pnr_cache.count()
+                        if getattr(self, "_zenith_pnr_cache", None) else 0
+                    ),
+                }
+                self._tab_counts_cache = (now, counts)
+            cache_counts = self._tab_counts_cache[1]
             for key, widget in self._tab_widgets.items():
                 base = self._tab_base_labels[widget]
                 pieces = [base]
@@ -440,24 +449,34 @@ class App:
         except Exception:  # noqa: BLE001
             pass
 
-    def _install_usage_tracking(self) -> None:
-        """Bind tab-change telemetry on EVERY notebook in the widget tree.
+    def _bind_usage_notebooks(self, subtree) -> None:
+        """Bind tab-change telemetry on every notebook under `subtree`.
 
-        Walking the whole tree means tabs and sub-tabs added in the future are
-        tracked automatically — no per-feature wiring. Completion events are
-        handled centrally via `_USAGE_EVENTS` in `_handle_msg`.
-        """
+        Re-runnable: lazily-built tabs call this for their own subtree, so
+        inner notebooks created after startup are still tracked. A path-keyed
+        set prevents double-binding (bind add="+" would double-fire)."""
+        bound: set = getattr(self, "_usage_bound_nbs", set())
+        self._usage_bound_nbs = bound
+
         def _walk(widget) -> None:
             for child in widget.winfo_children():
-                if isinstance(child, ttk.Notebook):
+                if isinstance(child, ttk.Notebook) and str(child) not in bound:
                     child.bind(
                         "<<NotebookTabChanged>>", self._on_tab_changed, add="+",
                     )
+                    bound.add(str(child))
                 _walk(child)
         try:
-            _walk(self.root)
+            _walk(subtree)
         except Exception:  # noqa: BLE001
             log.debug("usage tab-tracking install failed", exc_info=True)
+
+    def _install_usage_tracking(self) -> None:
+        """Initial telemetry install: bind what exists now (outer notebook +
+        the eagerly-built default tab); lazily-built tabs bind on first visit
+        via _ensure_tab_built. Completion events are handled centrally via
+        `_USAGE_EVENTS` in `_handle_msg`."""
+        self._bind_usage_notebooks(self.root)
         # Ignore the tab events that fire while the window first maps; only
         # count real navigation once the UI has settled.
         self.root.after(1500, lambda: setattr(self, "_telemetry_ready", True))
@@ -790,8 +809,17 @@ class App:
         inner.bind("<Configure>", _on_inner_configure)
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mouse-wheel scroll while pointer is over the canvas.
+        # Mouse-wheel scroll while pointer is over the canvas — but NOT when
+        # the pointer sits over a widget with its own vertical scrolling
+        # (Treeview/Text/Listbox/inner Canvas): their class binding already
+        # handles the wheel, and page-scrolling too made the page jerk while
+        # scrolling a results grid (double-scroll).
         def _on_mousewheel(event):
+            w = event.widget
+            while isinstance(w, tk.Widget) and w is not canvas:
+                if isinstance(w, (tk.Text, ttk.Treeview, tk.Listbox, tk.Canvas)):
+                    return
+                w = w.master
             canvas.yview_scroll(int(-event.delta / 120), "units")
 
         def _bind_wheel(_e):
@@ -932,11 +960,42 @@ class App:
             "zenith": zenith_tab, "mailer": mailer_tab,
         }
 
-        self._build_iata_tab(iata_tab)
-        self._build_bd_tab(bd_tab)
-        self._build_traffic_tab(traffic_tab)  # builds Air Traffic + OEP sub-tabs
-        self._build_zenith_tab(zenith_tab)
-        self._build_mailer_tab(mailer_tab)
+        # LAZY TAB CONSTRUCTION. Building all five tabs up front cost ~1.4s of
+        # the ~2.5s launch (hundreds of widgets, most never looked at in a
+        # session). Only the default tab is built now; the rest build on first
+        # visit — a one-off, imperceptible cost hidden inside the tab switch.
+        # Workers/messages can only originate from a built tab, so nothing can
+        # reference an unbuilt tab's widgets. Post-build steps that used to run
+        # at startup (BD status label, usage-telemetry binding on inner
+        # notebooks) run in _ensure_tab_built instead.
+        self._tab_builders: dict = {
+            iata_tab: self._build_iata_tab,
+            bd_tab: self._build_bd_tab,
+            traffic_tab: self._build_traffic_tab,  # Air Traffic + OEP sub-tabs
+            zenith_tab: self._build_zenith_tab,
+            mailer_tab: self._build_mailer_tab,
+        }
+        self._ensure_tab_built(iata_tab)          # default/visible tab
+        notebook.bind("<<NotebookTabChanged>>",
+                      self._on_outer_tab_selected, add="+")
+
+    def _on_outer_tab_selected(self, _event) -> None:
+        try:
+            sel = self.root.nametowidget(self.outer_notebook.select())
+        except (tk.TclError, KeyError):
+            return
+        self._ensure_tab_built(sel)
+
+    def _ensure_tab_built(self, widget) -> None:
+        """Build a lazily-deferred tab exactly once (no-op afterwards)."""
+        builder = self._tab_builders.pop(widget, None)
+        if builder is None:
+            return
+        builder(widget)
+        # Steps that assume the tab's widgets exist:
+        if widget is self._tab_widgets.get("bd"):
+            self._refresh_bd_status_label()
+        self._bind_usage_notebooks(widget)        # inner notebooks built just now
 
     # ==================================================================
     # Traffic Movement tab — air traffic (multi-source) + BD overseas labour
@@ -3644,7 +3703,44 @@ class App:
         if self._validator is not None:
             self._validator.stop()
 
+    def _apply_initial_geometry(self) -> None:
+        """Open at the last session's size/position; sensible default first run.
+
+        The saved geometry is validated against the CURRENT screen (a window
+        parked on a since-unplugged second monitor must not reopen off-screen).
+        """
+        default = "1080x820"
+        geom = ""
+        try:
+            geom = config.WINDOW_GEOMETRY_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        if geom == "zoomed":
+            self.root.geometry(default)
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
+            return
+        m = _re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geom)
+        if m:
+            w, h, x, y = (int(g) for g in m.groups())
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            if w >= 400 and h >= 300 and -50 <= x < sw - 100 and -50 <= y < sh - 100:
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+                return
+        self.root.geometry(default)
+
+    def _save_geometry(self) -> None:
+        try:
+            state = "zoomed" if self.root.state() == "zoomed" else self.root.geometry()
+            config.WINDOW_GEOMETRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            config.WINDOW_GEOMETRY_FILE.write_text(state, encoding="utf-8")
+        except Exception:  # noqa: BLE001 — never block app close on this
+            log.debug("geometry save failed", exc_info=True)
+
     def _on_close(self) -> None:
+        self._save_geometry()
         any_alive = (
             (self._worker is not None and self._worker.is_alive())
             or (self._bd_worker is not None and self._bd_worker.is_alive())
@@ -4454,11 +4550,27 @@ class App:
         self.btn_resume.configure(state="disabled")
         self.btn_stop.configure(state="disabled")
 
+    # Logs are capped so a 10k-row bulk run doesn't grow a Text widget without
+    # bound (each insert re-layouts; memory and repaint cost climb with size).
+    _LOG_MAX_LINES = 2000
+
+    @classmethod
+    def _append_log(cls, widget: tk.Text, msg: str) -> None:
+        """Append one line to a read-only log Text, trimming the oldest lines
+        once the widget exceeds _LOG_MAX_LINES."""
+        widget.configure(state="normal")
+        widget.insert("end", msg + "\n")
+        try:
+            lines = int(widget.index("end-1c").split(".")[0])
+            if lines > cls._LOG_MAX_LINES:
+                widget.delete("1.0", f"{lines - cls._LOG_MAX_LINES + 1}.0")
+        except (tk.TclError, ValueError):
+            pass
+        widget.see("end")
+        widget.configure(state="disabled")
+
     def _log(self, msg: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        self._append_log(self.log_text, msg)
 
     # ==================================================================
     # BD Travel Agency tab — actions + worker
@@ -4758,10 +4870,7 @@ class App:
     # ------------------------------------------------------------------
 
     def _bd_log(self, msg: str) -> None:
-        self.bd_log_text.configure(state="normal")
-        self.bd_log_text.insert("end", msg + "\n")
-        self.bd_log_text.see("end")
-        self.bd_log_text.configure(state="disabled")
+        self._append_log(self.bd_log_text, msg)
 
     def _bd_reset_buttons(self) -> None:
         self.btn_bd_refresh.configure(state="normal")
@@ -6017,10 +6126,7 @@ class App:
             self.zenith_bulk_output_dir.set(d)
 
     def _zenith_bulk_log_line(self, line: str) -> None:
-        self.zenith_bulk_log.configure(state="normal")
-        self.zenith_bulk_log.insert("end", line + "\n")
-        self.zenith_bulk_log.see("end")
-        self.zenith_bulk_log.configure(state="disabled")
+        self._append_log(self.zenith_bulk_log, line)
 
     def _zenith_bulk_stop(self) -> None:
         self._zenith_bulk_stop_flag.set()
@@ -7233,10 +7339,7 @@ class App:
         messagebox.showinfo("Zenith — Export Done", f"Wrote:\n\n{path}")
 
     def _zenith_log(self, text: str) -> None:
-        self.zenith_log_text.configure(state="normal")
-        self.zenith_log_text.insert("end", text + "\n")
-        self.zenith_log_text.see("end")
-        self.zenith_log_text.configure(state="disabled")
+        self._append_log(self.zenith_log_text, text)
 
     def _zenith_reset_buttons(self) -> None:
         self.btn_zenith_run.configure(state="normal")
@@ -7249,10 +7352,7 @@ class App:
     # ==================================================================
 
     def _zenith_fl_log(self, text: str) -> None:
-        self.zenith_fl_log_text.configure(state="normal")
-        self.zenith_fl_log_text.insert("end", text + "\n")
-        self.zenith_fl_log_text.see("end")
-        self.zenith_fl_log_text.configure(state="disabled")
+        self._append_log(self.zenith_fl_log_text, text)
 
     def _zenith_fl_pick_output(self) -> None:
         folder = filedialog.askdirectory(title="Choose flight-loads output folder")
@@ -7585,7 +7685,23 @@ def run() -> None:
         handlers=[handler],
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
+    # Declare DPI awareness BEFORE the Tk root exists. Without it Windows
+    # bitmap-stretches the whole window on scaled displays (125%/150% laptops)
+    # — blurry text everywhere. With it, Tk reads the real DPI and renders
+    # crisp; fonts scale via `tk scaling`. Opt-out: TRAVELOPS_NO_DPI=1.
+    if os.environ.get("TRAVELOPS_NO_DPI") != "1":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # SYSTEM_DPI_AWARE
+        except Exception:  # noqa: BLE001 — pre-Win8.1 / non-Windows
+            pass
     root = tk.Tk()
+    try:
+        # Point-sized fonts render at true size only if Tk's points→pixels
+        # factor matches the real DPI.
+        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         # Better default font on Windows
         from tkinter import font as tkfont
