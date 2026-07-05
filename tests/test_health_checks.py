@@ -78,6 +78,24 @@ def test_same_site_redirect_logic():
     assert not _same_site("regtravelagency.gov.bd", "portal.isp.com")
 
 
+def test_backend_probes_real_endpoint_not_root():
+    # A Cloud Run API root 404s; probe the updater's real version endpoint so a
+    # healthy backend doesn't read as a false WARN. (Only the console app has a
+    # backend; the standalone mailer has no auth module and no backend check.)
+    seen = {}
+
+    def rec_probe(url, timeout):
+        seen[url] = True
+        return (OK, "ok")
+    results = run_health_checks("console", probe=rec_probe)
+    has_backend = any(r.key == "backend" for r in results)
+    if not has_backend:
+        return                                          # no auth module (standalone) — n/a
+    assert any(u.endswith("/api/v1/app/latest") for u in seen), \
+        f"backend not probed at the real endpoint; probed: {list(seen)}"
+    assert not any(u.rstrip('/').endswith('.run.app') for u in seen)   # not the bare root
+
+
 def test_new_coverage_checks_present():
     keys = {r.key for r in run_health_checks("console", probe=lambda u, t: (OK, "ok"))}
     assert "graph" in keys and "traffic" in keys            # M365 + traffic now covered

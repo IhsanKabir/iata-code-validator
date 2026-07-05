@@ -58,8 +58,11 @@ log = logging.getLogger(__name__)
 # from the IATA_GOOGLE_CLIENT_ID / IATA_API_BASE_URL repo secrets and
 # committed to the .gitignore — it never ships in source control.
 
-# Default to the public Cloud Run URL the TravelportAuto desktop uses.
-DEFAULT_API_BASE_URL = "https://aero-pulse-api-cuoiwdgdaq-uc.a.run.app"
+# Default to the live Cloud Run backend (asia-south1). The old us-central
+# URL (…cuoiwdgdaq-uc…) is decommissioned — it 404s on every route — so it was
+# a broken fallback. The frozen exe still overrides this with the baked
+# IATA_API_BASE_URL secret; this default only matters for dev / unbaked builds.
+DEFAULT_API_BASE_URL = "https://aero-pulse-api-591603094460.asia-south1.run.app"
 
 try:
     from . import _build_config as _bc  # type: ignore[import-not-found]

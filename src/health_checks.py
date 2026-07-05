@@ -265,7 +265,12 @@ def _registry(app: str, verify_browser: bool = False) -> list:
         _net("whatsapp", "WhatsApp Blast", "https://web.whatsapp.com", "WhatsApp Web may be down, or check your internet."),
     ]
     if backend:
-        checks.append(_net("backend", "Sign-in / auto-update backend", backend,
+        # Probe a REAL endpoint, not the API root — a Cloud Run API has no route
+        # at "/" and legitimately 404s there (that was a false WARN). The
+        # updater's version endpoint answers (200, or 401 when gated) if the
+        # backend is alive.
+        backend_url = backend.rstrip("/") + "/api/v1/app/latest"
+        checks.append(_net("backend", "Sign-in / auto-update backend", backend_url,
                            "The app's backend is unreachable — sign-in and updates may fail."))
     return checks
 
