@@ -2,23 +2,29 @@
 
 Drives web.whatsapp.com through a persistent-profile browser so the QR scan is
 one-time. Sends a text message — optionally with one shared image — to a bare
-international number. Mirrors the proven persistent-context pattern in
-validator.py. Works in BOTH apps:
+international number.
 
-  * Combined console: uses the bundled patchright Chromium.
-  * Standalone mailer: drives the user's installed Chrome/Edge (no bundled
-    browser -> the exe stays tiny) via a channel.
+THREAD MODEL (critical): Playwright's sync API pins its driver to the OS thread
+that created it, so EVERY Playwright call must run on that one thread. This
+class therefore owns a single long-lived "session thread": the browser is
+created there and every command (login check, send, close) is marshalled onto
+it through a queue. GUI worker threads only enqueue commands and block for the
+result — they never touch the page directly. This is the fix for the
+cross-thread "greenlet switch on wrong thread" failure that otherwise breaks
+every send.
+
+Works in BOTH apps: the combined console uses the bundled patchright Chromium;
+the standalone mailer drives the user's installed Chrome/Edge via a channel.
 
 DISCLAIMER: automating WhatsApp Web violates WhatsApp's Terms of Service and
-can get the sending number BANNED, especially on fast/large blasts to people
-who never messaged you first. The GUI surfaces this at every step; this module
-just does the mechanics as safely as it can (serial, verified, resumable).
+can get the sending number BANNED. The GUI surfaces this at every step.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -27,11 +33,11 @@ from urllib.parse import quote
 
 log = logging.getLogger(__name__)
 
-# Send outcomes (mirror mailer SendOutcome vocabulary where it overlaps).
+# Send outcomes.
 SENT = "SENT"
-NOT_ON_WHATSAPP = "NOT_ON_WHATSAPP"      # number has no WhatsApp account
+NOT_ON_WHATSAPP = "NOT_ON_WHATSAPP"
 FAILED = "FAILED"
-LOGGED_OUT = "LOGGED_OUT"                 # session expired mid-run
+LOGGED_OUT = "LOGGED_OUT"
 SKIPPED = "SKIPPED"
 
 # Login states.
@@ -49,11 +55,12 @@ class WhatsAppSendResult:
     error: str = ""
 
 
-def build_send_url(phone: str, text: str) -> str:
-    """WhatsApp deep link that opens a 1:1 chat with the text pre-filled.
+class WhatsAppBrowserError(RuntimeError):
+    pass
 
-    The text lands in the compose box as content (newlines preserved as line
-    breaks, NOT as premature sends) — we press Enter once to actually send."""
+
+def build_send_url(phone: str, text: str) -> str:
+    """WhatsApp deep link that opens a 1:1 chat with the text pre-filled."""
     q = f"phone={quote(phone)}"
     if text:
         q += f"&text={quote(text)}"
@@ -61,8 +68,7 @@ def build_send_url(phone: str, text: str) -> str:
 
 
 def _import_sync_playwright():
-    """patchright (bundled in the console) first, then plain playwright
-    (standalone). Same API, so the rest of the module is agnostic."""
+    """patchright (bundled in the console) first, then plain playwright."""
     try:
         from patchright.sync_api import sync_playwright  # type: ignore
         return sync_playwright
@@ -74,13 +80,11 @@ def _import_sync_playwright():
 def resolve_launch_kwargs(browser: str, *, chrome_probe=None) -> dict:
     """Launch kwargs for the persistent context.
 
-    browser: 'bundled' (use the packaged Chromium), 'system' (installed
-    Chrome/Edge via a channel), or 'auto' (bundled when frozen/available, else
-    system). `chrome_probe(channel)->bool` lets tests inject availability."""
+    browser: 'bundled' | 'system' | 'auto'. `chrome_probe(channel)->bool` lets
+    tests inject availability."""
     def _have(channel: str) -> bool:
         if chrome_probe is not None:
             return chrome_probe(channel)
-        # Heuristic browser presence check (Windows install locations).
         candidates = {
             "chrome": [
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -93,10 +97,11 @@ def resolve_launch_kwargs(browser: str, *, chrome_probe=None) -> dict:
         }.get(channel, [])
         return any(Path(p).is_file() for p in candidates)
 
-    frozen = bool(getattr(__import__("sys"), "frozen", False)) or \
+    import sys
+    frozen = bool(getattr(sys, "frozen", False)) or \
         os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "0"
     if browser == "bundled" or (browser == "auto" and frozen):
-        return {}                            # default bundled chromium
+        return {}
     for channel in ("chrome", "msedge"):
         if _have(channel):
             return {"channel": channel}
@@ -104,15 +109,11 @@ def resolve_launch_kwargs(browser: str, *, chrome_probe=None) -> dict:
         raise WhatsAppBrowserError(
             "No Chrome or Edge found. Install Google Chrome, or use the "
             "combined Travel Ops Console app (it ships its own browser).")
-    return {}                                # last resort: bundled
-
-
-class WhatsAppBrowserError(RuntimeError):
-    pass
+    return {}
 
 
 class WhatsAppSession:
-    """One persistent WhatsApp Web browser session. Serial send only."""
+    """One persistent WhatsApp Web session, confined to its own thread."""
 
     def __init__(
         self,
@@ -120,28 +121,48 @@ class WhatsAppSession:
         *,
         browser: str = "auto",
         on_log=None,
-        nav_timeout_s: float = 60.0,
+        nav_timeout_s: float = 45.0,
     ) -> None:
         self.profile_dir = Path(profile_dir)
         self.browser = browser
         self._on_log = on_log or (lambda m: log.info(m))
+        self._nav_timeout_s = nav_timeout_s
         self._nav_timeout_ms = int(nav_timeout_s * 1000)
+        self._confirm_timeout_s = 20.0            # wait for a NEW outgoing bubble
         self._pw = None
         self._context = None
         self._page = None
+        self._cmd_q: "queue.Queue" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._start_error: Exception | None = None
         self._stop = threading.Event()
 
-    # -- lifecycle ----------------------------------------------------------
+    # -- session thread + command marshalling -------------------------------
 
     def start(self) -> None:
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        """Spawn the session thread, which creates the browser ON that thread.
+        Blocks until the browser is ready (or raises the startup error)."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="wa-session", daemon=True)
+        self._thread.start()
+        if not self._started.wait(timeout=self._nav_timeout_s + 40):
+            raise WhatsAppBrowserError("WhatsApp browser did not start in time.")
+        if self._start_error is not None:
+            err, self._start_error = self._start_error, None
+            raise err
+
+    def _create_browser(self) -> None:
+        """Create the Playwright browser ON the session thread. Overridable in
+        tests to inject a fake page (so the threading contract can be verified
+        without a real browser)."""
         sync_playwright = _import_sync_playwright()
         self._pw = sync_playwright().start()
         kwargs = resolve_launch_kwargs(self.browser)
-        # WhatsApp needs a VISIBLE window (QR scan + it's a user guardrail).
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=str(self.profile_dir),
-            headless=False,
+            headless=False,                           # QR scan + user guardrail
             viewport={"width": 1200, "height": 860},
             args=["--disable-blink-features=AutomationControlled"],
             **kwargs,
@@ -152,39 +173,70 @@ class WhatsAppSession:
         self._page.goto(_WA_BASE, wait_until="domcontentloaded")
         self._on_log("WhatsApp Web opened.")
 
+    def _loop(self) -> None:
+        # EVERYTHING Playwright happens on this thread.
+        try:
+            self._create_browser()
+        except Exception as exc:  # noqa: BLE001
+            self._start_error = exc
+            self._started.set()
+            return
+        self._started.set()
+        while True:
+            item = self._cmd_q.get()
+            if item is None:                          # close sentinel
+                break
+            fn, holder = item
+            try:
+                holder["result"] = fn()
+            except Exception as exc:  # noqa: BLE001
+                holder["error"] = exc
+            finally:
+                holder["event"].set()
+        for teardown in (lambda: self._context.close(), lambda: self._pw.stop()):
+            try:
+                teardown()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("wa teardown: %s", exc)
+
+    def _call(self, fn, *, timeout: float):
+        if self._thread is None or not self._thread.is_alive():
+            raise WhatsAppBrowserError("WhatsApp session is not running.")
+        holder: dict = {"event": threading.Event()}
+        self._cmd_q.put((fn, holder))
+        if not holder["event"].wait(timeout=timeout):
+            raise TimeoutError("WhatsApp session command timed out.")
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result")
+
     def stop(self) -> None:
+        """Soft stop: the browser stays alive; the current/next send bails out."""
         self._stop.set()
 
-    def close(self) -> None:
-        for fn in (
-            lambda: self._context and self._context.close(),
-            lambda: self._pw and self._pw.stop(),
-        ):
-            try:
-                fn()
-            except Exception as exc:  # noqa: BLE001
-                log.debug("whatsapp close: %s", exc)
-        self._context = self._page = self._pw = None
+    def clear_stop(self) -> None:
+        """Re-arm the session for a fresh run after a soft stop."""
+        self._stop.clear()
 
-    # -- login --------------------------------------------------------------
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._cmd_q.put(None)
+            self._thread.join(timeout=15)
+        self._thread = None
+
+    # -- public API (marshalled) --------------------------------------------
 
     def login_status(self) -> str:
-        """logged_in (chat list present) | needs_qr | loading."""
-        if self._page is None:
-            return LOADING
         try:
-            if self._page.locator("#pane-side").count() > 0:
-                return LOGGED_IN
-            qr = self._page.locator(
-                'canvas[aria-label], div[data-ref], [data-testid="qrcode"]')
-            if qr.count() > 0:
-                return NEEDS_QR
-        except Exception as exc:  # noqa: BLE001
-            log.debug("login_status probe: %s", exc)
-        return LOADING
+            return self._call(self._do_login_status, timeout=20)
+        except (WhatsAppBrowserError, TimeoutError):
+            return LOADING
 
     def wait_until_logged_in(self, timeout_s: float = 180.0) -> bool:
-        """Poll until the chat list appears (user scanned the QR)."""
+        """Poll (on the CALLING thread) until the chat list appears. Each poll
+        is a quick marshalled call, so the session thread stays free and Stop
+        is honoured."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if self._stop.is_set():
@@ -194,43 +246,67 @@ class WhatsAppSession:
             time.sleep(1.0)
         return False
 
-    # -- sending ------------------------------------------------------------
-
     def send(self, phone: str, text: str,
              image_path: str | None = None) -> WhatsAppSendResult:
-        """Send one message. Never raises for a per-contact problem — returns a
-        classified result so the batch continues."""
-        if self._stop.is_set():
-            return WhatsAppSendResult(phone, SKIPPED, "stopped")
-        if self._page is None:
-            return WhatsAppSendResult(phone, FAILED, "session not started")
         try:
-            self._page.goto(build_send_url(phone, "" if image_path else text),
-                            wait_until="domcontentloaded")
-            state = self._await_chat_or_block(phone)
-            if state != "chat":
-                return WhatsAppSendResult(phone, state, "")
-            if image_path:
-                return self._send_with_image(phone, text, image_path)
-            return self._send_text(phone)
-        except Exception as exc:  # noqa: BLE001 — one contact must not kill the run
-            log.warning("whatsapp send %s failed: %s", phone, exc)
+            return self._call(lambda: self._do_send(phone, text, image_path),
+                              timeout=self._nav_timeout_s + 60)
+        except Exception as exc:  # noqa: BLE001
             return WhatsAppSendResult(phone, FAILED, str(exc)[:200])
 
-    def _await_chat_or_block(self, phone: str) -> str:
-        """Wait for the compose box (chat open) OR an invalid-number modal OR a
-        logout. Returns 'chat' | NOT_ON_WHATSAPP | LOGGED_OUT | FAILED."""
-        deadline = time.monotonic() + self._nav_timeout_ms / 1000
+    # -- page ops (run ON the session thread) -------------------------------
+
+    def _do_login_status(self) -> str:
+        if self._page is None:
+            return LOADING
+        try:
+            if self._page.locator("#pane-side").count() > 0:
+                return LOGGED_IN
+            if self._page.locator(
+                    'canvas[aria-label], div[data-ref], [data-testid="qrcode"]').count() > 0:
+                return NEEDS_QR
+        except Exception as exc:  # noqa: BLE001
+            log.debug("login_status probe: %s", exc)
+        return LOADING
+
+    def _do_send(self, phone: str, text: str,
+                 image_path: str | None) -> WhatsAppSendResult:
+        if self._stop.is_set():
+            return WhatsAppSendResult(phone, SKIPPED, "stopped")
+        self._page.goto(build_send_url(phone, "" if image_path else text),
+                        wait_until="domcontentloaded")
+        state = self._await_chat_or_block()
+        if state != "chat":
+            return WhatsAppSendResult(phone, state)
+        # Baseline the outgoing-message count BEFORE sending so confirmation is
+        # scoped to a NEW message, not a pre-existing tick from earlier in the
+        # same chat (the false-SENT bug).
+        baseline = self._outgoing_count()
+        try:
+            if image_path:
+                self._attach_and_caption(text, image_path)
+            else:
+                box = self._compose_box()
+                box.wait_for(state="visible", timeout=15000)
+                box.click()
+                self._page.keyboard.press("Enter")
+        except Exception as exc:  # noqa: BLE001
+            return WhatsAppSendResult(phone, FAILED, str(exc)[:200])
+        if self._confirm_new_message(baseline):
+            return WhatsAppSendResult(phone, SENT)
+        return WhatsAppSendResult(phone, FAILED, "no new message appeared")
+
+    def _await_chat_or_block(self) -> str:
+        deadline = time.monotonic() + self._nav_timeout_s
         while time.monotonic() < deadline:
             if self._stop.is_set():
                 return SKIPPED
-            # invalid-number popup ("Phone number shared via url is invalid")
-            invalid = self._page.get_by_text("invalid", exact=False)
-            if invalid.count() > 0 and self._page.locator(
-                    'div[data-animate-modal-body="true"], [role="dialog"]').count() > 0:
+            if self._page.locator(
+                    '[role="dialog"], div[data-animate-modal-body="true"]').count() > 0 \
+                    and self._page.get_by_text("invalid", exact=False).count() > 0:
                 self._dismiss_modal()
                 return NOT_ON_WHATSAPP
-            if self.login_status() == NEEDS_QR:
+            if self._do_login_status() == NEEDS_QR:
                 return LOGGED_OUT
             if self._compose_box().count() > 0:
                 return "chat"
@@ -238,7 +314,6 @@ class WhatsAppSession:
         return FAILED
 
     def _compose_box(self):
-        # Layered, most-stable-first. The compose box lives in the footer.
         return self._page.locator(
             'footer div[contenteditable="true"][role="textbox"], '
             'footer div[contenteditable="true"], '
@@ -255,57 +330,47 @@ class WhatsAppSession:
             except Exception:  # noqa: BLE001
                 continue
 
-    def _send_text(self, phone: str) -> WhatsAppSendResult:
-        box = self._compose_box()
-        box.wait_for(state="visible", timeout=15000)
-        box.click()
-        self._page.keyboard.press("Enter")
-        if self._confirm_sent():
-            return WhatsAppSendResult(phone, SENT)
-        return WhatsAppSendResult(phone, FAILED, "no send confirmation")
-
-    def _send_with_image(self, phone: str, caption: str,
-                         image_path: str) -> WhatsAppSendResult:
-        # Set the file directly on WhatsApp's hidden media <input>, bypassing
-        # the OS file dialog (which Playwright can't drive).
+    def _attach_and_caption(self, caption: str, image_path: str) -> None:
+        # Set the file on WhatsApp's hidden media <input>, bypassing the OS
+        # dialog Playwright can't drive.
         file_input = self._page.locator(
             'input[type="file"][accept*="image"], input[type="file"]').first
         file_input.set_input_files(image_path, timeout=15000)
-        # media preview: a caption box appears; type the text there.
-        cap = self._page.locator(
-            'div[contenteditable="true"][role="textbox"]').last
-        cap.wait_for(state="visible", timeout=15000)
+        # Wait for the media PREVIEW to be ready (its send button appears)
+        # BEFORE typing the caption — otherwise the caption is lost / mistyped.
+        send_btn = self._page.locator(
+            'span[data-icon="send"], div[role="button"][aria-label="Send"], '
+            '[data-testid="send"]').first
+        send_btn.wait_for(state="visible", timeout=20000)
         if caption:
+            cap = self._page.locator(
+                'div[contenteditable="true"][role="textbox"]').last
+            cap.wait_for(state="visible", timeout=10000)
             cap.click()
             self._page.keyboard.type(caption, delay=8)
-        # send button in the media preview
-        for sel in ('span[data-icon="send"]', 'div[role="button"][aria-label="Send"]',
-                    '[data-testid="send"]'):
-            try:
-                btn = self._page.locator(sel).first
-                if btn.count() > 0:
-                    btn.click(timeout=5000)
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        else:
-            self._page.keyboard.press("Enter")
-        if self._confirm_sent(image=True):
-            return WhatsAppSendResult(phone, SENT)
-        return WhatsAppSendResult(phone, FAILED, "image send not confirmed")
+        send_btn.click(timeout=8000)
 
-    def _confirm_sent(self, *, image: bool = False) -> bool:
-        """Confirm the message left our device: an outgoing bubble shows a
-        status tick (pending clock -> single/double check). We accept the
-        pending clock too (it left the composer), but wait briefly for a check."""
+    def _outgoing_count(self) -> int:
         try:
-            # a message status icon on the newest outgoing message
-            self._page.locator(
-                'span[data-icon="msg-check"], span[data-icon="msg-dblcheck"], '
-                'span[data-icon="msg-time"]'
-            ).last.wait_for(state="visible", timeout=15000)
-            time.sleep(0.3)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.debug("send confirm: %s", exc)
-            return False
+            return self._page.locator("div.message-out").count()
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _confirm_new_message(self, baseline: int) -> bool:
+        """Confirm a NEW outgoing message appeared (count grew past baseline).
+        A new row means our text left the composer; we additionally wait for a
+        status tick on it. 'Only a pre-existing tick, no new row' => not sent."""
+        deadline = time.monotonic() + self._confirm_timeout_s
+        grew = False
+        while time.monotonic() < deadline:
+            try:
+                if self._page.locator("div.message-out").count() > baseline:
+                    grew = True
+                    tick = self._page.locator("div.message-out").last.locator(
+                        'span[data-icon^="msg-"]')
+                    if tick.count() > 0:
+                        return True
+            except Exception as exc:  # noqa: BLE001
+                log.debug("confirm: %s", exc)
+            time.sleep(0.4)
+        return grew                                   # new row but no tick yet = sent-pending

@@ -43,6 +43,12 @@ def normalize_phone(raw: object, *, default_cc: str = "880") -> str | None:
     the country your *local* numbers belong to.
     """
     s = ("" if raw is None else str(raw)).strip()
+    if not s:
+        return None
+    # Reject anything with letters (extensions like "x99"/"ext.12", stray text):
+    # stripping them silently would fabricate a different, wrong number.
+    if any(c.isalpha() for c in s):
+        return None
     explicit_intl = s.startswith("+") or s.startswith("00")
     digits = _NON_DIGIT_RE.sub("", s)
     if not digits:
@@ -50,14 +56,19 @@ def normalize_phone(raw: object, *, default_cc: str = "880") -> str | None:
     if digits.startswith("00"):                 # 00<cc>… international prefix
         digits = digits[2:]
         explicit_intl = True
-    cc = default_cc.lstrip("0")
+    cc = _NON_DIGIT_RE.sub("", default_cc).lstrip("0") or "880"   # sanitize cc
     if explicit_intl:
         pass                                    # trust the given country code
     elif digits.startswith("0"):
         digits = cc + digits[1:]                # local trunk 0 -> country code
-    elif len(digits) <= 10:
-        digits = cc + digits                    # short national number
-    # else: 11+ bare digits already include a country code -> keep as-is
+    elif len(digits) < 11:
+        # A bare number with no +, no 00, no leading 0, and shorter than an
+        # international number is AMBIGUOUS (is 4155551234 a US number or a
+        # local one missing its code?). Prepending a country code here can dial
+        # a real stranger in the wrong country — so REJECT it instead. Users
+        # give foreign numbers a leading + and local numbers their leading 0.
+        return None
+    # else: 11+ bare digits already carry a country code -> keep as-is
     if not (_MIN_INTL_DIGITS <= len(digits) <= _MAX_INTL_DIGITS):
         return None
     return digits

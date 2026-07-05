@@ -69,6 +69,27 @@ class WhatsAppMixin:
     def _wa_profile_dir(self) -> Path:
         return config.APP_DIR / "whatsapp_profile"
 
+    def _wa_request_stop(self) -> None:
+        """Stop the batch loop AND the in-flight session op (so Stop doesn't
+        appear dead for the duration of the current send)."""
+        self._wa_stop.set()
+        if self._wa_session is not None:
+            self._wa_session.stop()
+        self.wa_status.configure(text="Stopping after the current message…")
+
+    def _wa_shutdown(self) -> None:
+        """Called from the host app's window-close handler: stop a running
+        blast and close the browser session so no orphan Chromium is left.
+        No-op if the WhatsApp section was never built (lazy tab never opened)."""
+        if getattr(self, "_wa_session", None) is None:
+            return
+        try:
+            self._wa_stop.set()
+            self._wa_session.close()
+            self._wa_session = None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("wa shutdown: %s", exc)
+
     # -- section build ------------------------------------------------------
 
     def _build_whatsapp_section(self, parent: tk.Widget) -> None:
@@ -143,7 +164,7 @@ class WhatsAppMixin:
                                       command=self._wa_run, state="disabled")
         self.btn_wa_send.pack(side="left", padx=(8, 0))
         self.btn_wa_stop = ttk.Button(act, text="Stop", style="Danger.TButton",
-                                      command=lambda: self._wa_stop.set(), state="disabled")
+                                      command=self._wa_request_stop, state="disabled")
         self.btn_wa_stop.pack(side="left", padx=(8, 0))
 
         # preview grid + progress
@@ -361,6 +382,7 @@ class WhatsAppMixin:
         rows = list(self._wa_rows[:cap])
         session = self._wa_session
         self._wa_stop.clear()
+        session.clear_stop()                         # re-arm after any prior Stop
         self.btn_wa_send.configure(state="disabled")
         self.btn_wa_stop.configure(state="normal")
         self.wa_progress.configure(value=0, maximum=len(rows))

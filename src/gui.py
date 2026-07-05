@@ -3833,6 +3833,9 @@ class App(WhatsAppMixin):
 
     def _on_close(self) -> None:
         self._save_geometry()
+        # Stop any WhatsApp blast + close the browser so no orphan Chromium
+        # lingers after the window is gone.
+        self._wa_shutdown()
         any_alive = (
             (self._worker is not None and self._worker.is_alive())
             or (self._bd_worker is not None and self._bd_worker.is_alive())
