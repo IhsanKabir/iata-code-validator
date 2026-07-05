@@ -32,19 +32,35 @@ def app():
 def test_default_tab_is_built_and_others_deferred(app):
     # IATA (default tab) builds eagerly; the other four defer to first visit.
     assert hasattr(app, "log_text")                  # IATA widgets exist
-    assert len(app._tab_builders) == 4               # bd/traffic/zenith/mailer pending
+    assert len(app._tab_builders) == 5               # bd/traffic/zenith/mailer/health pending
 
 
 def test_all_lazy_tabs_build_without_errors(app):
     for widget in list(app._tab_widgets.values()):
         app._ensure_tab_built(widget)
     assert not app._tab_builders                     # everything built exactly once
-    # Key widgets from each tab exist afterwards (incl. the WhatsApp section):
+    # Key widgets from each tab exist afterwards (incl. WhatsApp + Health):
     for attr in ("log_text", "bd_log_text", "mail_tree", "zenith_bulk_log",
-                 "btn_zenith_fh_inspect", "oep_tree", "wa_tree", "btn_wa_send"):
+                 "btn_zenith_fh_inspect", "oep_tree", "wa_tree", "btn_wa_send",
+                 "health_tree", "btn_health_run"):
         assert hasattr(app, attr), f"missing {attr} after full build"
-    # WhatsApp mixin dispatch: unknown wa_ kind returns False (not swallowed).
+    # Mixin dispatch: unknown kinds return False (not swallowed).
     assert app._wa_handle_msg("wa_unknown", None) is False
+    assert app._health_handle_msg("health_unknown", None) is False
+
+
+def test_health_handler_safe_when_widgets_destroyed(app):
+    """Closing the Health surface mid-run must not let a late message crash the
+    queue pump (a TclError there freezes ALL background messaging)."""
+    import tkinter as _tk
+    app._ensure_tab_built(app._tab_widgets["health"])
+    tree = app.health_tree
+    tree.destroy()                                   # simulate the surface closing
+    from src.health_checks import HealthResult
+    from src.health_gui import HEALTH_MSG_RESULT
+    # must consume the message (True) and NOT raise
+    r = HealthResult("iata", "IATA", "Connectivity", "OK", "ok", "")
+    assert app._health_handle_msg(HEALTH_MSG_RESULT, r) is True
     # Re-running is a no-op, not a rebuild.
     app._ensure_tab_built(app._tab_widgets["bd"])
 

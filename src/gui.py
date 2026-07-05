@@ -44,6 +44,7 @@ from . import (
     zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
     zenith_pnr_history_downloader,
 )
+from .health_gui import HealthMixin
 from .mailer_log import MailerLog
 from .traffic_sources import SOURCES as TRAFFIC_SOURCES
 from .whatsapp_gui import WhatsAppMixin
@@ -210,7 +211,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
 }
 
 
-class App(WhatsAppMixin):
+class App(WhatsAppMixin, HealthMixin):
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Travel Ops Console")
@@ -993,6 +994,7 @@ class App(WhatsAppMixin):
         traffic_tab = ttk.Frame(notebook)
         zenith_tab = ttk.Frame(notebook)
         mailer_tab = ttk.Frame(notebook)
+        health_tab = ttk.Frame(notebook)
         # Tab text is a base name; `_refresh_tab_labels` appends running
         # state ("●") and cache counts so users see status at a glance.
         # BD Overseas Movement (OEP) now lives as a sub-tab under Traffic
@@ -1003,15 +1005,17 @@ class App(WhatsAppMixin):
             traffic_tab: "Traffic Movement",
             zenith_tab: "Zenith",
             mailer_tab: "Bulk Mailer",
+            health_tab: "Health",
         }
         notebook.add(iata_tab, text=self._tab_base_labels[iata_tab])
         notebook.add(bd_tab, text=self._tab_base_labels[bd_tab])
         notebook.add(traffic_tab, text=self._tab_base_labels[traffic_tab])
         notebook.add(zenith_tab, text=self._tab_base_labels[zenith_tab])
         notebook.add(mailer_tab, text=self._tab_base_labels[mailer_tab])
+        notebook.add(health_tab, text=self._tab_base_labels[health_tab])
         self._tab_widgets = {
             "iata": iata_tab, "bd": bd_tab, "traffic": traffic_tab,
-            "zenith": zenith_tab, "mailer": mailer_tab,
+            "zenith": zenith_tab, "mailer": mailer_tab, "health": health_tab,
         }
 
         # LAZY TAB CONSTRUCTION. Building all five tabs up front cost ~1.4s of
@@ -1028,6 +1032,7 @@ class App(WhatsAppMixin):
             traffic_tab: self._build_traffic_tab,  # Air Traffic + OEP sub-tabs
             zenith_tab: self._build_zenith_tab,
             mailer_tab: self._build_mailer_tab,
+            health_tab: lambda p: self._build_health_panel(p, "console"),
         }
         self._ensure_tab_built(iata_tab)          # default/visible tab
         notebook.bind("<<NotebookTabChanged>>",
@@ -4039,7 +4044,13 @@ class App(WhatsAppMixin):
         try:
             while True:
                 kind, payload = self._msg_queue.get_nowait()
-                self._handle_msg(kind, payload)
+                # A raising handler (e.g. touching a just-destroyed dialog widget)
+                # must NEVER kill the pump — that would freeze every feature's
+                # background messaging for the rest of the session.
+                try:
+                    self._handle_msg(kind, payload)
+                except Exception:  # noqa: BLE001
+                    log.exception("message handler failed for %r", kind)
                 # Result grids repopulate on completion messages — re-apply
                 # zebra striping once per drain (not per message; progress
                 # messages arrive at high rate during bulk runs).
@@ -4051,8 +4062,10 @@ class App(WhatsAppMixin):
         self.root.after(100, self._poll_queue)
 
     def _handle_msg(self, kind: str, payload: object) -> None:
-        # WhatsApp-blast messages are handled by the shared mixin.
+        # WhatsApp-blast + Health messages are handled by shared mixins.
         if kind.startswith("wa_") and self._wa_handle_msg(kind, payload):
+            return
+        if kind.startswith("health_") and self._health_handle_msg(kind, payload):
             return
         # Central usage telemetry — fire for any registered completion message
         # before the feature-specific handling, so a handler that raises can't
