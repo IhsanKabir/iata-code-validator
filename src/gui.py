@@ -1360,6 +1360,18 @@ class App(WhatsAppMixin, HealthMixin):
     # ==================================================================
 
     def _build_mailer_tab(self, parent: ttk.Frame) -> None:
+        # Two channels, one per sub-tab, so the WhatsApp option is discoverable
+        # instead of buried below the whole email form.
+        inner = ttk.Notebook(parent)
+        inner.pack(fill="both", expand=True)
+        email_tab = ttk.Frame(inner)
+        wa_tab = ttk.Frame(inner)
+        inner.add(email_tab, text="Email")
+        inner.add(wa_tab, text="WhatsApp")
+        self._build_email_panel(email_tab)
+        self._build_whatsapp_section(self._make_scrollable(wa_tab))
+
+    def _build_email_panel(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
 
         intro = self._section(parent, "Bulk Mailer")
@@ -1647,9 +1659,6 @@ class App(WhatsAppMixin, HealthMixin):
         prog = self._section(parent, "Progress")
         self.mail_progress = ttk.Progressbar(prog, mode="determinate", maximum=1)
         self.mail_progress.pack(fill="x", padx=2, pady=2)
-
-        # ----- WhatsApp Blast (free, sends from the user's own number) -----
-        self._build_whatsapp_section(parent)
 
         # Show the credential block matching the default transport — layout only;
         # initial=True so we DON'T touch Outlook COM / MSAL at startup (that pops a
