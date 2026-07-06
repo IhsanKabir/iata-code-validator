@@ -37,8 +37,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import (
-    __version__, auth, config, excel_io, graph_mailer, mailer_client, mailer_io,
-    mailer_split,
+    __version__, auth, config, excel_io, graph_mailer, guide_view, mailer_client,
+    mailer_io, mailer_split,
     oep_client, oep_presets, traffic_client, updater, zenith_client,
     zenith_history_analyzer, zenith_history_downloader, zenith_history_parser,
     zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
@@ -995,6 +995,7 @@ class App(WhatsAppMixin, HealthMixin):
         zenith_tab = ttk.Frame(notebook)
         mailer_tab = ttk.Frame(notebook)
         health_tab = ttk.Frame(notebook)
+        guide_tab = ttk.Frame(notebook)
         # Tab text is a base name; `_refresh_tab_labels` appends running
         # state ("●") and cache counts so users see status at a glance.
         # BD Overseas Movement (OEP) now lives as a sub-tab under Traffic
@@ -1006,6 +1007,7 @@ class App(WhatsAppMixin, HealthMixin):
             zenith_tab: "Zenith",
             mailer_tab: "Bulk Mailer",
             health_tab: "Health",
+            guide_tab: "❔ Guide",
         }
         notebook.add(iata_tab, text=self._tab_base_labels[iata_tab])
         notebook.add(bd_tab, text=self._tab_base_labels[bd_tab])
@@ -1013,9 +1015,11 @@ class App(WhatsAppMixin, HealthMixin):
         notebook.add(zenith_tab, text=self._tab_base_labels[zenith_tab])
         notebook.add(mailer_tab, text=self._tab_base_labels[mailer_tab])
         notebook.add(health_tab, text=self._tab_base_labels[health_tab])
+        notebook.add(guide_tab, text=self._tab_base_labels[guide_tab])
         self._tab_widgets = {
             "iata": iata_tab, "bd": bd_tab, "traffic": traffic_tab,
             "zenith": zenith_tab, "mailer": mailer_tab, "health": health_tab,
+            "guide": guide_tab,
         }
 
         # LAZY TAB CONSTRUCTION. Building all five tabs up front cost ~1.4s of
@@ -1033,6 +1037,7 @@ class App(WhatsAppMixin, HealthMixin):
             zenith_tab: self._build_zenith_tab,
             mailer_tab: self._build_mailer_tab,
             health_tab: lambda p: self._build_health_panel(p, "console"),
+            guide_tab: lambda p: guide_view.build_guide(p, self, "console"),
         }
         self._ensure_tab_built(iata_tab)          # default/visible tab
         notebook.bind("<<NotebookTabChanged>>",
@@ -5168,8 +5173,20 @@ class App(WhatsAppMixin, HealthMixin):
             # Stripe colors are per-theme; recolor every registered grid.
             for tree in getattr(self, "_striped_trees", []):
                 self._configure_stripe(tree)
+            # The Guide draws Canvas boxes/badges with theme-fixed colors; the
+            # cleanest refresh is to rebuild it (cheap, static content) if it
+            # has already been built.
+            self._rebuild_guide_if_built()
         except Exception as exc:  # noqa: BLE001
             log.warning("Theme toggle failed: %s", exc)
+
+    def _rebuild_guide_if_built(self) -> None:
+        guide_tab = self._tab_widgets.get("guide")
+        if guide_tab is None or guide_tab in self._tab_builders:
+            return  # not built yet — it'll pick up the current theme on first open
+        for child in guide_tab.winfo_children():
+            child.destroy()
+        guide_view.build_guide(guide_tab, self, "console")
 
     def _on_check_for_updates(self) -> None:
         if self._update_worker is not None and self._update_worker.is_alive():

@@ -32,7 +32,7 @@ def app():
 def test_default_tab_is_built_and_others_deferred(app):
     # IATA (default tab) builds eagerly; the other four defer to first visit.
     assert hasattr(app, "log_text")                  # IATA widgets exist
-    assert len(app._tab_builders) == 5               # bd/traffic/zenith/mailer/health pending
+    assert len(app._tab_builders) == 6               # bd/traffic/zenith/mailer/health/guide pending
 
 
 def test_all_lazy_tabs_build_without_errors(app):
