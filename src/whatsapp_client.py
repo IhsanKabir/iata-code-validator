@@ -97,19 +97,24 @@ def resolve_launch_kwargs(browser: str, *, chrome_probe=None) -> dict:
         }.get(channel, [])
         return any(Path(p).is_file() for p in candidates)
 
-    import sys
-    frozen = bool(getattr(sys, "frozen", False)) or \
-        os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "0"
-    if browser == "bundled" or (browser == "auto" and frozen):
+    # A BUNDLED browser exists only when the app shipped one and pointed
+    # Playwright at it via PLAYWRIGHT_BROWSERS_PATH=0 (the combined Travel Ops
+    # Console does this; the standalone Bulk Mailer does NOT — it has no bundled
+    # browser and must drive the user's own Chrome/Edge). Keying off `frozen`
+    # alone was the bug: the frozen standalone is `frozen` but has no bundled
+    # browser, so `auto` returned {} and Playwright hunted for a Chromium that
+    # isn't there ("Executable doesn't exist … chromium-…\chrome.exe").
+    has_bundled = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "0"
+    if browser == "bundled" or (browser == "auto" and has_bundled):
         return {}
+    # 'system', or 'auto' without a bundled browser: drive installed Chrome/Edge.
     for channel in ("chrome", "msedge"):
         if _have(channel):
             return {"channel": channel}
-    if browser == "system":
-        raise WhatsAppBrowserError(
-            "No Chrome or Edge found. Install Google Chrome, or use the "
-            "combined Travel Ops Console app (it ships its own browser).")
-    return {}
+    raise WhatsAppBrowserError(
+        "No Chrome or Edge browser was found on this PC. Install Google Chrome "
+        "(free) and reopen — WhatsApp Blast drives your own browser. (The combined "
+        "Travel Ops Console ships its own browser, so it needs no Chrome.)")
 
 
 class WhatsAppSession:

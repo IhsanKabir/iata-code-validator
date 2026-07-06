@@ -53,6 +53,32 @@ def test_resolve_auto_uses_channel_when_not_frozen(monkeypatch):
     assert kwargs == {"channel": "chrome"}
 
 
+def test_resolve_auto_with_bundled_returns_empty(monkeypatch):
+    # console case: PLAYWRIGHT_BROWSERS_PATH=0 -> use the bundled Chromium, never
+    # a system channel, even if Chrome is also installed.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
+    assert resolve_launch_kwargs("auto", chrome_probe=lambda c: True) == {}
+
+
+def test_resolve_auto_without_bundled_falls_back_to_system(monkeypatch):
+    # REGRESSION for the reported crash: the frozen standalone ships NO bundled
+    # browser (PLAYWRIGHT_BROWSERS_PATH unset). `auto` must use the user's Chrome,
+    # NOT return {} — that made Playwright hunt for a Chromium that isn't there
+    # ("Executable doesn't exist … chrome.exe"). Note the resolver no longer looks
+    # at sys.frozen at all; only the bundled-browser flag decides.
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    assert resolve_launch_kwargs(
+        "auto", chrome_probe=lambda c: c == "chrome") == {"channel": "chrome"}
+
+
+def test_resolve_auto_no_bundled_no_browser_raises_helpfully(monkeypatch):
+    # Standalone with neither bundled nor system browser: a clear install-Chrome
+    # message, not Playwright's cryptic "Executable doesn't exist".
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    with pytest.raises(WhatsAppBrowserError, match="Chrome"):
+        resolve_launch_kwargs("auto", chrome_probe=lambda c: False)
+
+
 # --- threading contract: EVERY page op runs on the one session thread -------
 # This directly guards the critical bug the review caught (Playwright sync
 # objects created on one thread, driven from another -> every send fails).
