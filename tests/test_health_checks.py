@@ -110,6 +110,70 @@ def test_verify_browser_param_accepted():
     assert browser.status in (OK, WARN, FAIL)              # runs without raising
 
 
+# --- browser LAUNCH verification (the fix for the false-green that let the -----
+# --- standalone ship a broken WhatsApp browser) -------------------------------
+
+class _FakeBrowser:
+    def close(self):
+        pass
+
+
+def _fake_sp(launch_ok: bool):
+    """Stub sync_playwright whose chromium.launch either works or raises."""
+    class _Chromium:
+        def launch(self, **_k):
+            if not launch_ok:
+                raise RuntimeError(
+                    "BrowserType.launch: Executable doesn't exist … chrome.exe")
+            return _FakeBrowser()
+
+    class _PW:
+        chromium = _Chromium()
+
+        def stop(self):
+            pass
+
+    class _Starter:
+        def start(self):
+            return _PW()
+
+    return lambda: _Starter()
+
+
+def test_browser_verify_launches_reports_ok(monkeypatch):
+    import src.whatsapp_client as w
+    from src.health_checks import _check_browser_engine
+    monkeypatch.setattr(w, "resolve_launch_kwargs", lambda b, **k: {"channel": "chrome"})
+    monkeypatch.setattr(w, "_import_sync_playwright", lambda: _fake_sp(True))
+    status, detail, _ = _check_browser_engine(verify=True)
+    assert status == OK and "launches OK" in detail
+
+
+def test_browser_verify_FAILS_when_launch_raises(monkeypatch):
+    # THE regression: a browser that resolves but won't actually launch (the
+    # standalone's missing bundled Chromium) must be RED, never a false green.
+    import src.whatsapp_client as w
+    from src.health_checks import _check_browser_engine
+    monkeypatch.setattr(w, "resolve_launch_kwargs", lambda b, **k: {})   # "bundled"
+    monkeypatch.setattr(w, "_import_sync_playwright", lambda: _fake_sp(False))
+    status, detail, remedy = _check_browser_engine(verify=True)
+    assert status == FAIL
+    assert "won't launch" in detail
+    assert "Chrome" in remedy                              # actionable fix hint
+
+
+def test_browser_verify_warns_when_no_browser_at_all(monkeypatch):
+    import src.whatsapp_client as w
+    from src.health_checks import _check_browser_engine
+
+    def _raise(_b, **_k):
+        raise w.WhatsAppBrowserError("No Chrome or Edge browser was found …")
+
+    monkeypatch.setattr(w, "resolve_launch_kwargs", _raise)
+    status, _detail, remedy = _check_browser_engine(verify=True)
+    assert status == WARN and "Chrome" in remedy
+
+
 def test_overall_summary_counts():
     from src.health_checks import summarize
     results = run_health_checks("console", probe=lambda u, t: (OK, "ok"))

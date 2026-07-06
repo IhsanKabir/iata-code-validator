@@ -152,24 +152,37 @@ def _check_browser_engine(verify: bool = False) -> tuple[str, str, str]:
         kwargs = resolve_launch_kwargs("auto")
     except Exception as exc:  # noqa: BLE001
         return WARN, str(exc)[:100], "Install Google Chrome for the WhatsApp Blast."
-    if kwargs.get("channel"):
-        return OK, f"system {kwargs['channel']} browser found", ""
     if not verify:
+        # Fast battery: don't spawn a browser. Report what the resolver picked.
+        if kwargs.get("channel"):
+            return OK, f"system {kwargs['channel']} found (not launch-verified)", ""
         return OK, "browser engine present (not launch-verified)", ""
-    # Bundled path — actually resolve + stat the Chromium binary.
+    # verify=True (the GUI): actually LAUNCH a headless browser with the resolved
+    # kwargs and close it — the only check that proves WhatsApp/IATA can really
+    # drive a browser, and what would have caught the standalone "Executable
+    # doesn't exist" crash instead of a false green. Statting a path isn't enough.
+    # A plain launch() (no persistent profile) does this in well under a second.
     try:
         pw = sp().start()
-        try:
-            path = pw.chromium.executable_path
-        finally:
-            pw.stop()
-        if path and Path(path).is_file():
-            return OK, "bundled Chromium present", ""
-        return FAIL, "browser binary not found on disk", \
-            "Reinstall the app, or install Google Chrome."
     except Exception as exc:  # noqa: BLE001
-        return FAIL, f"browser won't initialise: {type(exc).__name__}", \
-            "Reinstall the app, or install Google Chrome."
+        return FAIL, f"browser driver won't start: {type(exc).__name__}", \
+            "Reinstall the app."
+    try:
+        browser = pw.chromium.launch(headless=True, **kwargs)
+        browser.close()
+    except Exception as exc:  # noqa: BLE001
+        detail = (str(exc).splitlines() or [""])[0][:120]
+        remedy = ("Install Google Chrome (free) and reopen — the browser couldn't "
+                  "launch." if not kwargs.get("channel")
+                  else "Reinstall Chrome/Edge, or reinstall the app.")
+        return FAIL, f"browser won't launch: {detail}", remedy
+    finally:
+        try:
+            pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    label = f"system {kwargs['channel']}" if kwargs.get("channel") else "bundled Chromium"
+    return OK, f"{label} launches OK", ""
 
 
 def _check_report_engine() -> tuple[str, str, str]:
