@@ -405,21 +405,32 @@ def lookup_pnr(
     loss (401/403 / login redirect) is never retried. The read timeout stays generous because
     the Dossier page is a large, slow ASPX render.
     """
-    if not pnr_code:
-        raise ValueError("pnr_code must be a non-empty string")
-    session.session.headers.setdefault("User-Agent", USER_AGENT)
-    code = pnr_code.strip().upper()
+    details, _raw, _url = _resolve_dossier(
+        session, pnr_code, timeout_s=timeout_s, max_attempts=max_attempts)
+    return details
 
+
+def _dossier_endpoints(code: str) -> list[tuple[str, dict]]:
     qs = (QUICK_SEARCH_URL, {
         "id_langue": "2", "GDSCRSPartnerRCIRLoc": "", "vaction": "VERIF", "Id": code,
     })
     syn = (SYNTHESE_DOSSIER_URL, {"Id_Dossier": code})
     # Dossier ids: direct entry first, code-search as fallback. PNR codes: code-search only
     # (a 6-char code is not a numeric Id_Dossier, so SyntheseDossier can't help it).
-    endpoints = [syn, qs] if _is_dossier_id(code) else [qs]
+    return [syn, qs] if _is_dossier_id(code) else [qs]
 
+
+def _resolve_dossier(
+    session: ZenithSession, pnr_code: str, *, timeout_s: float, max_attempts: int,
+) -> tuple[PNRDetails, str, str]:
+    """Resolve to (PNRDetails, raw_dossier_html, final_url). Shared by lookup_pnr
+    and lookup_pnr_and_passengers so the dossier is fetched exactly once."""
+    if not pnr_code:
+        raise ValueError("pnr_code must be a non-empty string")
+    session.session.headers.setdefault("User-Agent", USER_AGENT)
+    code = pnr_code.strip().upper()
     last_not_found: PNRNotFoundError | None = None
-    for url, params in endpoints:
+    for url, params in _dossier_endpoints(code):
         try:
             return _lookup_dossier_via(
                 session, url, params, code, timeout_s=timeout_s, max_attempts=max_attempts)
@@ -427,6 +438,31 @@ def lookup_pnr(
             last_not_found = exc        # try the next endpoint before declaring not-found
             continue
     raise last_not_found or PNRNotFoundError(f"Zenith couldn't resolve {code!r}.")
+
+
+def lookup_pnr_and_passengers(
+    session: ZenithSession,
+    pnr_code: str,
+    *,
+    timeout_s: float = 120.0,
+    max_attempts: int = 3,
+) -> tuple[PNRDetails, list]:
+    """Resolve a PNR AND replay each passenger's __doPostBack for full detail
+    (passport no., expiry, issuing country, nationality, email, phones, FFP).
+
+    Returns (PNRDetails, list[PassengerDetail]). Fetches the dossier once, then
+    posts back per passenger. Passenger extraction is best-effort: any failure
+    yields an empty passenger list rather than losing the PNR result."""
+    details, raw, url = _resolve_dossier(
+        session, pnr_code, timeout_s=timeout_s, max_attempts=max_attempts)
+    try:
+        from .zenith_passenger import fetch_passenger_details
+        pax = fetch_passenger_details(
+            session, raw, url, pnr=pnr_code.strip().upper(), timeout_s=timeout_s)
+    except Exception:  # noqa: BLE001 — never lose the PNR to a detail hiccup
+        log.exception("passenger detail fetch failed for %s", pnr_code)
+        pax = []
+    return details, pax
 
 
 def _lookup_dossier_via(
@@ -488,7 +524,9 @@ def _lookup_dossier_via(
         # back to the other endpoint).
         if "_lblPNRCode" not in resp.text and "PNR :" not in resp.text:
             raise PNRNotFoundError(f"Zenith couldn't resolve {code!r}.")
-        return parse_dossier_html(resp.text)
+        # Return the raw HTML + final URL too so a caller can replay the
+        # passenger __doPostBack from the SAME fetch (no second dossier hit).
+        return parse_dossier_html(resp.text), resp.text, resp.url
     raise ZenithError(f"Exhausted retries looking up {code}.")
 
 

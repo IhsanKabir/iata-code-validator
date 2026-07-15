@@ -142,6 +142,10 @@ MSG_ZENITH_BULK_PROGRESS = "zenith_bulk_progress"  # (i, total, code, status)
 MSG_ZENITH_BULK_DONE = "zenith_bulk_done"          # payload: dict (path, counts)
 MSG_ZENITH_BULK_ERROR = "zenith_bulk_error"
 MSG_ZENITH_BULK_LOG = "zenith_bulk_log"            # payload: str (a log line)
+# Passenger DETAIL extraction (postback replay per pax) — reuses the bulk log/progress
+MSG_ZENITH_PAX_PROGRESS = "zenith_pax_progress"    # (i, total, code, n_pax)
+MSG_ZENITH_PAX_DONE = "zenith_pax_done"            # payload: dict (path, pnrs, passengers)
+MSG_ZENITH_PAX_ERROR = "zenith_pax_error"          # payload: str
 
 # Zenith host options. The default usba host is CloudFront-fronted and 504-storms on slow
 # Dossier renders; the direct asia origin waits them out. "" = no override (default usba).
@@ -4570,6 +4574,46 @@ class App(WhatsAppMixin, HealthMixin):
             self.zenith_bulk_status_label.configure(text=f"⚠ {payload}")
             self._zenith_bulk_log_line(f"ERROR: {payload}")
             messagebox.showerror("PNR Bulk Lookup — Error", str(payload))
+        # ----- Passenger details (postback) -----
+        elif kind == MSG_ZENITH_PAX_PROGRESS:
+            i, total, code, npax = payload  # type: ignore[misc]
+            self.zenith_bulk_progress.configure(value=i, maximum=max(1, total))
+            if npax < 0:
+                self._zenith_bulk_log_line(f"  {i}/{total} {code}: NOT_FOUND")
+            else:
+                self._zenith_bulk_log_line(f"  {i}/{total} {code}: {npax} passenger(s)")
+            self.zenith_bulk_status_label.configure(text=f"Passenger details {i}/{total}…")
+        elif kind == MSG_ZENITH_PAX_DONE:
+            self.btn_zenith_pax.configure(state="normal")
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            p = payload  # type: ignore[assignment]
+            self.zenith_bulk_status_label.configure(
+                text=f"Passengers: {p['passengers']} from {p['pnrs']} PNR(s) "
+                     f"→ {Path(p['path']).name}")
+            self._zenith_bulk_log_line(
+                f"Done — {p['passengers']} passenger record(s) from {p['pnrs']} PNR(s).")
+            if p["passengers"] == 0:
+                messagebox.showwarning(
+                    "Passenger Details",
+                    "No passenger detail was extracted. If the PNRs resolved but "
+                    "returned 0 passengers, the passenger postback may need a tweak — "
+                    "tell me what the run log showed and I'll adjust it.")
+            elif messagebox.askyesno(
+                    "Passenger Details",
+                    f"Wrote {p['passengers']} passenger record(s) from {p['pnrs']} PNR(s).\n\n"
+                    f"Saved to:\n{p['path']}\n\nOpen the workbook now?"):
+                try:
+                    import os
+                    os.startfile(p["path"])  # noqa: S606
+                except Exception:  # noqa: BLE001
+                    pass
+        elif kind == MSG_ZENITH_PAX_ERROR:
+            self.btn_zenith_pax.configure(state="normal")
+            self.btn_zenith_bulk_run.configure(state="normal")
+            self.btn_zenith_bulk_stop.configure(state="disabled")
+            self.zenith_bulk_status_label.configure(text=f"⚠ {payload}")
+            messagebox.showerror("Passenger Details — Error", str(payload))
         # ----- Bulk Mailer -----
         elif kind == MSG_MAIL_PROGRESS:
             idx, total, to, status, row_index = payload  # type: ignore[misc]
@@ -6136,6 +6180,13 @@ class App(WhatsAppMixin, HealthMixin):
             command=self._zenith_dossier_run,
         )
         self.btn_zenith_dossier.pack(side="left", padx=(8, 0))
+        # Per-passenger passport/contact detail — replays the passenger click
+        # (postback) for each PNR and writes a Passenger Details workbook.
+        self.btn_zenith_pax = ttk.Button(
+            ctl, text="Passenger details → Excel",
+            command=self._zenith_pax_details_run,
+        )
+        self.btn_zenith_pax.pack(side="left", padx=(8, 0))
         self.zenith_bulk_status_label = ttk.Label(
             ctl,
             text="Pick an Excel above, then Look up PNRs.",
@@ -6165,6 +6216,7 @@ class App(WhatsAppMixin, HealthMixin):
 
         # ----- Worker state -----
         self._zenith_bulk_worker: threading.Thread | None = None
+        self._zenith_pax_worker: threading.Thread | None = None
         self._zenith_bulk_stop_flag = threading.Event()
         # Live progress counters for the status line (E enhancement).
         self._zenith_bulk_counters: dict[str, int] = {}
@@ -6437,6 +6489,101 @@ class App(WhatsAppMixin, HealthMixin):
 
         self._zenith_bulk_worker = threading.Thread(target=worker, daemon=True)
         self._zenith_bulk_worker.start()
+
+    def _zenith_pax_details_run(self) -> None:
+        """Fetch per-passenger passport/contact detail for each input PNR by
+        replaying the passenger __doPostBack, then write a confidential workbook.
+
+        Uses the same input Excel + output folder + delay as the PNR bulk lookup,
+        and shares the bulk log/progress/stop widgets. Isolated from the cached
+        bulk flow — one extra request per passenger, so it's slower."""
+        if not getattr(self, "_zenith_session", None):
+            messagebox.showerror(
+                "Passenger Details", "Sign in to Zenith first (top of this tab).")
+            return
+        if getattr(self, "_zenith_pax_worker", None) and self._zenith_pax_worker.is_alive():
+            messagebox.showinfo("Passenger Details", "A run is already in progress.")
+            return
+        input_path = self.zenith_bulk_input_path.get().strip()
+        if not input_path or not Path(input_path).is_file():
+            messagebox.showerror(
+                "Passenger Details", f"Pick a valid Excel file first.\nCurrent: {input_path!r}")
+            return
+        out_folder = Path(self.zenith_bulk_output_dir.get().strip() or str(Path.home()))
+        sheet = self.zenith_bulk_sheet_name.get().strip() or None
+        column = self.zenith_bulk_column_name.get().strip() or None
+        try:
+            codes = excel_io.read_pnr_codes_from_excel(
+                Path(input_path), sheet_name=sheet, column_name=column)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Passenger Details",
+                f"Couldn't read the input Excel:\n{type(exc).__name__}: {exc}")
+            return
+        if not codes:
+            messagebox.showerror(
+                "Passenger Details", f"No PNRs found in column {column!r}.")
+            return
+        if not messagebox.askyesno(
+                "Passenger Details",
+                f"Fetch passenger passport / contact detail for {len(codes)} PNR(s)?\n\n"
+                "This opens each passenger record (one extra request per passenger), so "
+                "it's slower than a normal lookup.\n\nThe output workbook is CONFIDENTIAL "
+                "(passport, DOB, contact details)."):
+            return
+
+        self.zenith_bulk_log.configure(state="normal")
+        self.zenith_bulk_log.delete("1.0", "end")
+        self.zenith_bulk_log.configure(state="disabled")
+        self._zenith_bulk_log_line(f"Passenger details: {len(codes)} PNR(s)…")
+        self._zenith_bulk_stop_flag.clear()
+        self.btn_zenith_pax.configure(state="disabled")
+        self.btn_zenith_bulk_run.configure(state="disabled")
+        self.btn_zenith_bulk_stop.configure(state="normal")
+        self.zenith_bulk_progress.configure(value=0, maximum=len(codes))
+        self.zenith_bulk_status_label.configure(text=f"Passenger details 0/{len(codes)}…")
+
+        sess = self._zenith_session
+        stop = self._zenith_bulk_stop_flag
+        delay_s = max(0.0, float(self.zenith_bulk_delay_s.get()))
+
+        def worker() -> None:
+            import time as _t
+            from . import zenith_pnr_client as zpc
+            try:
+                all_pax: list = []
+                ok_pnrs = 0
+                for i, code in enumerate(codes, start=1):
+                    if stop.is_set():
+                        self._post(MSG_ZENITH_BULK_LOG, "  Stopped.")
+                        break
+                    try:
+                        _details, pax = zpc.lookup_pnr_and_passengers(sess, code)
+                        if pax:
+                            all_pax.extend(pax)
+                            ok_pnrs += 1
+                        self._post(MSG_ZENITH_PAX_PROGRESS, (i, len(codes), code, len(pax)))
+                    except zpc.PNRNotFoundError:
+                        self._post(MSG_ZENITH_PAX_PROGRESS, (i, len(codes), code, -1))
+                    except zpc.SessionExpiredError as exc:
+                        self._post(MSG_ZENITH_PAX_ERROR,
+                                   f"Zenith session expired — sign in again. ({exc})")
+                        return
+                    except Exception as exc:  # noqa: BLE001 — one PNR must not sink the run
+                        self._post(MSG_ZENITH_BULK_LOG,
+                                   f"  {code}: {type(exc).__name__}: {exc}")
+                    if delay_s and i < len(codes):
+                        _t.sleep(delay_s)
+                path = excel_io.build_passenger_details_output_path(out_folder)
+                n = excel_io.write_passenger_details(path, all_pax)
+                self._post(MSG_ZENITH_PAX_DONE,
+                           {"path": str(path), "pnrs": ok_pnrs, "passengers": n})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("passenger details run failed")
+                self._post(MSG_ZENITH_PAX_ERROR, f"{type(exc).__name__}: {exc}")
+
+        self._zenith_pax_worker = threading.Thread(target=worker, daemon=True)
+        self._zenith_pax_worker.start()
 
     def _zenith_bulk_run(self) -> None:
         if not getattr(self, "_zenith_session", None):

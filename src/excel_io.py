@@ -1378,6 +1378,48 @@ def build_zenith_pax_output_path(folder: Path) -> Path:
     return folder / f"zenith_passengers_{timestamp}.xlsx"
 
 
+PASSENGER_DETAIL_COLUMNS = [
+    "PNR", "#", "Passenger", "Title", "Gender", "First Name", "Last Name",
+    "Date of Birth", "Nationality", "Email", "Home Phone", "Mobile Phone",
+    "Document Type", "Document Number", "Document Expiry", "Issuing Country",
+    "FFP Number",
+]
+
+
+def write_passenger_details(path: Path, passengers: Iterable) -> int:
+    """Write per-passenger DETAIL rows (from the dossier postback) to one sheet.
+
+    `passengers` is an iterable of zenith_passenger.PassengerDetail. Contains PII
+    (passport, DOB, contact) by design — the file is confidential. Returns count.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Passenger Details"
+    ws.append(PASSENGER_DETAIL_COLUMNS)
+    n = 0
+    for p in passengers:
+        ws.append([
+            p.pnr, p.passenger_index, p.header_name, p.title, p.gender,
+            p.first_name, p.last_name, p.date_of_birth, p.nationality,
+            p.email, p.home_phone, p.mobile_phone, p.document_type,
+            p.document_number, p.document_expiry, p.document_country,
+            p.ffp_number,
+        ])
+        n += 1
+    widths = {1: 10, 3: 24, 8: 12, 9: 12, 10: 26, 11: 15, 12: 15,
+              13: 12, 14: 16, 15: 13, 16: 16, 17: 14}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    wb.save(path)
+    return n
+
+
+def build_passenger_details_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"passenger_details_{timestamp}.xlsx"
+
+
 # ---------------------------------------------------------------------------
 # Zenith Flight History audit
 # ---------------------------------------------------------------------------
