@@ -111,6 +111,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.posted: list = []
         self.session = self
+        self.state_values: dict = {}      # ZenithSession carries these
 
     def _next(self, url):
         item = self._responses.pop(0) if self._responses else ""
@@ -124,7 +125,7 @@ class _FakeSession:
         r.url = url
         return r
 
-    def post(self, url, data=None, timeout=None, allow_redirects=True):
+    def post(self, url, data=None, timeout=None, allow_redirects=True, headers=None):
         self.posted.append(dict(data or {}))
         return self._next(url)
 
@@ -219,7 +220,7 @@ def test_diagnostic_reports_modern_parse_and_saves(tmp_path):
         pnr="0A1CDT", out_dir=str(tmp_path))
     joined = " ".join(lines)
     assert "PARSED OK" in joined and "EP8057773" in joined
-    assert (tmp_path / "_paxdiag_0A1CDT_traveler_update.html").exists()
+    assert (tmp_path / "_paxdiag_0A1CDT_A_direct_get.html").exists()
 
 
 # --- MODERN path: passenger detail moved to BackOffice Traveler/Update ----------
@@ -292,3 +293,120 @@ def test_fetch_passenger_details_modern_one_get_all_pax():
 def test_fetch_passenger_details_modern_empty_without_idpnr():
     sess = _FakeSession([_TRAVELER_UPDATE])
     assert fetch_passenger_details(sess, "<html>legacy, no idPNR</html>", "u") == []
+
+
+def test_fetch_modern_self_heals_via_pollsession():
+    # First Traveler/Update -> BackOffice error page; PollSession bootstraps the
+    # modern session; retry -> the real form. (The reported cross-sell bug.)
+    sess = _FakeSession([
+        "<html>ERROR PAGE — session not accepted</html>",   # 1st Traveler/Update
+        "PollSession Successful. SessionID=abc",             # PollSession bootstrap
+        _TRAVELER_UPDATE,                                    # retried Traveler/Update
+    ])
+    sess.state_values = {"ID_ADMIN": "37739", "ID_SOCIETE": "2035"}
+    out = fetch_passenger_details(
+        sess, _DOSSIER_MODERN,
+        "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx", pnr="0A1CDT")
+    assert len(out) == 2 and out[0].document_number == "EP8057773"
+    assert len(sess.posted) == 3                    # traveler(err) + poll + traveler(retry)
+    assert "BookingEngine/PollSession" in sess.posted[1]["GET"]
+    assert "idUser=37739" in sess.posted[1]["GET"]
+
+
+def test_establish_backoffice_needs_state_values():
+    from src.zenith_passenger import establish_backoffice_session
+    sess = _FakeSession(["PollSession Successful."])
+    sess.state_values = {}                          # no ID_ADMIN -> can't build
+    assert establish_backoffice_session(sess, _DOSSIER_MODERN, "https://z/x") is False
+
+
+# --- browser-faithful postback -> 302 fallback (validated vs real HAR) ---------
+
+_DOSSIER_MODERN_FULL = (
+    '<html>… /Zenith/BackOffice/USBangla/en-GB/Traveler/Update?idPNR=16858865 …'
+    '<form name="Form1" method="post" action="Dossier.aspx?view=UsrDossierSynthese&amp;taskId=t1">'
+    '<input type="hidden" name="__VIEWSTATE" value="VS==" />'
+    '<input type="hidden" name="__EVENTVALIDATION" value="EV==" />'
+    '<input type="hidden" name="PageInstance" value="pi-1" />'
+    '<input type="text" name="instanceCtrlContent$tbNom" value="YU" />'
+    '<input type="text" name="txtDisabled" value="Z" disabled />'
+    '<select name="instanceCtrlContent$drpDevise"><option value="0">Select</option>'
+    '<option selected="selected" value="BDT">BDT</option></select>'
+    '<select name="instanceCtrlContent$drpFirst"><option value="A">A</option>'
+    '<option value="B">B</option></select>'
+    '<select name="instanceCtrlContent$drpEmpty"></select>'
+    '<select name="drpDisabled" disabled><option selected value="X">X</option></select>'
+    '<textarea name="instanceCtrlContent$tbComment">hi there</textarea>'
+    '<input type="submit" name="btnGo" value="Go" />'
+    '<input type="checkbox" name="chkOff" value="1" />'
+    '<input type="checkbox" name="chkOn" value="1" checked />'
+    '<a href="javascript:__doPostBack(\'instanceCtrlContent$rptPassagers$ctl01$linkPassager\',\'\')">YU ZHENJIE</a>'
+    '</form></html>'
+)
+
+
+def test_harvest_form_fields_matches_browser_serialization():
+    from src.zenith_passenger import harvest_form_fields
+    f = harvest_form_fields(_DOSSIER_MODERN_FULL)
+    assert f["__VIEWSTATE"] == "VS==" and f["__EVENTVALIDATION"] == "EV=="
+    assert f["PageInstance"] == "pi-1"
+    assert f["instanceCtrlContent$tbNom"] == "YU"
+    assert f["instanceCtrlContent$drpDevise"] == "BDT"        # selected option value
+    assert f["instanceCtrlContent$drpFirst"] == "A"           # first-option default
+    assert f["instanceCtrlContent$tbComment"] == "hi there"   # textarea inner text
+    assert f["chkOn"] == "1"                                  # checked box included
+    assert "chkOff" not in f                                  # unchecked box omitted
+    assert "btnGo" not in f                                   # submit button omitted
+    assert "txtDisabled" not in f and "drpDisabled" not in f  # disabled omitted
+    assert "instanceCtrlContent$drpEmpty" not in f            # AJAX-empty select omitted
+
+
+def test_build_passenger_postback_body_sets_target():
+    from src.zenith_passenger import build_passenger_postback_body
+    body = build_passenger_postback_body(
+        _DOSSIER_MODERN_FULL, "instanceCtrlContent$rptPassagers$ctl01$linkPassager")
+    assert body["__EVENTTARGET"] == "instanceCtrlContent$rptPassagers$ctl01$linkPassager"
+    assert body["__EVENTARGUMENT"] == ""
+    assert body["__VIEWSTATE"] == "VS=="                      # full form carried along
+
+
+def test_fetch_falls_back_to_postback_when_pollsession_insufficient():
+    # Direct GET -> error; PollSession succeeds but retry GET STILL errors (session
+    # alone insufficient); browser-faithful postback -> 302 -> modern form works.
+    sess = _FakeSession([
+        "<html>ERROR PAGE</html>",             # A: direct GET
+        "PollSession Successful.",             # A+: PollSession bootstrap
+        "<html>ERROR PAGE still</html>",       # A+: retry GET (still refused)
+        _TRAVELER_UPDATE,                      # B: postback POST -> followed 302 form
+    ])
+    sess.state_values = {"ID_ADMIN": "37739", "ID_SOCIETE": "2035"}
+    out = fetch_passenger_details(
+        sess, _DOSSIER_MODERN_FULL,
+        "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx", pnr="0A1CDT")
+    assert len(out) == 2 and out[0].document_number == "EP8057773"
+    assert sess._pax_strategy == "postback"                   # winner cached
+    assert len(sess.posted) == 4
+    # the 4th call is the postback POST carrying the passenger target + full form
+    post = sess.posted[3]
+    assert post["__EVENTTARGET"].endswith("linkPassager")
+    assert post["__VIEWSTATE"] == "VS=="
+
+
+def test_cached_postback_strategy_skips_direct_get_on_next_pnr():
+    sess = _FakeSession([_TRAVELER_UPDATE])   # only a postback response queued
+    sess.state_values = {"ID_ADMIN": "37739", "ID_SOCIETE": "2035"}
+    sess._pax_strategy = "postback"           # learned from a previous PNR
+    sess._bo_ready = True                     # modern session already bootstrapped
+    out = fetch_passenger_details(
+        sess, _DOSSIER_MODERN_FULL,
+        "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx", pnr="0A1CDU")
+    assert len(out) == 2
+    assert len(sess.posted) == 1 and "__EVENTTARGET" in sess.posted[0]  # straight to postback
+
+
+def test_successful_direct_get_caches_direct_strategy():
+    sess = _FakeSession([_TRAVELER_UPDATE])
+    fetch_passenger_details(
+        sess, _DOSSIER_MODERN, "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx",
+        pnr="0A1CDT")
+    assert sess._pax_strategy == "direct"

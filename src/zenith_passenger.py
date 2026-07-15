@@ -255,6 +255,153 @@ def parse_traveler_update_html(html: str, *, pnr: str = "") -> list[PassengerDet
     return out
 
 
+_BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+}
+_BO_COMPANY_RE = re.compile(r"/Zenith/BackOffice/([^/\"'<> ]+)/", re.IGNORECASE)
+
+
+# --- browser-faithful postback -> 302 -> modern GET ---------------------------
+# The dossier reaches Traveler/Update by POSTing the WHOLE ASP.NET form (a
+# `__doPostBack` on a passenger link); the legacy server answers 302 -> the modern
+# URL, which the browser then GETs. Verified against a real HAR: rebuilding the
+# full form body below reproduces the captured postback field-for-field. This is
+# the fallback when a cold GET of the constructed URL isn't accepted.
+_TAG_INPUT_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_TAG_SELECT_RE = re.compile(r"<select\b([^>]*)>(.*?)</select>", re.IGNORECASE | re.DOTALL)
+_TAG_TEXTAREA_RE = re.compile(r"<textarea\b([^>]*)>(.*?)</textarea>", re.IGNORECASE | re.DOTALL)
+_TAG_OPTION_RE = re.compile(r"<option\b([^>]*)>([^<]*)</option>", re.IGNORECASE)
+
+
+def _tag_attr(tag: str, name: str) -> str:
+    m = re.search(r'\b' + name + r'="([^"]*)"', tag, re.IGNORECASE)
+    return unescape(m.group(1)) if m else ""
+
+
+def _option_value(opt_attrs: str, opt_text: str) -> str:
+    """A posted <option> value = its value attr if present, else its text."""
+    if re.search(r"\bvalue=", opt_attrs, re.IGNORECASE):
+        return _tag_attr(opt_attrs, "value")
+    return unescape(opt_text).strip()
+
+
+def harvest_form_fields(html: str) -> dict[str, str]:
+    """Serialize an ASP.NET form exactly as a browser would: every enabled named
+    input (checkbox/radio only if checked), each enabled <select> as its selected
+    (or first) option value, each enabled <textarea> as its inner text. Disabled
+    controls are omitted (browsers don't submit them). Validated field-for-field
+    against a real dossier postback."""
+    form: dict[str, str] = {}
+    for tag in _TAG_INPUT_RE.findall(html):
+        name = _tag_attr(tag, "name")
+        if not name or "disabled" in tag.lower():
+            continue
+        itype = (_tag_attr(tag, "type") or "text").lower()
+        if itype in ("submit", "button", "image", "reset", "file"):
+            continue
+        if itype in ("checkbox", "radio") and "checked" not in tag.lower():
+            continue
+        form[name] = _tag_attr(tag, "value")
+    for hdr, block in _TAG_SELECT_RE.findall(html):
+        name = _tag_attr(hdr, "name")
+        if not name or "disabled" in hdr.lower():
+            continue
+        opts = _TAG_OPTION_RE.findall(block)
+        if not opts:
+            continue  # AJAX-empty select: the browser submits nothing
+        selected = [(a, t) for a, t in opts if re.search(r"\bselected\b", a, re.IGNORECASE)]
+        form[name] = _option_value(*(selected[0] if selected else opts[0]))
+    for hdr, inner in _TAG_TEXTAREA_RE.findall(html):
+        name = _tag_attr(hdr, "name")
+        if name and "disabled" not in hdr.lower():
+            form[name] = unescape(re.sub(r"<[^>]+>", "", inner)).strip()
+    return form
+
+
+def build_passenger_postback_body(dossier_html: str, target: str) -> dict[str, str]:
+    """The full form body to POST for a passenger `__doPostBack`, i.e. the whole
+    serialized dossier form with __EVENTTARGET pointed at the passenger link."""
+    body = harvest_form_fields(dossier_html)
+    body["__EVENTTARGET"] = target
+    body["__EVENTARGUMENT"] = ""
+    return body
+
+
+def _fetch_via_postback(session, dossier_html: str, dossier_url: str,
+                        pnr: str, timeout_s: float) -> list[PassengerDetail]:
+    """POST the passenger postback to the dossier; the 302 -> modern Traveler/Update
+    is followed automatically (allow_redirects), so the response IS the modern form
+    with ALL travelers. Any passenger link works — the redirect is PNR-level."""
+    ctx = extract_postback_context(dossier_html)
+    if not ctx.action or not ctx.passenger_targets:
+        return []
+    post_url = urljoin(dossier_url, ctx.action)
+    body = build_passenger_postback_body(dossier_html, ctx.passenger_targets[0])
+    resp = session.session.post(
+        post_url, data=body, timeout=timeout_s, allow_redirects=True,
+        headers={**_BROWSER_HEADERS, "Referer": dossier_url,
+                 "Content-Type": "application/x-www-form-urlencoded",
+                 "Origin": f"{dossier_url.split('/TTIDotNet')[0]}"})
+    text = getattr(resp, "text", "") or ""
+    return parse_traveler_update_html(text, pnr=pnr)
+
+
+def _ensure_backoffice_session(session, dossier_html: str, dossier_url: str) -> bool:
+    """Call PollSession at most once per session (cached), mirroring the browser's
+    login-time bootstrap of the modern app."""
+    if getattr(session, "_bo_ready", False):
+        return True
+    ok = establish_backoffice_session(session, dossier_html, dossier_url)
+    if ok:
+        try:
+            session._bo_ready = True
+        except Exception:  # noqa: BLE001 — frozen session: just re-derive next time
+            pass
+    return ok
+
+
+def _remember_strategy(session, strategy: str) -> None:
+    try:
+        session._pax_strategy = strategy
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def establish_backoffice_session(session, dossier_html: str, dossier_url: str) -> bool:
+    """Bootstrap the modern BackOffice session by calling PollSession, exactly as
+    the browser does at sign-in. The app's login authenticates the LEGACY app but
+    never calls this, so the modern Traveler pages reject the session. idUser /
+    idCompany come from the session's state_values (ID_ADMIN / ID_SOCIETE)."""
+    from urllib.parse import urlsplit
+    m = _BO_COMPANY_RE.search(dossier_html)
+    sv = getattr(session, "state_values", None) or {}
+    id_user = sv.get("ID_ADMIN", "")
+    id_company = sv.get("ID_SOCIETE", "")
+    if not m or not id_user:
+        return False
+    base = f"{urlsplit(dossier_url).scheme}://{urlsplit(dossier_url).netloc}"
+    url = (f"{base}/Zenith/BackOffice/{m.group(1)}/BookingEngine/PollSession"
+           f"?idUser={id_user}&idCompany={id_company}")
+    try:
+        r = session.session.get(url, timeout=30, allow_redirects=True,
+                                headers={**_BROWSER_HEADERS, "Referer": dossier_url})
+        ok = "PollSession Successful" in (r.text or "")
+        log.info("PollSession %s -> %s", url, "OK" if ok else f"({r.status_code})")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        log.info("PollSession failed: %s", exc)
+        return False
+
+
+def _get_traveler_update(session, url: str, referer: str, timeout_s: float) -> str:
+    resp = session.session.get(
+        url, timeout=timeout_s, allow_redirects=True,
+        headers={**_BROWSER_HEADERS, "Referer": referer})
+    return resp.text or ""
+
+
 def fetch_passenger_details(
     session,
     dossier_html: str,
@@ -264,27 +411,53 @@ def fetch_passenger_details(
     timeout_s: float = 120.0,
     max_passengers: int = 50,
 ) -> list[PassengerDetail]:
-    """Fetch ALL passengers' detail for one PNR via the modern Traveler/Update GET
-    (one request per PNR). Fail-safe: any error returns [] rather than raising."""
+    """Fetch ALL passengers' detail for one PNR from the modern BackOffice app.
+
+    Two strategies, tried in order and then cached on the session so the rest of a
+    bulk run uses only the one that works:
+      A. DIRECT — GET the constructed Traveler/Update URL (1 request). If the modern
+         session isn't bootstrapped yet, call PollSession once and retry.
+      B. POSTBACK — replay the browser's full `__doPostBack`; the legacy server 302s
+         to the same modern URL, which is followed automatically. Byte-faithful to
+         the real UI, so it works even if a cold GET is refused.
+    Fail-safe: any error returns []."""
     url = traveler_update_url(dossier_html, dossier_url)
     if not url:
         return []
+    strategy = getattr(session, "_pax_strategy", None)
     try:
-        resp = session.session.get(
-            url, timeout=timeout_s, allow_redirects=True,
-            headers={
-                # Match the browser so the BackOffice app (and any bot filter)
-                # treats it like the real UI navigating from the dossier.
-                "Referer": dossier_url,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/126.0.0.0 Safari/537.36"),
-            })
+        # Once a bulk run has learned the winning path, take it straight away.
+        if strategy == "postback":
+            _ensure_backoffice_session(session, dossier_html, dossier_url)
+            return _fetch_via_postback(session, dossier_html, dossier_url, pnr, timeout_s)[:max_passengers]
+
+        # Strategy A — direct GET.
+        text = _get_traveler_update(session, url, dossier_url, timeout_s)
+        pax = parse_traveler_update_html(text, pnr=pnr)
+        if pax:
+            _remember_strategy(session, "direct")
+            return pax[:max_passengers]
+
+        if "Travelers[" not in text:
+            # Bootstrap the modern session (once) and retry the direct GET.
+            if _ensure_backoffice_session(session, dossier_html, dossier_url):
+                text = _get_traveler_update(session, url, dossier_url, timeout_s)
+                pax = parse_traveler_update_html(text, pnr=pnr)
+                if pax:
+                    log.info("%s: passenger detail via direct GET (after PollSession)", pnr or "PNR")
+                    _remember_strategy(session, "direct")
+                    return pax[:max_passengers]
+            # Strategy B — browser-faithful postback -> 302 -> modern GET.
+            if "Travelers[" not in text:
+                pax = _fetch_via_postback(session, dossier_html, dossier_url, pnr, timeout_s)
+                if pax:
+                    log.info("%s: passenger detail via postback->302 fallback", pnr or "PNR")
+                    _remember_strategy(session, "postback")
+                    return pax[:max_passengers]
     except Exception as exc:  # noqa: BLE001 — never sink the PNR on a detail error
-        log.info("Traveler/Update GET failed for %s: %s", pnr, exc)
+        log.info("passenger detail failed for %s: %s", pnr, exc)
         return []
-    return parse_traveler_update_html(resp.text or "", pnr=pnr)[:max_passengers]
+    return pax[:max_passengers] if pax else []
 
 
 def fetch_passenger_details_postback(
@@ -378,28 +551,73 @@ def diagnose_passenger_fetch(
                      f"See saved dossier HTML.")
         return lines
     lines.append(f"{tag} Traveler/Update url = …{url[-90:]}")
-    try:
-        r = session.session.get(
-            url, timeout=timeout_s, allow_redirects=True,
-            headers={"Referer": dossier_url,
-                     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/126.0.0.0 Safari/537.36")})
-    except Exception as exc:  # noqa: BLE001
-        lines.append(f"{tag} Traveler/Update GET error: {type(exc).__name__}: {exc}")
-        return lines
-    text = r.text or ""
-    marks = [k for k in ("Travelers[", "DocumentNumber", "Email", "Nationalit",
-                         "captcha-delivery", "ERROR PAGE", "/otds/")
-             if k in text or k in (r.url or "")]
-    lines.append(f"{tag} Traveler/Update -> status={r.status_code} len={len(text)} "
-                 f"final=…{(r.url or '')[-45:]} markers={marks or '(none)'}")
-    _dump("traveler_update", text)
-    pax = parse_traveler_update_html(text, pnr=pnr)
-    if pax:
-        lines.append(f"{tag} PARSED OK -> {len(pax)} passenger(s); first="
+
+    def _markers(text: str, final_url: str = "") -> list[str]:
+        return [k for k in ("Travelers[", "DocumentNumber", "Email", "Nationalit",
+                            "captcha-delivery", "ERROR PAGE", "/otds/")
+                if k in text or k in final_url]
+
+    def _report_ok(where: str, pax: list) -> list[str]:
+        lines.append(f"{tag} PARSED OK via {where} -> {len(pax)} passenger(s); first="
                      f"{pax[0].first_name} {pax[0].last_name} doc={pax[0].document_number or '(none)'}")
+        return lines
+
+    # Strategy A — direct GET.
+    try:
+        r = session.session.get(url, timeout=timeout_s, allow_redirects=True,
+                                headers={**_BROWSER_HEADERS, "Referer": dossier_url})
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"{tag} direct GET error: {type(exc).__name__}: {exc}")
+        r = None
+    if r is not None:
+        text = r.text or ""
+        lines.append(f"{tag} [A] direct GET -> status={r.status_code} len={len(text)} "
+                     f"final=…{(r.url or '')[-45:]} markers={_markers(text, r.url or '') or '(none)'}")
+        _dump("A_direct_get", text)
+        pax = parse_traveler_update_html(text, pnr=pnr)
+        if pax:
+            return _report_ok("direct GET", pax)
+
+    # Strategy A+ — bootstrap the modern session (PollSession), retry the GET.
+    poll_ok = establish_backoffice_session(session, dossier_html, dossier_url)
+    lines.append(f"{tag} [A+] PollSession bootstrap -> {'OK' if poll_ok else 'FAILED'} "
+                 f"(idUser={((getattr(session, 'state_values', None) or {}).get('ID_ADMIN')) or '?'})")
+    if poll_ok:
+        try:
+            r = session.session.get(url, timeout=timeout_s, allow_redirects=True,
+                                    headers={**_BROWSER_HEADERS, "Referer": dossier_url})
+            text = r.text or ""
+            lines.append(f"{tag} [A+] retry GET -> status={r.status_code} len={len(text)} "
+                         f"markers={_markers(text, r.url or '') or '(none)'}")
+            _dump("Aplus_retry_get", text)
+            pax = parse_traveler_update_html(text, pnr=pnr)
+            if pax:
+                return _report_ok("direct GET after PollSession", pax)
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"{tag} [A+] retry GET error: {type(exc).__name__}: {exc}")
+
+    # Strategy B — browser-faithful postback -> 302 -> modern GET.
+    ctx = extract_postback_context(dossier_html)
+    if ctx.action and ctx.passenger_targets:
+        try:
+            body = build_passenger_postback_body(dossier_html, ctx.passenger_targets[0])
+            post_url = urljoin(dossier_url, ctx.action)
+            r = session.session.post(post_url, data=body, timeout=timeout_s, allow_redirects=True,
+                                     headers={**_BROWSER_HEADERS, "Referer": dossier_url,
+                                              "Content-Type": "application/x-www-form-urlencoded"})
+            text = r.text or ""
+            lines.append(f"{tag} [B] postback ({len(body)} fields) -> status={r.status_code} "
+                         f"len={len(text)} final=…{(r.url or '')[-45:]} "
+                         f"markers={_markers(text, r.url or '') or '(none)'}")
+            _dump("B_postback", text)
+            pax = parse_traveler_update_html(text, pnr=pnr)
+            if pax:
+                return _report_ok("postback->302 fallback", pax)
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"{tag} [B] postback error: {type(exc).__name__}: {exc}")
     else:
-        lines.append(f"{tag} 0 parsed. If markers show 'captcha-delivery' the app is bot-blocked; "
-                     f"'ERROR PAGE'/'otds' = session not accepted. See _paxdiag_{pnr}_traveler_update.html.")
+        lines.append(f"{tag} [B] skipped — no form action / passenger targets in dossier")
+
+    lines.append(f"{tag} 0 parsed by ALL strategies. 'captcha-delivery'=bot-blocked; "
+                 f"'ERROR PAGE'/'otds'=session not accepted. See _paxdiag_{pnr}_*.html.")
     return lines
