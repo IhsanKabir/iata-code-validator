@@ -465,6 +465,22 @@ def lookup_pnr_and_passengers(
     return details, pax
 
 
+def diagnose_pnr_passengers(
+    session: ZenithSession, pnr_code: str, *, out_dir=None, timeout_s: float = 120.0,
+) -> list[str]:
+    """Resolve one PNR's dossier and run the passenger-fetch DIAGNOSTIC, saving the
+    dossier + first postback response to `out_dir`. Returns log lines. Lets a single
+    live run pinpoint why passenger extraction returns nothing — no HAR needed."""
+    from .zenith_passenger import diagnose_passenger_fetch
+    try:
+        _details, raw, url = _resolve_dossier(
+            session, pnr_code, timeout_s=timeout_s, max_attempts=3)
+    except PNRNotFoundError:
+        return [f"[diag {pnr_code}] PNR did not resolve (NOT_FOUND) — cannot diagnose passengers."]
+    return diagnose_passenger_fetch(
+        session, raw, url, pnr=pnr_code.strip().upper(), out_dir=out_dir, timeout_s=timeout_s)
+
+
 def _lookup_dossier_via(
     session: ZenithSession,
     url: str,

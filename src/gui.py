@@ -6565,6 +6565,17 @@ class App(WhatsAppMixin, HealthMixin):
             session_dead = False
             lock = threading.Lock()
 
+            # SELF-DIAGNOSTIC on the first PNR: dumps the dossier + first postback
+            # response to the output folder and logs exactly where extraction breaks,
+            # so a single run pinpoints the obstacle (no HAR needed).
+            try:
+                self._post(MSG_ZENITH_BULK_LOG, "  --- diagnosing passenger fetch on 1st PNR ---")
+                for _dl in zpc.diagnose_pnr_passengers(sess, codes[0], out_dir=out_folder):
+                    self._post(MSG_ZENITH_BULK_LOG, "  " + _dl)
+                self._post(MSG_ZENITH_BULK_LOG, "  --- end diagnostic ---")
+            except Exception as _de:  # noqa: BLE001 — diagnostic must never break the run
+                self._post(MSG_ZENITH_BULK_LOG, f"  diagnostic error: {_de}")
+
             def one(code):
                 if stop.is_set():
                     return code, "stopped", None

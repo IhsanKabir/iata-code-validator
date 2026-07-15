@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from src.zenith_passenger import (
     PassengerDetail,
+    diagnose_passenger_fetch,
     extract_postback_context,
     fetch_passenger_details,
     parse_passenger_form,
@@ -118,6 +119,7 @@ class _FakeSession:
         r = _R()
         r.text = text
         r.status_code = status
+        r.url = url
         return r
 
 
@@ -188,3 +190,21 @@ def test_postback_retries_5xx_then_succeeds():
     out = fetch_passenger_details(sess, one_pax, "https://z/Dossier.aspx")
     assert len(out) == 1 and out[0].document_number == "EP8057773"
     assert len(sess.posted) == 2                  # first 504, retried to 200
+
+
+def test_diagnostic_reports_no_targets(tmp_path):
+    lines = diagnose_passenger_fetch(
+        _FakeSession([]), '<form action="Dossier.aspx"></form>', "u",
+        pnr="X", out_dir=str(tmp_path))
+    joined = " ".join(lines)
+    assert "NO passenger links found" in joined
+    assert (tmp_path / "_paxdiag_X_dossier.html").exists()   # saved for inspection
+
+
+def test_diagnostic_reports_parse_result_and_saves(tmp_path):
+    sess = _FakeSession([_PAX_FORM])
+    lines = diagnose_passenger_fetch(
+        sess, _DOSSIER, "https://z/Dossier.aspx", pnr="0A1DEA", out_dir=str(tmp_path))
+    joined = " ".join(lines)
+    assert "PARSED OK" in joined and "EP8057773" in joined
+    assert (tmp_path / "_paxdiag_0A1DEA_postback.html").exists()

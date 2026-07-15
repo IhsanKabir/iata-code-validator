@@ -23,6 +23,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from html import unescape
+from pathlib import Path
 from urllib.parse import urljoin
 
 log = logging.getLogger(__name__)
@@ -232,3 +233,70 @@ def fetch_passenger_details(
         seen.add(key)
         out.append(detail)
     return out
+
+
+def diagnose_passenger_fetch(
+    session, dossier_html: str, dossier_url: str, *, pnr: str = "",
+    out_dir=None, timeout_s: float = 120.0,
+) -> list[str]:
+    """Explain WHY passenger extraction succeeds or returns nothing, and save the
+    dossier + first postback response to `out_dir` for inspection. Returns human-
+    readable log lines. Used to pinpoint the obstacle without a HAR."""
+    lines: list[str] = []
+    tag = f"[diag {pnr}]"
+    ctx = extract_postback_context(dossier_html)
+    named = _PAX_TARGET_NAME_RE.findall(dossier_html)
+    raw_targets = _PAX_TARGET_RE.findall(dossier_html)
+    lines.append(f"{tag} dossier={len(dossier_html)} chars, form action={'yes' if ctx.action else 'MISSING'}, "
+                 f"hidden fields={len(ctx.hidden)}")
+    lines.append(f"{tag} passenger links: named={len(named)} raw={len(raw_targets)} "
+                 f"after-dedup={len(ctx.passenger_targets)}")
+
+    def _dump(name: str, text: str) -> None:
+        if not out_dir:
+            return
+        try:
+            p = Path(out_dir) / f"_paxdiag_{(pnr or 'PNR')}_{name}.html"
+            p.write_text(text or "", encoding="utf-8", errors="replace")
+            lines.append(f"{tag} saved {p.name}")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"{tag} could not save {name}: {exc}")
+
+    _dump("dossier", dossier_html)
+    if not ctx.passenger_targets:
+        lines.append(f"{tag} -> NO passenger links found. On this booking type the passenger "
+                     f"name is not a __doPostBack('...linkPassager') link. See saved dossier HTML.")
+        return lines
+
+    post_url = urljoin(dossier_url, ctx.action)
+    lines.append(f"{tag} POST url = {post_url[:90]}")
+    form = dict(ctx.hidden)
+    form["__EVENTTARGET"] = ctx.passenger_targets[0]
+    form["__EVENTARGUMENT"] = ""
+    try:
+        resp = session.session.post(post_url, data=form, timeout=timeout_s, allow_redirects=True)
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"{tag} postback POST error: {type(exc).__name__}: {exc}")
+        return lines
+    text = resp.text or ""
+    lines.append(f"{tag} postback -> status={resp.status_code} len={len(text)} "
+                 f"final_url=…{resp.url[-55:]}")
+    marks = {
+        "txtFirstName": "txtFirstName" in text, "txtLastName": "txtLastName" in text,
+        "txtNom": "txtNom" in text, "txtPrenom": "txtPrenom" in text,
+        "txtEmail": "txtEmail" in text, "linkPassager": "linkPassager" in text,
+        "_lblPNRCode(dossier)": "_lblPNRCode" in text, "login/otds": "/otds/" in (resp.url or ""),
+        "invalid-postback": ("Invalid postback" in text or "potentially dangerous" in text.lower()),
+        "viewstate-MAC-err": ("Validation of viewstate" in text or "viewstate MAC" in text.lower()),
+    }
+    present = ", ".join(k for k, v in marks.items() if v) or "(none of the expected markers)"
+    lines.append(f"{tag} response markers: {present}")
+    _dump("postback", text)
+    parsed = parse_passenger_form(text, pnr=pnr, index=1)
+    if parsed:
+        lines.append(f"{tag} PARSED OK -> {parsed.first_name} {parsed.last_name} "
+                     f"doc={parsed.document_number or '(none)'}")
+    else:
+        lines.append(f"{tag} parse returned None: the postback response is NOT the passenger "
+                     f"form. Read the saved _paxdiag_{pnr}_postback.html to see what came back.")
+    return lines
