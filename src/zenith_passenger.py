@@ -299,4 +299,27 @@ def diagnose_passenger_fetch(
     else:
         lines.append(f"{tag} parse returned None: the postback response is NOT the passenger "
                      f"form. Read the saved _paxdiag_{pnr}_postback.html to see what came back.")
+
+    # The passenger detail migrated to the modern BackOffice MVC app. Probe the
+    # Traveler endpoints the dossier links to (they carry idPNR) and dump them.
+    from urllib.parse import urlsplit
+    base = f"{urlsplit(dossier_url).scheme}://{urlsplit(dossier_url).netloc}"
+    modern = re.findall(r"/Zenith/[A-Za-z]+/[^\"'<> ]*?Traveler[^\"'<> ]*", dossier_html)
+    modern = list(dict.fromkeys(unescape(u) for u in modern))
+    lines.append(f"{tag} modern Traveler URLs in dossier: {len(modern)}")
+    for j, rel in enumerate(modern[:3], start=1):
+        url = base + rel
+        try:
+            r = session.session.get(url, timeout=timeout_s, allow_redirects=True)
+            t = r.text or ""
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"{tag} modern[{j}] GET error: {exc}")
+            continue
+        hits = [k for k in ("txtFirstName", "txtLastName", "Passport", "passport",
+                            "DocumentNumber", "Nationalit", "Email", "idTraveler",
+                            "Traveler/Update", "input", "Surname", "GivenName")
+                if k in t]
+        lines.append(f"{tag} modern[{j}] {rel[:60]} -> status={r.status_code} len={len(t)} "
+                     f"markers={hits or '(none)'}")
+        _dump(f"modern{j}", t)
     return lines
