@@ -178,7 +178,116 @@ def parse_passenger_form(html: str, *, pnr: str = "", index: int = 0) -> Passeng
     )
 
 
+# --- MODERN path: the passenger detail moved to the BackOffice MVC app --------
+# Clicking a passenger now loads Traveler/Update?idPNR=<Id_Dossier>&backURL=…, one
+# GET that returns ALL travelers as a Travelers[N] model (verified from a HAR). This
+# replaces the dead legacy __doPostBack. idPNR == the dossier's Id_Dossier.
+_IDPNR_RE = re.compile(r"idPNR=(\d+)", re.IGNORECASE)
+_MODERN_PREFIX_RE = re.compile(
+    r"(/Zenith/BackOffice/[^/\"'<> ]+/[^/\"'<> ]+/)Traveler", re.IGNORECASE)
+_TRAV_IDX_RE = re.compile(r"Travelers\[(\d+)\]\.Surname")
+
+
+def traveler_update_url(dossier_html: str, dossier_url: str) -> str | None:
+    """Build the modern Traveler/Update URL from the dossier (idPNR + BackOffice
+    locale prefix), or None if the dossier has no modern idPNR."""
+    m = _IDPNR_RE.search(dossier_html)
+    if not m:
+        return None
+    id_pnr = m.group(1)
+    from urllib.parse import quote, urlsplit
+    pm = _MODERN_PREFIX_RE.search(dossier_html)
+    prefix = pm.group(1) if pm else "/Zenith/BackOffice/USBangla/en-GB/"
+    base = f"{urlsplit(dossier_url).scheme}://{urlsplit(dossier_url).netloc}"
+    inner = f"/TTIDotNet/Transport/TransportNetBO2/Sales/SyntheseDossier.aspx?Id_Dossier={id_pnr}"
+    back = quote(quote(inner, safe=""), safe="")   # double-encoded, as the UI does
+    return f"{base}{prefix}Traveler/Update?idPNR={id_pnr}&backURL={back}"
+
+
+def _trav_text(html: str, idx: int, field: str) -> str:
+    m = re.search(
+        r'name="Travelers\[' + str(idx) + r'\]\.' + re.escape(field) +
+        r'"[^>]*?\bvalue="([^"]*)"', html, re.IGNORECASE)
+    return unescape(m.group(1)).strip() if m else ""
+
+
+def _trav_select(html: str, idx: int, field: str) -> str:
+    blk = re.search(
+        r'<select[^>]*name="Travelers\[' + str(idx) + r'\]\.' + re.escape(field) +
+        r'"[^>]*>(.*?)</select>', html, re.IGNORECASE | re.DOTALL)
+    if not blk:
+        return ""
+    opt = re.search(r"<option[^>]*\bselected[^>]*>([^<]*)</option>", blk.group(1),
+                    re.IGNORECASE)
+    v = unescape(opt.group(1)).strip() if opt else ""
+    return "" if v in ("Select...", "Select…") else v
+
+
+def parse_traveler_update_html(html: str, *, pnr: str = "") -> list[PassengerDetail]:
+    """Parse the modern Traveler/Update page (Travelers[N] model) into details."""
+    out: list[PassengerDetail] = []
+    for idx in sorted({int(i) for i in _TRAV_IDX_RE.findall(html)}):
+        surname = _trav_text(html, idx, "Surname")
+        first = _trav_text(html, idx, "Firstname")
+        if not surname and not first:
+            continue
+        day = _trav_text(html, idx, "DateOfBirth.Day")
+        month = _trav_select(html, idx, "DateOfBirth.Month") or _trav_text(html, idx, "DateOfBirth.Month")
+        year = _trav_text(html, idx, "DateOfBirth.Year")
+        dob = "/".join(x for x in (day, month, year) if x)
+        out.append(PassengerDetail(
+            pnr=pnr, passenger_index=idx + 1,
+            header_name=" ".join(x for x in (surname, first) if x),
+            title=_trav_select(html, idx, "Civility"),
+            gender=_trav_select(html, idx, "Gender"),
+            first_name=first, last_name=surname, date_of_birth=dob,
+            nationality=_trav_select(html, idx, "Nationality"),
+            email=_trav_text(html, idx, "Email"),
+            home_phone=_trav_text(html, idx, "HomePhoneNumber"),
+            mobile_phone=_trav_text(html, idx, "MobilePhoneNumber"),
+            document_type=_trav_select(html, idx, "DocumentType"),
+            document_number=_trav_text(html, idx, "DocumentNumber"),
+            document_expiry=_trav_text(html, idx, "DocumentExpirationDate"),
+            document_country=_trav_select(html, idx, "DocumentIssuingCountry"),
+            ffp_number=(_trav_text(html, idx, "FrequentFlyer.FFPNumber")
+                        or _trav_select(html, idx, "FrequentFlyer.FFPLevelId")),
+        ))
+    return out
+
+
 def fetch_passenger_details(
+    session,
+    dossier_html: str,
+    dossier_url: str,
+    *,
+    pnr: str = "",
+    timeout_s: float = 120.0,
+    max_passengers: int = 50,
+) -> list[PassengerDetail]:
+    """Fetch ALL passengers' detail for one PNR via the modern Traveler/Update GET
+    (one request per PNR). Fail-safe: any error returns [] rather than raising."""
+    url = traveler_update_url(dossier_html, dossier_url)
+    if not url:
+        return []
+    try:
+        resp = session.session.get(
+            url, timeout=timeout_s, allow_redirects=True,
+            headers={
+                # Match the browser so the BackOffice app (and any bot filter)
+                # treats it like the real UI navigating from the dossier.
+                "Referer": dossier_url,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/126.0.0.0 Safari/537.36"),
+            })
+    except Exception as exc:  # noqa: BLE001 — never sink the PNR on a detail error
+        log.info("Traveler/Update GET failed for %s: %s", pnr, exc)
+        return []
+    return parse_traveler_update_html(resp.text or "", pnr=pnr)[:max_passengers]
+
+
+def fetch_passenger_details_postback(
     session,
     dossier_html: str,
     dossier_url: str,
@@ -187,11 +296,8 @@ def fetch_passenger_details(
     timeout_s: float = 120.0,
     max_passengers: int = 20,
 ) -> list[PassengerDetail]:
-    """Replay each passenger's __doPostBack and parse the returned detail form.
-
-    `session` is a ZenithSession (uses `.session`). Fail-safe: a passenger whose
-    postback errors or returns a non-form is skipped, not fatal. Returns one
-    PassengerDetail per passenger the postback resolved."""
+    """LEGACY (dead on current Zenith): replay each passenger's __doPostBack. Kept
+    for reference/tests; the platform moved passenger detail to the modern app."""
     ctx = extract_postback_context(dossier_html)
     if not ctx.action or not ctx.passenger_targets:
         return []
@@ -263,63 +369,37 @@ def diagnose_passenger_fetch(
             lines.append(f"{tag} could not save {name}: {exc}")
 
     _dump("dossier", dossier_html)
-    if not ctx.passenger_targets:
-        lines.append(f"{tag} -> NO passenger links found. On this booking type the passenger "
-                     f"name is not a __doPostBack('...linkPassager') link. See saved dossier HTML.")
-        return lines
 
-    post_url = urljoin(dossier_url, ctx.action)
-    lines.append(f"{tag} POST url = {post_url[:90]}")
-    form = dict(ctx.hidden)
-    form["__EVENTTARGET"] = ctx.passenger_targets[0]
-    form["__EVENTARGUMENT"] = ""
+    # The passenger detail lives in the modern BackOffice app now: one GET to
+    # Traveler/Update?idPNR=<Id_Dossier> returns all travelers. Diagnose THAT.
+    url = traveler_update_url(dossier_html, dossier_url)
+    if not url:
+        lines.append(f"{tag} -> no modern idPNR in the dossier — cannot build Traveler/Update URL. "
+                     f"See saved dossier HTML.")
+        return lines
+    lines.append(f"{tag} Traveler/Update url = …{url[-90:]}")
     try:
-        resp = session.session.post(post_url, data=form, timeout=timeout_s, allow_redirects=True)
+        r = session.session.get(
+            url, timeout=timeout_s, allow_redirects=True,
+            headers={"Referer": dossier_url,
+                     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/126.0.0.0 Safari/537.36")})
     except Exception as exc:  # noqa: BLE001
-        lines.append(f"{tag} postback POST error: {type(exc).__name__}: {exc}")
+        lines.append(f"{tag} Traveler/Update GET error: {type(exc).__name__}: {exc}")
         return lines
-    text = resp.text or ""
-    lines.append(f"{tag} postback -> status={resp.status_code} len={len(text)} "
-                 f"final_url=…{resp.url[-55:]}")
-    marks = {
-        "txtFirstName": "txtFirstName" in text, "txtLastName": "txtLastName" in text,
-        "txtNom": "txtNom" in text, "txtPrenom": "txtPrenom" in text,
-        "txtEmail": "txtEmail" in text, "linkPassager": "linkPassager" in text,
-        "_lblPNRCode(dossier)": "_lblPNRCode" in text, "login/otds": "/otds/" in (resp.url or ""),
-        "invalid-postback": ("Invalid postback" in text or "potentially dangerous" in text.lower()),
-        "viewstate-MAC-err": ("Validation of viewstate" in text or "viewstate MAC" in text.lower()),
-    }
-    present = ", ".join(k for k, v in marks.items() if v) or "(none of the expected markers)"
-    lines.append(f"{tag} response markers: {present}")
-    _dump("postback", text)
-    parsed = parse_passenger_form(text, pnr=pnr, index=1)
-    if parsed:
-        lines.append(f"{tag} PARSED OK -> {parsed.first_name} {parsed.last_name} "
-                     f"doc={parsed.document_number or '(none)'}")
+    text = r.text or ""
+    marks = [k for k in ("Travelers[", "DocumentNumber", "Email", "Nationalit",
+                         "captcha-delivery", "ERROR PAGE", "/otds/")
+             if k in text or k in (r.url or "")]
+    lines.append(f"{tag} Traveler/Update -> status={r.status_code} len={len(text)} "
+                 f"final=…{(r.url or '')[-45:]} markers={marks or '(none)'}")
+    _dump("traveler_update", text)
+    pax = parse_traveler_update_html(text, pnr=pnr)
+    if pax:
+        lines.append(f"{tag} PARSED OK -> {len(pax)} passenger(s); first="
+                     f"{pax[0].first_name} {pax[0].last_name} doc={pax[0].document_number or '(none)'}")
     else:
-        lines.append(f"{tag} parse returned None: the postback response is NOT the passenger "
-                     f"form. Read the saved _paxdiag_{pnr}_postback.html to see what came back.")
-
-    # The passenger detail migrated to the modern BackOffice MVC app. Probe the
-    # Traveler endpoints the dossier links to (they carry idPNR) and dump them.
-    from urllib.parse import urlsplit
-    base = f"{urlsplit(dossier_url).scheme}://{urlsplit(dossier_url).netloc}"
-    modern = re.findall(r"/Zenith/[A-Za-z]+/[^\"'<> ]*?Traveler[^\"'<> ]*", dossier_html)
-    modern = list(dict.fromkeys(unescape(u) for u in modern))
-    lines.append(f"{tag} modern Traveler URLs in dossier: {len(modern)}")
-    for j, rel in enumerate(modern[:3], start=1):
-        url = base + rel
-        try:
-            r = session.session.get(url, timeout=timeout_s, allow_redirects=True)
-            t = r.text or ""
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"{tag} modern[{j}] GET error: {exc}")
-            continue
-        hits = [k for k in ("txtFirstName", "txtLastName", "Passport", "passport",
-                            "DocumentNumber", "Nationalit", "Email", "idTraveler",
-                            "Traveler/Update", "input", "Surname", "GivenName")
-                if k in t]
-        lines.append(f"{tag} modern[{j}] {rel[:60]} -> status={r.status_code} len={len(t)} "
-                     f"markers={hits or '(none)'}")
-        _dump(f"modern{j}", t)
+        lines.append(f"{tag} 0 parsed. If markers show 'captcha-delivery' the app is bot-blocked; "
+                     f"'ERROR PAGE'/'otds' = session not accepted. See _paxdiag_{pnr}_traveler_update.html.")
     return lines

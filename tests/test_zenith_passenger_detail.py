@@ -14,7 +14,10 @@ from src.zenith_passenger import (
     diagnose_passenger_fetch,
     extract_postback_context,
     fetch_passenger_details,
+    fetch_passenger_details_postback,
     parse_passenger_form,
+    parse_traveler_update_html,
+    traveler_update_url,
 )
 
 _DOSSIER = """
@@ -109,8 +112,7 @@ class _FakeSession:
         self.posted: list = []
         self.session = self
 
-    def post(self, url, data=None, timeout=None, allow_redirects=True):
-        self.posted.append(dict(data or {}))
+    def _next(self, url):
         item = self._responses.pop(0) if self._responses else ""
         status, text = item if isinstance(item, tuple) else (200, item)
 
@@ -122,6 +124,14 @@ class _FakeSession:
         r.url = url
         return r
 
+    def post(self, url, data=None, timeout=None, allow_redirects=True):
+        self.posted.append(dict(data or {}))
+        return self._next(url)
+
+    def get(self, url, timeout=None, allow_redirects=True, headers=None):
+        self.posted.append({"GET": url})
+        return self._next(url)
+
 
 _PAX_FORM_2 = (
     '<div>AD Mr. JESUN HAQUE</div>'
@@ -132,7 +142,7 @@ _PAX_FORM_2 = (
 
 def test_fetch_passenger_details_posts_each_target_and_parses():
     sess = _FakeSession([_PAX_FORM, _PAX_FORM_2])   # two DIFFERENT passengers
-    out = fetch_passenger_details(sess, _DOSSIER, "https://z/Sales/Dossier.aspx?x=1",
+    out = fetch_passenger_details_postback(sess, _DOSSIER, "https://z/Sales/Dossier.aspx?x=1",
                                   pnr="0A1DEA")
     assert len(out) == 2
     assert all(isinstance(p, PassengerDetail) for p in out)
@@ -144,13 +154,13 @@ def test_fetch_passenger_details_posts_each_target_and_parses():
 
 def test_fetch_passenger_details_skips_bad_responses():
     sess = _FakeSession(["<html>no fields</html>", _PAX_FORM])
-    out = fetch_passenger_details(sess, _DOSSIER, "https://z/Dossier.aspx")
+    out = fetch_passenger_details_postback(sess, _DOSSIER, "https://z/Dossier.aspx")
     assert len(out) == 1 and out[0].document_number == "EP8057773"
 
 
 def test_fetch_passenger_details_empty_when_no_targets():
     dossier_no_pax = '<form action="Dossier.aspx"></form>'
-    assert fetch_passenger_details(_FakeSession([]), dossier_no_pax, "u") == []
+    assert fetch_passenger_details_postback(_FakeSession([]), dossier_no_pax, "u") == []
 
 
 # --- weaknesses found in self-review, now fixed --------------------------------
@@ -175,7 +185,7 @@ def test_output_dedup_by_identity():
     # Even if two targets slip through, identical people collapse to one row.
     sess = _FakeSession([_PAX_FORM, _PAX_FORM])
     dossier = _DOSSIER  # two DISTINCT targets, but both return the same person
-    out = fetch_passenger_details(sess, dossier, "https://z/Dossier.aspx")
+    out = fetch_passenger_details_postback(sess, dossier, "https://z/Dossier.aspx")
     assert len(out) == 1                          # same passport/name -> one row
 
 
@@ -187,24 +197,98 @@ def test_postback_retries_5xx_then_succeeds():
         '<a id="x_rptPassagers_ctl02_linkPassager"\n'
         '   href="javascript:__doPostBack(\'a$rptPassagers$ctl02$linkPassager\',\'\')">JESUN HAQUE</a>',
         "")
-    out = fetch_passenger_details(sess, one_pax, "https://z/Dossier.aspx")
+    out = fetch_passenger_details_postback(sess, one_pax, "https://z/Dossier.aspx")
     assert len(out) == 1 and out[0].document_number == "EP8057773"
     assert len(sess.posted) == 2                  # first 504, retried to 200
 
 
-def test_diagnostic_reports_no_targets(tmp_path):
+def test_diagnostic_reports_no_modern_idpnr(tmp_path):
     lines = diagnose_passenger_fetch(
-        _FakeSession([]), '<form action="Dossier.aspx"></form>', "u",
+        _FakeSession([]), "<html>legacy dossier, no idPNR</html>", "https://z/x",
         pnr="X", out_dir=str(tmp_path))
     joined = " ".join(lines)
-    assert "NO passenger links found" in joined
+    assert "no modern idPNR" in joined
     assert (tmp_path / "_paxdiag_X_dossier.html").exists()   # saved for inspection
 
 
-def test_diagnostic_reports_parse_result_and_saves(tmp_path):
-    sess = _FakeSession([_PAX_FORM])
+def test_diagnostic_reports_modern_parse_and_saves(tmp_path):
+    sess = _FakeSession([_TRAVELER_UPDATE])
     lines = diagnose_passenger_fetch(
-        sess, _DOSSIER, "https://z/Dossier.aspx", pnr="0A1DEA", out_dir=str(tmp_path))
+        sess, _DOSSIER_MODERN,
+        "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx",
+        pnr="0A1CDT", out_dir=str(tmp_path))
     joined = " ".join(lines)
     assert "PARSED OK" in joined and "EP8057773" in joined
-    assert (tmp_path / "_paxdiag_0A1DEA_postback.html").exists()
+    assert (tmp_path / "_paxdiag_0A1CDT_traveler_update.html").exists()
+
+
+# --- MODERN path: passenger detail moved to BackOffice Traveler/Update ----------
+
+_DOSSIER_MODERN = (
+    '<html>… /Zenith/BackOffice/USBangla/en-GB/Traveler/UpdatePassengersGroupID?idPNR=16858865 …'
+    '<a href="javascript:__doPostBack(\'a$rptPassagers$ctl01$linkPassager\',\'\')">YU ZHENJIE</a>'
+    '</html>'
+)
+
+# Two travelers in the MVC Travelers[N] model (mirrors the real Traveler/Update page).
+_TRAVELER_UPDATE = """
+<input name="Travelers[0].Surname" type="text" value="YU" />
+<input name="Travelers[0].Firstname" type="text" value="ZHENJIE" />
+<select name="Travelers[0].Civility"><option value="0">Select...</option><option selected="selected" value="1">Mr.</option></select>
+<select name="Travelers[0].Gender"><option selected="selected">Male</option></select>
+<input name="Travelers[0].DateOfBirth.Day" type="text" value="1" />
+<select name="Travelers[0].DateOfBirth.Month"><option selected="selected">September</option></select>
+<input name="Travelers[0].DateOfBirth.Year" type="text" value="1973" />
+<select name="Travelers[0].Nationality"><option selected="selected">China</option></select>
+<input name="Travelers[0].Email" type="text" value="1187435137@qq.com" />
+<input name="Travelers[0].MobilePhoneNumber" type="tel" value="18188806906" />
+<select name="Travelers[0].DocumentType"><option selected="selected">Passport</option></select>
+<input name="Travelers[0].DocumentNumber" type="text" value="EP8057773" />
+<input name="Travelers[0].DocumentExpirationDate" type="datetime" value="05/06/2035" />
+<select name="Travelers[0].DocumentIssuingCountry"><option selected="selected">Bangladesh</option></select>
+<input name="Travelers[1].Surname" type="text" value="HAQUE" />
+<input name="Travelers[1].Firstname" type="text" value="JESUN" />
+<input name="Travelers[1].DocumentNumber" type="text" value="BX9990001" />
+"""
+
+
+def test_traveler_update_url_built_from_dossier():
+    url = traveler_update_url(
+        _DOSSIER_MODERN,
+        "https://asia.ttinteractive.com/TTIDotNet/Transport/TransportNetBO2/Sales/Dossier.aspx?x=1")
+    assert url.startswith(
+        "https://asia.ttinteractive.com/Zenith/BackOffice/USBangla/en-GB/Traveler/Update?idPNR=16858865")
+    assert "backURL=%252F" in url or "backURL=%252f" in url   # double-encoded return url
+
+
+def test_traveler_update_url_none_without_idpnr():
+    assert traveler_update_url("<html>legacy dossier, no idPNR</html>", "https://z/x") is None
+
+
+def test_parse_traveler_update_all_fields_and_multi_pax():
+    pax = parse_traveler_update_html(_TRAVELER_UPDATE, pnr="0A1CDT")
+    assert len(pax) == 2                                       # both travelers
+    a = pax[0]
+    assert a.last_name == "YU" and a.first_name == "ZHENJIE"
+    assert a.title == "Mr." and a.gender == "Male"
+    assert a.date_of_birth == "1/September/1973"
+    assert a.nationality == "China" and a.email == "1187435137@qq.com"
+    assert a.mobile_phone == "18188806906"
+    assert a.document_type == "Passport" and a.document_number == "EP8057773"
+    assert a.document_expiry == "05/06/2035" and a.document_country == "Bangladesh"
+    assert pax[1].last_name == "HAQUE" and pax[1].document_number == "BX9990001"
+
+
+def test_fetch_passenger_details_modern_one_get_all_pax():
+    sess = _FakeSession([_TRAVELER_UPDATE])
+    out = fetch_passenger_details(
+        sess, _DOSSIER_MODERN, "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx",
+        pnr="0A1CDT")
+    assert len(out) == 2                                       # ONE GET -> all passengers
+    assert out[0].document_number == "EP8057773"
+    assert len(sess.posted) == 1 and "GET" in sess.posted[0]   # a single GET, no postbacks
+
+
+def test_fetch_passenger_details_modern_empty_without_idpnr():
+    sess = _FakeSession([_TRAVELER_UPDATE])
+    assert fetch_passenger_details(sess, "<html>legacy, no idPNR</html>", "u") == []
