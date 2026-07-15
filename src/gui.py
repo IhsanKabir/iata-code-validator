@@ -142,10 +142,12 @@ MSG_ZENITH_BULK_PROGRESS = "zenith_bulk_progress"  # (i, total, code, status)
 MSG_ZENITH_BULK_DONE = "zenith_bulk_done"          # payload: dict (path, counts)
 MSG_ZENITH_BULK_ERROR = "zenith_bulk_error"
 MSG_ZENITH_BULK_LOG = "zenith_bulk_log"            # payload: str (a log line)
-# Passenger DETAIL extraction (postback replay per pax) — reuses the bulk log/progress
-MSG_ZENITH_PAX_PROGRESS = "zenith_pax_progress"    # (i, total, code, n_pax)
-MSG_ZENITH_PAX_DONE = "zenith_pax_done"            # payload: dict (path, pnrs, passengers)
-MSG_ZENITH_PAX_ERROR = "zenith_pax_error"          # payload: str
+# Passenger DETAIL extraction (postback replay per pax) — reuses the bulk log/progress.
+# Distinct names/values from the Flight-Loads MSG_ZENITH_PAX_* above (a collision there
+# routed these to the wrong handler and froze the bulk-tab counter at 0).
+MSG_ZENITH_PAXDET_PROGRESS = "zenith_paxdet_progress"  # (done, total, code, n_pax)
+MSG_ZENITH_PAXDET_DONE = "zenith_paxdet_done"          # payload: dict (path, pnrs, passengers)
+MSG_ZENITH_PAXDET_ERROR = "zenith_paxdet_error"        # payload: str
 
 # Zenith host options. The default usba host is CloudFront-fronted and 504-storms on slow
 # Dossier renders; the direct asia origin waits them out. "" = no override (default usba).
@@ -4575,15 +4577,15 @@ class App(WhatsAppMixin, HealthMixin):
             self._zenith_bulk_log_line(f"ERROR: {payload}")
             messagebox.showerror("PNR Bulk Lookup — Error", str(payload))
         # ----- Passenger details (postback) -----
-        elif kind == MSG_ZENITH_PAX_PROGRESS:
-            i, total, code, npax = payload  # type: ignore[misc]
-            self.zenith_bulk_progress.configure(value=i, maximum=max(1, total))
+        elif kind == MSG_ZENITH_PAXDET_PROGRESS:
+            done, total, code, npax = payload  # type: ignore[misc]
+            self.zenith_bulk_progress.configure(value=done, maximum=max(1, total))
             if npax < 0:
-                self._zenith_bulk_log_line(f"  {i}/{total} {code}: NOT_FOUND")
+                self._zenith_bulk_log_line(f"  {done}/{total} {code}: NOT_FOUND")
             else:
-                self._zenith_bulk_log_line(f"  {i}/{total} {code}: {npax} passenger(s)")
-            self.zenith_bulk_status_label.configure(text=f"Passenger details {i}/{total}…")
-        elif kind == MSG_ZENITH_PAX_DONE:
+                self._zenith_bulk_log_line(f"  {done}/{total} {code}: {npax} passenger(s)")
+            self.zenith_bulk_status_label.configure(text=f"Passenger details {done}/{total}…")
+        elif kind == MSG_ZENITH_PAXDET_DONE:
             self.btn_zenith_pax.configure(state="normal")
             self.btn_zenith_bulk_run.configure(state="normal")
             self.btn_zenith_bulk_stop.configure(state="disabled")
@@ -4596,9 +4598,9 @@ class App(WhatsAppMixin, HealthMixin):
             if p["passengers"] == 0:
                 messagebox.showwarning(
                     "Passenger Details",
-                    "No passenger detail was extracted. If the PNRs resolved but "
-                    "returned 0 passengers, the passenger postback may need a tweak — "
-                    "tell me what the run log showed and I'll adjust it.")
+                    "No passenger detail was extracted. If PNRs resolved but returned 0 "
+                    "passengers, the passenger postback may need a tweak — tell me what "
+                    "the run log showed and I'll adjust it.")
             elif messagebox.askyesno(
                     "Passenger Details",
                     f"Wrote {p['passengers']} passenger record(s) from {p['pnrs']} PNR(s).\n\n"
@@ -4608,7 +4610,7 @@ class App(WhatsAppMixin, HealthMixin):
                     os.startfile(p["path"])  # noqa: S606
                 except Exception:  # noqa: BLE001
                     pass
-        elif kind == MSG_ZENITH_PAX_ERROR:
+        elif kind == MSG_ZENITH_PAXDET_ERROR:
             self.btn_zenith_pax.configure(state="normal")
             self.btn_zenith_bulk_run.configure(state="normal")
             self.btn_zenith_bulk_stop.configure(state="disabled")
@@ -6546,41 +6548,79 @@ class App(WhatsAppMixin, HealthMixin):
         sess = self._zenith_session
         stop = self._zenith_bulk_stop_flag
         delay_s = max(0.0, float(self.zenith_bulk_delay_s.get()))
+        concurrency = max(1, int(self.zenith_bulk_concurrency.get()))
 
         def worker() -> None:
+            # Each PNR is a heavy Dossier render + a postback per passenger, so
+            # run them in parallel (like the bulk lookup) with a per-request
+            # timeout, and emit a live heartbeat + progress on EVERY outcome so
+            # the counter never sits frozen while a slow PNR is in flight.
             import time as _t
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             from . import zenith_pnr_client as zpc
-            try:
-                all_pax: list = []
-                ok_pnrs = 0
-                for i, code in enumerate(codes, start=1):
-                    if stop.is_set():
-                        self._post(MSG_ZENITH_BULK_LOG, "  Stopped.")
-                        break
-                    try:
-                        _details, pax = zpc.lookup_pnr_and_passengers(sess, code)
-                        if pax:
-                            all_pax.extend(pax)
-                            ok_pnrs += 1
-                        self._post(MSG_ZENITH_PAX_PROGRESS, (i, len(codes), code, len(pax)))
-                    except zpc.PNRNotFoundError:
-                        self._post(MSG_ZENITH_PAX_PROGRESS, (i, len(codes), code, -1))
-                    except zpc.SessionExpiredError as exc:
-                        self._post(MSG_ZENITH_PAX_ERROR,
-                                   f"Zenith session expired — sign in again. ({exc})")
-                        return
-                    except Exception as exc:  # noqa: BLE001 — one PNR must not sink the run
-                        self._post(MSG_ZENITH_BULK_LOG,
-                                   f"  {code}: {type(exc).__name__}: {exc}")
-                    if delay_s and i < len(codes):
+            total = len(codes)
+            all_pax: list = []
+            ok_pnrs = 0
+            done = 0
+            session_dead = False
+            lock = threading.Lock()
+
+            def one(code):
+                if stop.is_set():
+                    return code, "stopped", None
+                self._post(MSG_ZENITH_BULK_LOG, f"  → {code} …")   # heartbeat
+                try:
+                    _d, pax = zpc.lookup_pnr_and_passengers(sess, code, timeout_s=60)
+                    return code, "ok", pax
+                except zpc.PNRNotFoundError:
+                    return code, "notfound", None
+                except zpc.SessionExpiredError as exc:
+                    return code, "session", str(exc)
+                except Exception as exc:  # noqa: BLE001 — one PNR must not sink the run
+                    return code, "error", f"{type(exc).__name__}: {exc}"
+                finally:
+                    if delay_s:
                         _t.sleep(delay_s)
+
+            try:
+                with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                    futures = [ex.submit(one, c) for c in codes]
+                    for fut in as_completed(futures):
+                        code, status, data = fut.result()
+                        with lock:
+                            done += 1
+                            d = done
+                            if status == "ok" and data:
+                                all_pax.extend(data)
+                                ok_pnrs += 1
+                        if status == "ok":
+                            self._post(MSG_ZENITH_PAXDET_PROGRESS,
+                                       (d, total, code, len(data or [])))
+                        elif status == "notfound":
+                            self._post(MSG_ZENITH_PAXDET_PROGRESS, (d, total, code, -1))
+                        elif status == "session":
+                            session_dead = True
+                            stop.set()   # stop not-yet-started tasks fast
+                            self._post(MSG_ZENITH_PAXDET_PROGRESS, (d, total, code, 0))
+                        else:  # "error" | "stopped"
+                            self._post(MSG_ZENITH_PAXDET_PROGRESS, (d, total, code, 0))
+                            if status == "error":
+                                self._post(MSG_ZENITH_BULK_LOG, f"  {code}: {data}")
+                # Always save what we gathered (partial on stop/session loss).
                 path = excel_io.build_passenger_details_output_path(out_folder)
                 n = excel_io.write_passenger_details(path, all_pax)
-                self._post(MSG_ZENITH_PAX_DONE,
+                if session_dead:
+                    self._post(MSG_ZENITH_BULK_LOG,
+                               f"  Session expired — saved {n} partial record(s) to {path}")
+                    self._post(MSG_ZENITH_PAXDET_ERROR,
+                               "Zenith session expired mid-run — sign in again (top of "
+                               f"tab), then re-run. Partial results saved to {path}.")
+                    return
+                self._post(MSG_ZENITH_PAXDET_DONE,
                            {"path": str(path), "pnrs": ok_pnrs, "passengers": n})
             except Exception as exc:  # noqa: BLE001
                 log.exception("passenger details run failed")
-                self._post(MSG_ZENITH_PAX_ERROR, f"{type(exc).__name__}: {exc}")
+                self._post(MSG_ZENITH_PAXDET_ERROR, f"{type(exc).__name__}: {exc}")
 
         self._zenith_pax_worker = threading.Thread(target=worker, daemon=True)
         self._zenith_pax_worker.start()
