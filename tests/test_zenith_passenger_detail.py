@@ -410,3 +410,33 @@ def test_successful_direct_get_caches_direct_strategy():
         sess, _DOSSIER_MODERN, "https://asia.ttinteractive.com/TTIDotNet/x/Dossier.aspx",
         pnr="0A1CDT")
     assert sess._pax_strategy == "direct"
+
+
+def test_parse_traveler_update_input_mode_civility_and_gender():
+    # Some PNRs render Civility/Gender as read-only INPUTS, not selects: Gender as
+    # text, Civility as a numeric ID (mapping from the page's own select options).
+    html = (
+        '<input name="Travelers[0].Surname" value="HOSSAIN" />'
+        '<input name="Travelers[0].Firstname" value="MD AKTAR" />'
+        '<input name="Travelers[0].Civility" value="15" />'
+        '<input name="Travelers[0].Gender" value="Female" />'
+        '<input name="Travelers[1].Surname" value="AKTER" />'
+        '<input name="Travelers[1].Civility" value="99" />'   # unknown ID -> blank
+        '<input name="Travelers[2].Surname" value="MIA" />'
+        '<input name="Travelers[2].Civility" value="0" />'    # 0 = Select... -> blank
+    )
+    pax = parse_traveler_update_html(html, pnr="0A1CDT")
+    assert pax[0].title == "Mstr." and pax[0].gender == "Female"
+    assert pax[1].title == "" and pax[2].title == ""
+
+
+def test_parse_traveler_update_select_mode_still_wins():
+    # Select-mode pages keep working; select takes precedence over any stray input.
+    html = (
+        '<input name="Travelers[0].Surname" value="YU" />'
+        '<select name="Travelers[0].Civility"><option value="0">Select...</option>'
+        '<option selected="selected" value="1">Mr.</option></select>'
+        '<select name="Travelers[0].Gender"><option selected>Male</option></select>'
+    )
+    pax = parse_traveler_update_html(html)
+    assert pax[0].title == "Mr." and pax[0].gender == "Male"

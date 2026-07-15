@@ -211,6 +211,23 @@ def _trav_text(html: str, idx: int, field: str) -> str:
     return unescape(m.group(1)).strip() if m else ""
 
 
+# Traveler/Update renders Civility + Gender as a <select> on some PNRs and as a
+# plain <input value="…"> on others (read-only mode). The input carries Gender as
+# text ("Male") but Civility as a numeric ID — mapping taken from the real page's
+# own select options.
+_CIVILITY_LABELS = {
+    "1": "Mr.", "2": "Mrs.", "3": "Miss", "10": "Dr.", "11": "Pr.",
+    "12": "Eng.", "13": "Rev.", "14": "Ms.", "15": "Mstr.", "16": "Hon",
+    "17": "Capt.",
+}
+
+
+def _civility_label(raw: str) -> str:
+    if raw.isdigit():
+        return _CIVILITY_LABELS.get(raw, "")
+    return raw
+
+
 def _trav_select(html: str, idx: int, field: str) -> str:
     blk = re.search(
         r'<select[^>]*name="Travelers\[' + str(idx) + r'\]\.' + re.escape(field) +
@@ -238,8 +255,10 @@ def parse_traveler_update_html(html: str, *, pnr: str = "") -> list[PassengerDet
         out.append(PassengerDetail(
             pnr=pnr, passenger_index=idx + 1,
             header_name=" ".join(x for x in (surname, first) if x),
-            title=_trav_select(html, idx, "Civility"),
-            gender=_trav_select(html, idx, "Gender"),
+            title=_civility_label(_trav_select(html, idx, "Civility")
+                                  or _trav_text(html, idx, "Civility")),
+            gender=(_trav_select(html, idx, "Gender")
+                    or _trav_text(html, idx, "Gender")),
             first_name=first, last_name=surname, date_of_birth=dob,
             nationality=_trav_select(html, idx, "Nationality"),
             email=_trav_text(html, idx, "Email"),
