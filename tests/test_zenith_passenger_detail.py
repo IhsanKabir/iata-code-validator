@@ -101,29 +101,40 @@ def test_parse_passenger_form_returns_none_for_non_form():
 
 
 class _FakeSession:
+    """Serves queued responses. Each item is a str (200) or a (status, text) tuple."""
+
     def __init__(self, responses):
         self._responses = list(responses)
         self.posted: list = []
         self.session = self
 
     def post(self, url, data=None, timeout=None, allow_redirects=True):
-        self.posted.append(data)
-        text = self._responses.pop(0) if self._responses else ""
+        self.posted.append(dict(data or {}))
+        item = self._responses.pop(0) if self._responses else ""
+        status, text = item if isinstance(item, tuple) else (200, item)
 
         class _R:
             pass
         r = _R()
         r.text = text
+        r.status_code = status
         return r
 
 
+_PAX_FORM_2 = (
+    '<div>AD Mr. JESUN HAQUE</div>'
+    '<input name="m$txtFirstName" value="JESUN"><input name="m$txtLastName" value="HAQUE">'
+    '<input name="m$txtDocumentNumber" value="BX9990001">'
+)
+
+
 def test_fetch_passenger_details_posts_each_target_and_parses():
-    sess = _FakeSession([_PAX_FORM, _PAX_FORM])
+    sess = _FakeSession([_PAX_FORM, _PAX_FORM_2])   # two DIFFERENT passengers
     out = fetch_passenger_details(sess, _DOSSIER, "https://z/Sales/Dossier.aspx?x=1",
                                   pnr="0A1DEA")
     assert len(out) == 2
     assert all(isinstance(p, PassengerDetail) for p in out)
-    assert out[0].document_number == "EP8057773"
+    assert {p.document_number for p in out} == {"EP8057773", "BX9990001"}
     assert sess.posted[0]["__EVENTTARGET"] == "a$rptPassagers$ctl01$linkPassager"
     assert sess.posted[0]["__VIEWSTATE"] == "VS-DATA=="
     assert sess.posted[1]["__EVENTTARGET"] == "a$rptPassagers$ctl02$linkPassager"
@@ -138,3 +149,42 @@ def test_fetch_passenger_details_skips_bad_responses():
 def test_fetch_passenger_details_empty_when_no_targets():
     dossier_no_pax = '<form action="Dossier.aspx"></form>'
     assert fetch_passenger_details(_FakeSession([]), dossier_no_pax, "u") == []
+
+
+# --- weaknesses found in self-review, now fixed --------------------------------
+
+_ROUND_TRIP_DOSSIER = """
+<form action="Dossier.aspx?taskId=z">
+<input type="hidden" name="__VIEWSTATE" value="VS">
+<a href="javascript:__doPostBack('a$rptSegments$ctl00$rptPassagers$ctl01$linkPassager','')">YU ZHENJIE</a>
+<a href="javascript:__doPostBack('a$rptSegments$ctl01$rptPassagers$ctl01$linkPassager','')">YU ZHENJIE</a>
+</form>
+"""
+
+
+def test_round_trip_passenger_deduped_by_name():
+    # Same passenger appears once per segment on a round trip — must POST ONCE.
+    ctx = extract_postback_context(_ROUND_TRIP_DOSSIER)
+    assert len(ctx.passenger_targets) == 1        # deduped by name, not 2
+    assert "ctl00$rptPassagers" in ctx.passenger_targets[0]
+
+
+def test_output_dedup_by_identity():
+    # Even if two targets slip through, identical people collapse to one row.
+    sess = _FakeSession([_PAX_FORM, _PAX_FORM])
+    dossier = _DOSSIER  # two DISTINCT targets, but both return the same person
+    out = fetch_passenger_details(sess, dossier, "https://z/Dossier.aspx")
+    assert len(out) == 1                          # same passport/name -> one row
+
+
+def test_postback_retries_5xx_then_succeeds():
+    # A transient 504 on the postback must be retried, not silently lost.
+    sess = _FakeSession([(504, "gateway timeout"), (200, _PAX_FORM)])
+    # single-passenger dossier so only one target is posted
+    one_pax = _DOSSIER.replace(
+        '<a id="x_rptPassagers_ctl02_linkPassager"\n'
+        '   href="javascript:__doPostBack(\'a$rptPassagers$ctl02$linkPassager\',\'\')">JESUN HAQUE</a>',
+        "")
+    out = fetch_passenger_details(sess, one_pax, "https://z/Dossier.aspx")
+    assert len(out) == 1 and out[0].document_number == "EP8057773"
+    assert len(sess.posted) == 2                  # first 504, retried to 200

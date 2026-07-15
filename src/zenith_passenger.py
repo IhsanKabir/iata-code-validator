@@ -40,6 +40,10 @@ _NAME_RE = re.compile(r'\bname="([^"]*)"')
 _VALUE_RE = re.compile(r'\bvalue="([^"]*)"')
 _FORM_ACTION_RE = re.compile(r'<form[^>]*\baction="([^"]*)"', re.IGNORECASE)
 _PAX_TARGET_RE = re.compile(r"__doPostBack\('([^']*linkPassager)'")
+# Target + the passenger NAME in the anchor text — used to dedup a passenger who
+# appears once PER SEGMENT on a round trip (rptSegments$ctl00 AND $ctl01).
+_PAX_TARGET_NAME_RE = re.compile(
+    r"__doPostBack\('([^']*linkPassager)','[^']*'\)\"[^>]*>([^<]+)</a>")
 # The form header renders the passenger as "AD Mr. YU ZHENJIE" in a green bar.
 _PAX_HEADER_RE = re.compile(
     r'(?:AD|CHD?|INF)\s+(?:Mr|Mrs|Ms|Mstr|Miss|Dr)\.?\s+[A-Z][A-Za-z .\'-]+')
@@ -85,7 +89,21 @@ def extract_postback_context(dossier_html: str) -> PostbackContext:
             continue
         vm = _VALUE_RE.search(tag)
         hidden[nm.group(1)] = unescape(vm.group(1)) if vm else ""
-    targets = tuple(dict.fromkeys(_PAX_TARGET_RE.findall(dossier_html)))  # dedup, keep order
+    # Dedup by passenger NAME so a round-trip passenger (listed per segment) is
+    # fetched once. Fall back to raw-target dedup if names aren't capturable.
+    pairs = _PAX_TARGET_NAME_RE.findall(dossier_html)
+    if pairs:
+        seen: set[str] = set()
+        targets_list: list[str] = []
+        for target, name in pairs:
+            key = " ".join(name.split()).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            targets_list.append(target)
+        targets = tuple(targets_list)
+    else:
+        targets = tuple(dict.fromkeys(_PAX_TARGET_RE.findall(dossier_html)))
     return PostbackContext(action=action, hidden=hidden, passenger_targets=targets)
 
 
@@ -177,18 +195,40 @@ def fetch_passenger_details(
     if not ctx.action or not ctx.passenger_targets:
         return []
     post_url = urljoin(dossier_url, ctx.action)
+    targets = ctx.passenger_targets
+    if len(targets) > max_passengers:
+        log.warning("%s: %d passengers, capping at %d", pnr or "PNR",
+                    len(targets), max_passengers)
+        targets = targets[:max_passengers]
+
     out: list[PassengerDetail] = []
-    for i, target in enumerate(ctx.passenger_targets[:max_passengers], start=1):
+    seen: set[tuple] = set()   # belt-and-suspenders identity dedup
+    import time as _t
+    for i, target in enumerate(targets, start=1):
         form = dict(ctx.hidden)
         form["__EVENTTARGET"] = target
         form["__EVENTARGUMENT"] = ""
-        try:
-            resp = session.session.post(post_url, data=form, timeout=timeout_s,
-                                        allow_redirects=True)
-        except Exception as exc:  # noqa: BLE001 — one bad pax must not sink the rest
-            log.info("passenger postback %d failed: %s", i, exc)
+        resp = None
+        for attempt in range(3):   # retry transient 5xx / network on the postback
+            try:
+                resp = session.session.post(
+                    post_url, data=form, timeout=timeout_s, allow_redirects=True)
+            except Exception as exc:  # noqa: BLE001 — one bad pax must not sink the rest
+                log.info("passenger postback %d attempt %d error: %s", i, attempt + 1, exc)
+                resp = None
+            if resp is not None and getattr(resp, "status_code", 200) < 500:
+                break
+            if attempt < 2:
+                _t.sleep(1.5 * (attempt + 1))
+        if resp is None:
             continue
-        detail = parse_passenger_form(resp.text, pnr=pnr, index=i)
-        if detail is not None:
-            out.append(detail)
+        detail = parse_passenger_form(resp.text, pnr=pnr, index=len(out) + 1)
+        if detail is None:
+            continue
+        key = (detail.last_name.upper(), detail.first_name.upper(),
+               detail.date_of_birth, detail.document_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(detail)
     return out

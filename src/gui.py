@@ -6570,7 +6570,10 @@ class App(WhatsAppMixin, HealthMixin):
                     return code, "stopped", None
                 self._post(MSG_ZENITH_BULK_LOG, f"  → {code} …")   # heartbeat
                 try:
-                    _d, pax = zpc.lookup_pnr_and_passengers(sess, code, timeout_s=60)
+                    # Keep a generous timeout — Dossier renders were measured up to
+                    # ~55s under load, so a tight timeout spuriously fails them. The
+                    # heartbeat + parallelism are what keep the UI feeling alive.
+                    _d, pax = zpc.lookup_pnr_and_passengers(sess, code, timeout_s=120)
                     return code, "ok", pax
                 except zpc.PNRNotFoundError:
                     return code, "notfound", None
