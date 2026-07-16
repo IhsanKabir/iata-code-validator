@@ -795,11 +795,13 @@ def read_zenith_ids(
     start_row: int = 2,
     end_row: int | None = None,
 ) -> list[str]:
-    """Read customer IDs from a column in an Excel file.
+    """Read customer IDs *or names* from a column in an Excel file.
 
-    Same shape as `read_iata_numbers` but doesn't reject non-numeric
-    or short-length values — Zenith customer IDs are 8 digits but we
-    accept anything non-blank.
+    Same shape as `read_iata_numbers` but doesn't reject non-numeric or
+    short-length values — Zenith customer IDs are 8 digits, and anything
+    non-numeric is treated as a customer NAME by the lookup (name search).
+    IDs get the usual cleanup (spaces/hyphens dropped, "12492298.0" from
+    Excel floats fixed); names keep their spaces, just whitespace-collapsed.
     """
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -821,7 +823,15 @@ def read_zenith_ids(
             values_only=True,
         ):
             cell = row[0]
-            text = _normalize(cell)
+            # _normalize strips spaces/hyphens — right for IDs ("1249-2298",
+            # Excel's 12492298.0), fatal for names ("AJMERI TOUR AND TRAVELS"
+            # must NOT become "AJMERITOURANDTRAVELS"). Use it only when the
+            # cleaned value is a pure number; otherwise keep the name.
+            cleaned = _normalize(cell)
+            if cleaned.isdigit():
+                text = cleaned
+            else:
+                text = " ".join(str(cell).split()) if cell is not None else ""
             if text:
                 ids.append(text)
         return ids
@@ -842,8 +852,11 @@ def write_zenith_results(path: Path, results: Iterable) -> None:
     ws.append(ZENITH_OUTPUT_COLUMNS)
     for r in results:
         rec = r.record
+        # Name lookups: the row key is the searched name, the record carries the
+        # resolved numeric id — show the REAL id, keep the query in Search Input.
+        resolved = rec.customer_id if rec and rec.customer_id else r.customer_id
         ws.append([
-            r.customer_id,
+            resolved,
             r.status,
             rec.customer_type if rec else "",
             rec.company_name if rec else "",
@@ -870,6 +883,7 @@ def write_zenith_results(path: Path, results: Iterable) -> None:
             rec.registration_date if rec else "",
             r.error,
             r.checked_at,
+            r.customer_id if r.customer_id != resolved else "",
         ])
     # Auto-size the Customer ID column for readability.
     ws.column_dimensions[get_column_letter(1)].width = 14

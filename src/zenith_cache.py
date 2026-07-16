@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS zenith_customers (
     postal_code TEXT NOT NULL DEFAULT '',
     country TEXT NOT NULL DEFAULT '',
     registration_date TEXT NOT NULL DEFAULT '',
+    customer_type TEXT NOT NULL DEFAULT '',
+    company_name TEXT NOT NULL DEFAULT '',
+    administrative_name TEXT NOT NULL DEFAULT '',
+    iata_number TEXT NOT NULL DEFAULT '',
+    resolved_id TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     checked_at TEXT NOT NULL DEFAULT ''
 );
@@ -75,7 +80,15 @@ CREATE TABLE IF NOT EXISTS zenith_meta (
 
 
 # All CustomerRecord fields in DB column order — keep in sync with _SCHEMA.
+# customer_type/company_name/administrative_name/iata_number were ADDED in a
+# later schema version (they were silently dropped before — agency rows came
+# back from the cache with an empty Agency Name / IATA Number); _ensure_columns
+# migrates older cache files in place.
 _RECORD_COLUMNS = (
+    "customer_type",
+    "company_name",
+    "administrative_name",
+    "iata_number",
     "title",
     "first_name",
     "middle_name",
@@ -106,6 +119,17 @@ class ZenithCache:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._ensure_columns(conn)
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection) -> None:
+        """In-place migration: CREATE TABLE IF NOT EXISTS never adds columns to an
+        existing file, so add any missing ones (idempotent, data preserved)."""
+        have = {row[1] for row in conn.execute("PRAGMA table_info(zenith_customers)")}
+        for col in (*_RECORD_COLUMNS, "resolved_id"):
+            if col not in have:
+                conn.execute(
+                    f"ALTER TABLE zenith_customers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _conn(self):
@@ -125,10 +149,14 @@ class ZenithCache:
         values: list = [result.customer_id, result.status]
         for col in _RECORD_COLUMNS:
             values.append(getattr(record, col, ""))
+        # For name lookups the row is keyed by the query but the record carries
+        # the REAL numeric id — persist it so the round-trip doesn't lose it.
+        values.append(record.customer_id if record.customer_id != result.customer_id else "")
         values.append(result.error)
         values.append(result.checked_at)
 
-        cols = "customer_id, status, " + ", ".join(_RECORD_COLUMNS) + ", error, checked_at"
+        cols = ("customer_id, status, " + ", ".join(_RECORD_COLUMNS)
+                + ", resolved_id, error, checked_at")
         placeholders = ", ".join("?" * len(values))
         sql = f"""
             INSERT INTO zenith_customers ({cols})
@@ -136,6 +164,7 @@ class ZenithCache:
             ON CONFLICT(customer_id) DO UPDATE SET
                 status=excluded.status,
                 {", ".join(f"{c}=excluded.{c}" for c in _RECORD_COLUMNS)},
+                resolved_id=excluded.resolved_id,
                 error=excluded.error,
                 checked_at=excluded.checked_at
         """
@@ -244,7 +273,8 @@ def _row_to_result(row: sqlite3.Row) -> LookupResult:
     record = None
     if status in (STATUS_OK, STATUS_NOT_FOUND):
         kwargs = {col: row[col] for col in _RECORD_COLUMNS}
-        record = CustomerRecord(customer_id=cid, **kwargs)
+        # Name-lookup rows are keyed by the query; the record gets the real id back.
+        record = CustomerRecord(customer_id=row["resolved_id"] or cid, **kwargs)
     return LookupResult(
         customer_id=cid,
         status=status,

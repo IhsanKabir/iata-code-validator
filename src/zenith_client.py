@@ -1,7 +1,9 @@
 """HTTP client for Zenith TT Interactive (usba.ttinteractive.com).
 
 Bulk extracts customer records (name, email, phone, address, etc.) given
-a list of Customer IDs. Read-only — never POSTs to update/create.
+a list of Customer IDs **or names** — all-digits input hits the ID handlers
+directly; anything else goes through the name search (CustomerSearch.ashx)
+and resolves to an ID first. Read-only — never POSTs to update/create.
 
 Flow (one-time, per session):
 
@@ -71,6 +73,12 @@ CUSTOMER_LOOKUP_URL = (
 TRAVEL_AGENCY_LOOKUP_URL = (
     f"{BASE_URL}/TTIDOTNET/TRANSPORT/TRANSPORTNETBO2/SALES2/CustomerViews/TravelAgency.ashx"
 )
+# Name search: GET CustomerSearch.ashx?CustomerName=<name> 302s to a Customer.aspx
+# results page (masterUserControl=UsrCustomerSearch) listing every match with its
+# Customer Code / Name / Phone / Type / E-mail. Verified from a browser HAR.
+CUSTOMER_SEARCH_URL = (
+    f"{BASE_URL}/TTIDOTNET/TRANSPORT/TRANSPORTNETBO2/SALES2/CustomerViews/CustomerSearch.ashx"
+)
 FLIGHT_LOAD_URL = f"{BASE_URL}/newui/aerien/commercial/Sale_ListeVols_NewStock.asp"
 
 # Server-side limit: max 10 pages of results per single search.
@@ -129,6 +137,11 @@ class CustomerNotFoundError(ZenithError):
     """Zenith found no customer with the given ID."""
 
 
+class CustomerAmbiguousError(ZenithError):
+    """A name search matched several customers and none is an exact-name match.
+    The message lists the candidates (id + name) so the user can re-run by ID."""
+
+
 class RateLimitedError(ZenithError):
     """Zenith returned 429 / 503 / a known rate-limit signal."""
 
@@ -184,6 +197,17 @@ class LookupResult:
     record: CustomerRecord | None = None
     error: str = ""
     checked_at: str = ""
+
+
+@dataclass(frozen=True)
+class CustomerSearchMatch:
+    """One row of the name-search results table."""
+
+    customer_id: str
+    name: str = ""
+    phone: str = ""
+    customer_type: str = ""   # "Travel Agency" | "Final Customer"
+    email: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +308,61 @@ def parse_customer_html(html: str, customer_id: str) -> CustomerRecord:
         registration_date=registration_date,
     )
     return record
+
+
+# --- name-search results page (Customer.aspx?masterUserControl=UsrCustomerSearch) ---
+# Each match is a <tr> whose edit anchor carries <handler>.ashx?IdCustomer=<id> —
+# TravelAgency.ashx on the captured agency row; accept ANY handler so person
+# (FinalCustomer.ashx) rows match too. Other row actions use different params
+# (CustomerId=, @ID_Customer=), so they can't false-match. Values live in tds
+# classed th-name / th-phone / th-type / th-email, each holding a mobile label
+# div we must strip.
+_SEARCH_ROW_ID_RE = re.compile(
+    r'[A-Za-z]+\.ashx\?IdCustomer=(\d+)', re.IGNORECASE)
+_SEARCH_PAGE_MARKER = "UsrCustomerSearch"
+_XS_LABEL_DIV_RE = re.compile(
+    r'<div class="visible-xs-inline xs-left">.*?</div>', re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _search_td_text(row_html: str, td_class: str) -> str:
+    """Text value of the row's `<td class="center th-<td_class>">`, label stripped."""
+    m = re.search(
+        r'<td class="center th-' + re.escape(td_class) + r'"[^>]*>(.*?)</td>',
+        row_html, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    inner = _XS_LABEL_DIV_RE.sub("", m.group(1))
+    return _html_unescape(" ".join(_TAG_RE.sub(" ", inner).split())).strip()
+
+
+def parse_customer_search_html(html: str) -> list[CustomerSearchMatch]:
+    """Parse the name-search results table into CustomerSearchMatch rows.
+
+    Returns [] for a results page with no matches. Raises ZenithError if the
+    page doesn't look like a search-results page at all (degraded/error page) —
+    so callers can retry instead of mistaking an outage for "no such customer".
+    """
+    if _SEARCH_PAGE_MARKER not in html:
+        raise ZenithError("Response is not a customer-search results page.")
+    out: list[CustomerSearchMatch] = []
+    seen: set[str] = set()
+    for m in _SEARCH_ROW_ID_RE.finditer(html):
+        cid = m.group(1)
+        if cid in seen:            # the id appears in several row actions
+            continue
+        seen.add(cid)
+        row_start = html.rfind("<tr", 0, m.start())
+        row_end = html.find("</tr>", m.start())
+        row = html[row_start:row_end] if row_start >= 0 and row_end >= 0 else ""
+        out.append(CustomerSearchMatch(
+            customer_id=cid,
+            name=_search_td_text(row, "name"),
+            phone=_search_td_text(row, "phone"),
+            customer_type=_search_td_text(row, "type"),
+            email=_search_td_text(row, "email"),
+        ))
+    return out
 
 
 _STATE_VALUES_RE = re.compile(
@@ -467,6 +546,84 @@ class ZenithSession:
                 continue
         raise ZenithError(f"Exhausted retries fetching {customer_id}.")
 
+    def search_customers(
+        self, name: str, *, timeout_s: float = 90.0, max_attempts: int = 4,
+    ) -> list[CustomerSearchMatch]:
+        """Search customers by name (the header quick-search). Returns every match.
+
+        GET CustomerSearch.ashx?CustomerName=<name>; the 302 chain lands on the
+        results page listing Customer Code / Name / Phone / Type / E-mail per hit.
+        [] means Zenith genuinely found nothing; degraded pages are retried.
+        """
+        query = " ".join(str(name).split())
+        if not query:
+            return []
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            is_last = attempt >= attempts
+            try:
+                resp = self.session.get(
+                    CUSTOMER_SEARCH_URL, params={"CustomerName": query},
+                    allow_redirects=True, timeout=timeout_s)
+            except requests.RequestException as exc:
+                if is_last:
+                    raise ZenithError(
+                        f"Network error searching {query!r} after "
+                        f"{attempts} attempts: {exc}") from exc
+                time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+                continue
+            if resp.status_code in (401, 403) or "/otds/" in resp.url:
+                raise SessionExpiredError(
+                    f"Zenith returned {resp.status_code} searching {query!r} — "
+                    "session expired or never authenticated.")
+            if resp.status_code in (429, 503):
+                if is_last:
+                    raise RateLimitedError(
+                        f"Zenith returned {resp.status_code} searching "
+                        f"{query!r} after {attempts} attempts — back off.")
+                time.sleep(_backoff_with_jitter(attempt, base_s=4.0, cap_s=12.0))
+                continue
+            try:
+                return parse_customer_search_html(resp.text)
+            except ZenithError:
+                # Not a results page (5xx-as-200 / degraded render) — retry.
+                if is_last:
+                    raise
+                time.sleep(_backoff_with_jitter(attempt, base_s=1.5, cap_s=8.0))
+                continue
+        raise ZenithError(f"Exhausted retries searching {query!r}.")
+
+    def fetch_customer_by_query(
+        self, query: str, *, timeout_s: float = 90.0, max_attempts: int = 4,
+    ) -> CustomerRecord:
+        """Fetch one customer by ID *or* name — the bulk lookup's entry point.
+
+        All-digits input is treated as a customer ID (today's behavior). Anything
+        else is name-searched and resolved to an ID: a single match wins; several
+        matches resolve only on a unique exact (case/space-insensitive) name;
+        otherwise CustomerAmbiguousError lists the candidates. The returned
+        record always carries the REAL numeric customer_id.
+        """
+        q = " ".join(str(query).split())
+        if q.isdigit():
+            return self.fetch_customer(q, timeout_s=timeout_s, max_attempts=max_attempts)
+        matches = self.search_customers(q, timeout_s=timeout_s, max_attempts=max_attempts)
+        if not matches:
+            raise CustomerNotFoundError(f"No customer matches the name {q!r}.")
+        if len(matches) > 1:
+            key = q.casefold()
+            exact = [m for m in matches if " ".join(m.name.split()).casefold() == key]
+            if len(exact) != 1:
+                shown = "; ".join(
+                    f"{m.customer_id}={m.name or '(no name)'}" for m in matches[:8])
+                more = f" … +{len(matches) - 8} more" if len(matches) > 8 else ""
+                raise CustomerAmbiguousError(
+                    f"AMBIGUOUS: {len(matches)} customers match {q!r} — "
+                    f"re-run with the ID. Candidates: {shown}{more}")
+            matches = exact
+        return self.fetch_customer(
+            matches[0].customer_id, timeout_s=timeout_s, max_attempts=max_attempts)
+
 
 # ---------------------------------------------------------------------------
 # Concurrent bulk fetcher
@@ -534,7 +691,9 @@ def fetch_many(
                 error="cancelled", checked_at=_now_iso(),
             )
         try:
-            record = session.fetch_customer(cid)
+            # ID or NAME — all-digits goes straight to the ID handlers, anything
+            # else is name-searched and resolved (record carries the real ID).
+            record = session.fetch_customer_by_query(cid)
             result = LookupResult(
                 customer_id=cid, status=STATUS_OK, record=record,
                 checked_at=_now_iso(),
@@ -542,6 +701,12 @@ def fetch_many(
         except CustomerNotFoundError as exc:
             result = LookupResult(
                 customer_id=cid, status=STATUS_NOT_FOUND,
+                error=str(exc), checked_at=_now_iso(),
+            )
+        except CustomerAmbiguousError as exc:
+            # Several name matches, none exact — needs a human choice, never retried.
+            result = LookupResult(
+                customer_id=cid, status=STATUS_ERROR,
                 error=str(exc), checked_at=_now_iso(),
             )
         except SessionExpiredError as exc:
@@ -614,7 +779,8 @@ def fetch_many(
         if r.status != STATUS_ERROR:
             return False
         err = r.error or ""
-        return "cancelled" not in err and "SessionExpired" not in err
+        return ("cancelled" not in err and "SessionExpired" not in err
+                and "AMBIGUOUS" not in err)
 
     by_id: dict[str, LookupResult] = {}
     for r in results:

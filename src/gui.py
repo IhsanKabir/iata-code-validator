@@ -5433,10 +5433,17 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_col_combo = ttk.Combobox(
             body, textvariable=self.zenith_column_name, state="readonly",
         )
-        ttk.Label(body, text="ID column:", width=14, anchor="w").grid(
+        ttk.Label(body, text="ID/Name column:", width=14, anchor="w").grid(
             row=2, column=0, sticky="w", padx=(2, 4), pady=4,
         )
         self.zenith_col_combo.grid(row=2, column=1, sticky="ew", padx=(0, 4), pady=4)
+        ttk.Label(
+            body, style="Hint.TLabel",
+            text=(
+                "The column may mix 8-digit Customer IDs and customer/agency NAMES — "
+                "names are searched in Zenith and resolved to their ID automatically."
+            ),
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=2, pady=(0, 2))
         body.columnconfigure(1, weight=1)
 
         # ----- Throughput controls -----
@@ -7394,7 +7401,7 @@ class App(WhatsAppMixin, HealthMixin):
 
     def _zenith_pick_input(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select Excel with Customer IDs",
+            title="Select Excel with Customer IDs or Names",
             filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
         )
         if not path:
@@ -7533,7 +7540,7 @@ class App(WhatsAppMixin, HealthMixin):
         col = self.zenith_column_name.get().strip()
         if not in_path or not sheet or not col:
             messagebox.showerror(
-                "Zenith", "Pick an input file, sheet, and ID column first.",
+                "Zenith", "Pick an input file, sheet, and ID/Name column first.",
             )
             return
         out_dir = Path(self.zenith_output_dir.get().strip() or str(Path.home()))
@@ -7545,7 +7552,7 @@ class App(WhatsAppMixin, HealthMixin):
             messagebox.showerror("Zenith", f"Could not read IDs: {exc}")
             return
         if not ids:
-            messagebox.showerror("Zenith", "No IDs found in that column.")
+            messagebox.showerror("Zenith", "No IDs or names found in that column.")
             return
         if self.zenith_test_mode.get():
             ids = ids[:100]

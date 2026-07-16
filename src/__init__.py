@@ -2,4 +2,4 @@
 movement, Zenith (customer / flight loads / history / PNR / passenger),
 and a Bulk Mailer (Outlook / Graph / SMTP)."""
 
-__version__ = "1.29.7"
+__version__ = "1.30.0"

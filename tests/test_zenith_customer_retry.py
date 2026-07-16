@@ -155,6 +155,11 @@ class _FakeSession:
             raise zenith_client.CustomerNotFoundError(f"not found {cid}")
         return zenith_client.parse_customer_html(_OK_HTML, cid)
 
+    # fetch_many now routes through the ID-or-name entry point; these tests
+    # exercise ID semantics, so delegate straight to fetch_customer.
+    def fetch_customer_by_query(self, cid, **kw):
+        return self.fetch_customer(cid, **kw)
+
 
 def _final(results):
     by_id = {}

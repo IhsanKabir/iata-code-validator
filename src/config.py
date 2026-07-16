@@ -178,6 +178,7 @@ ZENITH_OUTPUT_COLUMNS = [
     "Registration Date",
     "Error",
     "Checked At",
+    "Search Input",   # the name the user searched, when the row was a name lookup
 ]
 
 ZENITH_CACHE_DB = APP_DIR / "zenith_cache.sqlite"
