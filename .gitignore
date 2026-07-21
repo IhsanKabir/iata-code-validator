@@ -39,3 +39,8 @@ tests/fixtures/
 Thumbs.db
 .DS_Store
 build_log*.txt
+
+# PyInstaller swap backups + staging (local only)
+dist_old*/
+dist_old*
+dist_new/
