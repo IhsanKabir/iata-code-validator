@@ -17,4 +17,4 @@ pyarrow==24.0.0
 # Private shared analytics library â€” powers the Zenith > Reports sub-tab
 # (download list + the Instant Reports / mail-list windows). Built from the
 # analytics repo (`python scripts/build_wheel.py`) and vendored here.
-./wheels/usba_reporting-0.2.20-py3-none-any.whl
+./wheels/usba_reporting-0.2.21-py3-none-any.whl
