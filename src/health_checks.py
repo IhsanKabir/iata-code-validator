@@ -271,6 +271,7 @@ def _registry(app: str, verify_browser: bool = False) -> list:
         _integration("outlook", "Bulk Mailer · Outlook desktop", _check_outlook),
         _net("iata", "IATA Code Validator", getattr(config, "IATA_URL", "https://store.iata.org/ieccacfree"), "IATA's CheckACode site may be down or changed — retry later."),
         _net("bd_agency", "BD Travel Agency Lookup", "https://regtravelagency.gov.bd", "The BD registry site may be down — retry later."),
+        _net("natta", "Nepal NATTA Members", "https://natta.org.np/members/", "natta.org.np may be down — retry the extraction later."),
         _net("oep", "BD Overseas Movement (OEP)", "https://www.oep.gov.bd", "oep.gov.bd may be down — retry later."),
         _net("traffic", "Traffic Movement (sample source)", _TRAFFIC_SAMPLE, "A traffic data source is unreachable; others may still work."),
         _net("zenith", "Zenith GDS", ZENITH_URL, "Try the other host in the Zenith Server picker (usba vs asia)."),

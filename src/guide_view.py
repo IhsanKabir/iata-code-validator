@@ -199,7 +199,7 @@ _CONSOLE_TOPICS: tuple[Topic, ...] = (
                             "may have changed or be unreachable."),),
     ),
     Topic(
-        key="bd", icon="🏢", title="BD Travel Agency Lookup",
+        key="bd", icon="🏢", title="Travel Agency Lookup · Bangladesh",
         tagline="Look up Bangladesh travel agencies from regtravelagency.gov.bd.",
         flow=("Refresh list", "Full export or Lookup", "Excel out"),
         steps=(
@@ -213,6 +213,26 @@ _CONSOLE_TOPICS: tuple[Topic, ...] = (
               "Each matched row is tagged with how it matched. Toggle name / licence / "
               "address matching and whether to include expired agencies."),
         ),
+    ),
+    Topic(
+        key="natta", icon="🇳🇵", title="Travel Agency Lookup · Nepal (NATTA)",
+        tagline="Extract Nepal's full NATTA member directory with contacts, on demand.",
+        flow=("Extract", "Wait a few minutes", "Excel out"),
+        steps=(
+            S("⬇", "Extract member directory now",
+              "Fetches natta.org.np's A–Z member index, then every member's page — "
+              "owner name & designation, telephone, office address, email, website, "
+              "member ID and photo link. Roughly 650 pages, a few minutes."),
+            S("⏹", "Stop any time",
+              "Stop finishes the in-flight pages and still writes a partial Excel; "
+              "rerun later for a fresh full copy."),
+            S("📊", "One row per member",
+              "The Status column marks any page the NATTA site itself failed to "
+              "serve, so you always know coverage. Rerun whenever you need "
+              "up-to-date contacts."),
+        ),
+        callouts=(C("note", "If the extraction fails immediately, check the Health tab — "
+                            "natta.org.np may be unreachable."),),
     ),
     Topic(
         key="traffic", icon="✈️", title="Traffic Movement",

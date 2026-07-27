@@ -181,6 +181,24 @@ ZENITH_OUTPUT_COLUMNS = [
     "Search Input",   # the name the user searched, when the row was a name lookup
 ]
 
+# NATTA (Nepal) member-directory export
+NATTA_OUTPUT_COLUMNS = [
+    "Member ID",
+    "Agency Name",
+    "Owner Name",
+    "Designation",
+    "Telephone",
+    "Office Address",
+    "Email Address",
+    "Website",
+    "Company Name (page)",
+    "Member ID (page)",
+    "Photo URL",
+    "Other Fields",
+    "Member Page",
+    "Status",
+]
+
 ZENITH_CACHE_DB = APP_DIR / "zenith_cache.sqlite"
 
 # Bulk Mailer tab — send-log so re-runs skip already-sent rows.

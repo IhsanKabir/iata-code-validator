@@ -20,6 +20,7 @@ from .config import (
     OEP_OUTPUT_COLUMNS_GENDER_SUMMARY,
     OUTPUT_COLUMNS,
     ZENITH_FLIGHT_OUTPUT_COLUMNS,
+    NATTA_OUTPUT_COLUMNS,
     ZENITH_OUTPUT_COLUMNS,
 )
 from .parser import LookupResult
@@ -894,6 +895,44 @@ def build_zenith_output_path(folder: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return folder / f"zenith_customers_{timestamp}.xlsx"
+
+
+def write_natta_members(path: Path, members: Iterable) -> None:
+    """Flat sheet of natta_client.NattaMember rows in NATTA_OUTPUT_COLUMNS order.
+    Unrecognised page fields are folded into 'Other Fields' as 'Label: value; …'
+    so a site layout addition is captured without a code change."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "NATTA Members"
+    ws.append(NATTA_OUTPUT_COLUMNS)
+    for m in members:
+        ws.append([
+            m.member_id,
+            m.name,
+            m.owner_name,
+            m.designation,
+            m.telephone,
+            m.office_address,
+            m.email,
+            m.website,
+            m.company_name,
+            m.member_id_page,
+            m.photo_url,
+            "; ".join(f"{k}: {v}" for k, v in (m.extras or {}).items()),
+            m.url,
+            m.status,
+        ])
+    for col, w in (("A", 14), ("B", 40), ("C", 26), ("D", 20), ("E", 22),
+                   ("F", 34), ("G", 32), ("H", 26), ("M", 52)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+    wb.save(path)
+
+
+def build_natta_output_path(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return folder / f"natta_members_{timestamp}.xlsx"
 
 
 def write_zenith_flight_loads(path: Path, rows: Iterable) -> None:

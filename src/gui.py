@@ -86,6 +86,12 @@ MSG_BD_DONE = "bd_done"
 MSG_BD_ERROR = "bd_error"
 MSG_BD_REFRESHED = "bd_refreshed"   # payload: (count:int, last_refresh:str)
 
+# NATTA (Nepal) member-directory worker → GUI message types
+MSG_NATTA_LOG = "natta_log"
+MSG_NATTA_PROGRESS = "natta_progress"   # payload: (done:int, total:int, msg:str)
+MSG_NATTA_DONE = "natta_done"           # payload: dict (path, count, ok)
+MSG_NATTA_ERROR = "natta_error"
+
 # OEP worker → GUI message types
 MSG_OEP_LOG = "oep_log"
 MSG_OEP_DONE = "oep_done"         # payload: dict (see _oep_worker_run)
@@ -190,6 +196,7 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_ZENITH_BULK_DONE: ("zenith_pnr_bulk", None),
     MSG_OEP_DONE: ("oep_movement", None),
     MSG_TRAFFIC_DONE: ("traffic_movement", None),
+    MSG_NATTA_DONE: ("natta_extract", "count"),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
     MSG_UPDATE_FOUND: ("update_available", None),
     MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
@@ -204,6 +211,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
     MSG_BD_ERROR: "bd_error",
     MSG_OEP_ERROR: "oep_error",
     MSG_TRAFFIC_ERROR: "traffic_error",
+    MSG_NATTA_ERROR: "natta_error",
     MSG_ZENITH_ERROR: "zenith_customer_error",
     MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
     MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
@@ -254,6 +262,11 @@ class App(WhatsAppMixin, HealthMixin):
         self._bd_sheet_columns: list[str] = []
         self._bd_worker: threading.Thread | None = None
         self._bd_cache = BDAgencyCache(config.BD_CACHE_DB)
+
+        # ----- NATTA (Nepal) sub-tab state -----
+        self.natta_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self._natta_stop_flag = threading.Event()
+        self._natta_worker: threading.Thread | None = None
 
         # ----- OEP tab state -----
         from datetime import date, timedelta
@@ -1008,7 +1021,7 @@ class App(WhatsAppMixin, HealthMixin):
         # Movement, alongside the air-traffic sources.
         self._tab_base_labels = {
             iata_tab: "IATA Code Validator",
-            bd_tab: "BD Travel Agency Lookup",
+            bd_tab: "Travel Agency Lookup",   # sub-tabs: Bangladesh registry + Nepal NATTA
             traffic_tab: "Traffic Movement",
             zenith_tab: "Zenith",
             mailer_tab: "Bulk Mailer",
@@ -2346,6 +2359,18 @@ class App(WhatsAppMixin, HealthMixin):
     # ------------------------------------------------------------------
 
     def _build_bd_tab(self, parent: ttk.Frame) -> None:
+        # Two directories under one roof: the Bangladesh government registry
+        # (cached, name-matchable) and Nepal's NATTA member directory (scraped
+        # on demand). Mirrors the Traffic tab's inner-notebook pattern.
+        inner_nb = ttk.Notebook(parent)
+        inner_nb.pack(fill="both", expand=True)
+        bd_inner = ttk.Frame(inner_nb)
+        natta_inner = ttk.Frame(inner_nb)
+        inner_nb.add(bd_inner, text="Bangladesh — Govt Registry")
+        inner_nb.add(natta_inner, text="Nepal — NATTA Members")
+        self._build_natta_tab(natta_inner)
+        parent = bd_inner            # the existing BD form packs into sub-tab 1
+
         # ----- Cached data + Refresh action -----
         body = self._section(parent, "Cached agency list  ·  regtravelagency.gov.bd")
         row = ttk.Frame(body)
@@ -4151,6 +4176,31 @@ class App(WhatsAppMixin, HealthMixin):
             self._bd_log(f"ERROR: {payload}")
             messagebox.showerror("BD Agency Lookup — Error", str(payload))
             self._bd_reset_buttons()
+        # ------ NATTA (Nepal) messages ------
+        elif kind == MSG_NATTA_LOG:
+            self._natta_log(str(payload))
+        elif kind == MSG_NATTA_PROGRESS:
+            done, total, msg = payload  # type: ignore[misc]
+            self.natta_progress_bar["maximum"] = max(1, total)
+            self.natta_progress_bar["value"] = done
+            self.natta_progress_label.configure(text=msg)
+        elif kind == MSG_NATTA_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            note = " (stopped early — partial list)" if info.get("stopped") else ""
+            self._natta_log(
+                f"Done{note}: {info.get('ok', 0):,} of {info.get('count', 0):,} members "
+                f"extracted. File: {info.get('path', '')}")
+            self.natta_progress_label.configure(text=f"Done{note}.")
+            messagebox.showinfo(
+                "NATTA — Done",
+                f"Extracted {info.get('ok', 0):,} of {info.get('count', 0):,} members{note}."
+                f"\n\nOutput:\n{info.get('path', '')}")
+            self._natta_reset_buttons()
+        elif kind == MSG_NATTA_ERROR:
+            self._natta_log(f"ERROR: {payload}")
+            self.natta_progress_label.configure(text="Failed.")
+            messagebox.showerror("NATTA — Error", str(payload))
+            self._natta_reset_buttons()
         # ------ OEP messages ------
         elif kind == MSG_OEP_BUSY:
             self.oep_status_label.configure(text=str(payload))
@@ -5053,6 +5103,118 @@ class App(WhatsAppMixin, HealthMixin):
     def _bd_reset_buttons(self) -> None:
         self.btn_bd_refresh.configure(state="normal")
         self.btn_bd_run.configure(state="normal")
+
+    # ==================================================================
+    # NATTA (Nepal) member directory — extract-on-demand sub-tab
+    # ==================================================================
+
+    def _build_natta_tab(self, parent: ttk.Frame) -> None:
+        body = self._section(
+            parent, "NATTA member directory  ·  natta.org.np/members",
+            help_text=(
+                "Fetches the A–Z members index, then EVERY member's detail page, "
+                "and writes one Excel row per member: owner name & designation, "
+                "telephone, office address, email, website, member ID and photo "
+                "link. ~650 pages, a few minutes — run it whenever you need a "
+                "fresh copy. A member page the site itself fails to serve is "
+                "marked in the Status column rather than silently dropped."
+            ),
+        )
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(2, 0))
+        self.btn_natta_run = ttk.Button(
+            row, text="⬇  Extract member directory now",
+            command=self._natta_run, style="Primary.TButton",
+        )
+        self.btn_natta_run.pack(side="left")
+        self.btn_natta_stop = ttk.Button(
+            row, text="Stop", command=self._natta_stop, state="disabled",
+            style="Danger.TButton",
+        )
+        self.btn_natta_stop.pack(side="left", padx=(8, 0))
+
+        # ----- Output -----
+        body = self._section(parent, "Output")
+        out_entry = ttk.Entry(body, textvariable=self.natta_output_dir)
+        out_btn = ttk.Button(body, text="Browse...", command=self._natta_pick_output)
+        self._form_row(body, 0, "Folder:", out_entry, suffix=out_btn)
+
+        # ----- Progress -----
+        prog = self._section(parent, "Progress")
+        self.natta_progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.natta_progress_bar.pack(fill="x")
+        self.natta_progress_label = ttk.Label(
+            prog, text="Click Extract to pull the full member list with contacts.",
+            style="Hint.TLabel",
+        )
+        self.natta_progress_label.pack(anchor="w", pady=(2, 0))
+
+        # ----- Log -----
+        body = self._section(parent, "Log")
+        log_box = ttk.Frame(body)
+        log_box.pack(fill="both", expand=True)
+        self.natta_log_text = tk.Text(
+            log_box, height=10, wrap="none", font=("Consolas", 9),
+            relief="flat", borderwidth=1, highlightthickness=1,
+            highlightbackground="#cbd5e1",
+        )
+        self.natta_log_text.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(log_box, command=self.natta_log_text.yview)
+        scroll.pack(side="right", fill="y")
+        self.natta_log_text.configure(yscrollcommand=scroll.set, state="disabled")
+
+    def _natta_pick_output(self) -> None:
+        folder = filedialog.askdirectory(title="Choose output folder")
+        if folder:
+            self.natta_output_dir.set(folder)
+
+    def _natta_log(self, msg: str) -> None:
+        self._append_log(self.natta_log_text, msg)
+
+    def _natta_stop(self) -> None:
+        self._natta_stop_flag.set()
+        self._natta_log("Stopping after in-flight pages… a partial Excel will still be written.")
+
+    def _natta_run(self) -> None:
+        if self._natta_worker is not None and self._natta_worker.is_alive():
+            return
+        out_dir = Path(self.natta_output_dir.get().strip() or str(Path.home()))
+        self._natta_stop_flag.clear()
+        self.btn_natta_run.configure(state="disabled")
+        self.btn_natta_stop.configure(state="normal")
+        self.natta_progress_bar.configure(value=0, maximum=1)
+        self._natta_log("Fetching the members index from natta.org.np …")
+        self._natta_worker = threading.Thread(
+            target=self._natta_worker_run, args=(out_dir,), daemon=True,
+        )
+        self._natta_worker.start()
+
+    def _natta_worker_run(self, out_dir: Path) -> None:
+        from . import natta_client
+
+        def progress(done: int, total: int, msg: str) -> None:
+            self._post(MSG_NATTA_PROGRESS, (done, total, msg))
+
+        try:
+            members = natta_client.fetch_all_members(
+                progress_cb=progress, stop_event=self._natta_stop_flag,
+            )
+            if not members:
+                raise RuntimeError("No members fetched — check the connection and retry.")
+            out_path = excel_io.build_natta_output_path(out_dir)
+            excel_io.write_natta_members(out_path, members)
+            ok = sum(1 for m in members if m.status == "OK")
+            self._post(MSG_NATTA_DONE, {
+                "path": str(out_path), "count": len(members), "ok": ok,
+                "stopped": self._natta_stop_flag.is_set(),
+            })
+        except Exception as exc:  # noqa: BLE001 — worker edge: surface everything
+            log.exception("NATTA extraction failed")
+            self._post(MSG_NATTA_ERROR, f"{type(exc).__name__}: {exc}")
+
+    def _natta_reset_buttons(self) -> None:
+        self.btn_natta_run.configure(state="normal")
+        self.btn_natta_stop.configure(state="disabled")
 
     # ==================================================================
     # Auth + status bar
