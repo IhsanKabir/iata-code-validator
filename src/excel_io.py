@@ -1201,6 +1201,56 @@ def _apply_load_factor_cf(ws, col_letter: str, last_row: int) -> None:
     )
 
 
+def by_date_keys(rows) -> set[str]:
+    """The distinct 'DD/MM/YYYY' dates in a Flight Loads run."""
+    return {getattr(r, "flight_date", "") for r in rows if getattr(r, "flight_date", "")}
+
+
+def _looks_like_ordered_sheet(ws) -> bool:
+    """True for a cross-tab load sheet: 'Flight No' / 'Leg/Sector' in row 2, real
+    dates across row 1, and per-date 'Capacity' labels in row 2.
+
+    Deliberately strict. The workbook may also hold hand-built summaries and
+    seats grids whose row 2 also starts with 'Flight No' — appending 16-column
+    date blocks onto one of those corrupts it, which is exactly what the old
+    `wb.active` fallback did.
+    """
+    a = str(ws.cell(row=2, column=1).value or "").strip().lower()
+    b = str(ws.cell(row=2, column=2).value or "").strip().lower()
+    if not (a.startswith("flight") and b.startswith("leg")):
+        return False
+    if not _read_existing_dates(ws):
+        return False                       # row 1 carries no DD/MM/YYYY headers
+    width = min(ws.max_column, 400)
+    return any(str(ws.cell(row=2, column=c).value or "").strip().lower() == "capacity"
+               for c in range(3, width + 1))
+
+
+def _find_ordered_sheet(wb, dates: set[str] | None = None):
+    """The sheet a Flight Loads run should be appended to.
+
+    Prefers the canonical ``Ordered Data`` sheet; otherwise the ordered-looking
+    sheet already holding dates from the SAME year(s) as the incoming run (so a
+    2026 pull lands on the '2026' sheet), then the one with the most dates.
+    Raises rather than guessing — never falls back to the active sheet.
+    """
+    if ORDERED_REPORT_SHEET in wb.sheetnames:
+        return wb[ORDERED_REPORT_SHEET]
+    candidates = [ws for ws in wb.worksheets if _looks_like_ordered_sheet(ws)]
+    if not candidates:
+        raise ValueError(
+            f"{wb!r}: no '{ORDERED_REPORT_SHEET}' sheet and no sheet that looks like a "
+            "cross-tab load report (row 2 needs 'Flight No' / 'Leg/Sector' and per-date "
+            "'Capacity' columns, row 1 the dates). Pick the right workbook, or add an "
+            f"'{ORDERED_REPORT_SHEET}' sheet.")
+    years = {d.rsplit("/", 1)[-1] for d in (dates or set())}
+    def score(ws):
+        existing = _read_existing_dates(ws)
+        same_year = sum(1 for k in existing if k.rsplit("/", 1)[-1] in years)
+        return (same_year, len(existing))
+    return max(candidates, key=score)
+
+
 def append_flight_loads_to_ordered_report(
     report_path: Path,
     flight_load_rows: Iterable,
@@ -1225,11 +1275,7 @@ def append_flight_loads_to_ordered_report(
     report_path = Path(report_path)
     if report_path.exists():
         wb = load_workbook(report_path)
-        ws = (
-            wb[ORDERED_REPORT_SHEET]
-            if ORDERED_REPORT_SHEET in wb.sheetnames
-            else wb.active
-        )
+        ws = _find_ordered_sheet(wb, by_date_keys(rows))
     elif create_if_missing:
         wb = Workbook()
         ws = wb.active
