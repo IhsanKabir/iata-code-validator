@@ -1,4 +1,4 @@
-"""In-app self-updater for the IATA Code Validator .exe.
+"""In-app self-updater for the Travel Ops Console .exe.
 
 Workflow:
   1. check_for_update() asks GitHub Releases API for the latest non-draft
@@ -43,7 +43,12 @@ log = logging.getLogger(__name__)
 
 GITHUB_REPO = "IhsanKabir/iata-code-validator"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-ASSET_NAME = "IATACodeValidator.exe"
+# The exe was renamed to TravelOpsConsole.exe. Releases publish BOTH names
+# (identical bytes) so already-installed copies, which look for the legacy
+# name, keep auto-updating. Prefer the new name, accept the old one.
+ASSET_NAME = "TravelOpsConsole.exe"
+LEGACY_ASSET_NAME = "IATACodeValidator.exe"
+ASSET_NAMES = (ASSET_NAME, LEGACY_ASSET_NAME)
 
 USER_AGENT = f"IATACodeValidator-Updater/{__version__}"
 
@@ -175,12 +180,13 @@ def check_for_update(timeout: int = 15) -> UpdateInfo | None:
 
     tag = (data.get("tag_name") or "").strip()
     notes = data.get("body") or ""
+    assets = data.get("assets") or []
     asset = next(
-        (a for a in (data.get("assets") or []) if a.get("name") == ASSET_NAME),
+        (a for n in ASSET_NAMES for a in assets if a.get("name") == n),
         None,
     )
     if not tag or not asset:
-        log.warning("Latest release has no tag or no %s asset", ASSET_NAME)
+        log.warning("Latest release has no tag or no %s asset", " / ".join(ASSET_NAMES))
         return None
     return UpdateInfo(
         latest_version=tag.lstrip("v"),
@@ -364,7 +370,7 @@ _SWAP_BAT_TEMPLATE = textwrap.dedent("""\
         REM Could not move the running exe. Bail out with a popup and
         REM leave the staged copy in place so the user can replace
         REM manually. The original keeps working.
-        msg * "Update failed: could not replace IATACodeValidator.exe.{newline}"^
+        msg * "Update failed: could not replace the app .exe.{newline}"^
             "Please close the app and copy:{newline}"^
             "%STAGED%{newline}over %TARGET%."
         goto cleanup

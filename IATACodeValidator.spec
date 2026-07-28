@@ -141,7 +141,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="IATACodeValidator",
+    name="TravelOpsConsole",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
