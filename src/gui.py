@@ -263,6 +263,9 @@ class App(WhatsAppMixin, HealthMixin):
         self._bd_worker: threading.Thread | None = None
         self._bd_cache = BDAgencyCache(config.BD_CACHE_DB)
 
+        # Flight Loads: which EXTRA report the pull writes (flat is always written)
+        self.zenith_fl_format = tk.StringVar(value=excel_io.FLIGHT_LOAD_FORMATS[0])
+
         # ----- NATTA (Nepal) sub-tab state -----
         self.natta_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
         self._natta_stop_flag = threading.Event()
@@ -5899,6 +5902,15 @@ class App(WhatsAppMixin, HealthMixin):
         # Append the LAST run's data into a user-picked Ordered Report
         # (cross-tab one-date-per-block format). Enabled only after a
         # successful run because we need the rows in memory.
+        # Format picker — read when the run FINISHES, so it can be set before or
+        # during the pull. The flat rows file is always written as well, so the raw
+        # pulled data is never lost to a format choice.
+        ttk.Label(ctl, text="  Report format:").pack(side="left", padx=(12, 4))
+        self.zenith_fl_format_combo = ttk.Combobox(
+            ctl, textvariable=self.zenith_fl_format, state="readonly", width=26,
+            values=list(excel_io.FLIGHT_LOAD_FORMATS),
+        )
+        self.zenith_fl_format_combo.pack(side="left")
         self.btn_zenith_fl_append_ordered = ttk.Button(
             ctl, text="Append to Ordered Report…",
             command=self._zenith_fl_append_ordered,
@@ -7941,6 +7953,8 @@ class App(WhatsAppMixin, HealthMixin):
             "date_from": date_from, "date_to": date_to,
             "page_size": page_size, "chunk_days": chunk_days,
             "delay_s": delay_s, "out_path": out_path,
+            # read HERE (run start) so changing it mid-pull cannot half-apply
+            "fmt": self.zenith_fl_format.get(),
         }
         self._zenith_fl_worker = threading.Thread(
             target=self._zenith_fl_worker_run, args=(cfg,), daemon=True,
@@ -7984,6 +7998,29 @@ class App(WhatsAppMixin, HealthMixin):
         except Exception as exc:  # noqa: BLE001
             log.exception("Flight-loads Excel write failed")
             self._post(MSG_ZENITH_FL_ERROR, f"Excel write failed: {exc}")
+            return
+
+        # The chosen extra format, written from the SAME rows. A failure here must
+        # not lose the run — the flat workbook above is already on disk, so report
+        # the problem and carry on.
+        fmt = cfg.get("fmt") or excel_io.FLIGHT_LOAD_FORMATS[0]
+        if fmt != excel_io.FLIGHT_LOAD_FORMATS[0]:
+            try:
+                extra = excel_io.build_flight_load_format_path(
+                    Path(cfg["out_path"]).parent, fmt)
+                if fmt == "Cross-tab (Ordered layout)":
+                    excel_io.append_flight_loads_to_ordered_report(
+                        extra, rows, create_if_missing=True)
+                elif fmt == "Load Factor in Seats":
+                    excel_io.write_flight_loads_seats_report(extra, rows)
+                elif fmt == "Daily Flight Load snapshot":
+                    excel_io.write_flight_loads_daily_snapshot(extra, rows)
+                self._post(MSG_ZENITH_FL_LOG, f"{fmt} written: {extra}")
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Flight-loads extra format failed")
+                self._post(MSG_ZENITH_FL_LOG,
+                           f"[WARN] {fmt} could not be written ({exc}). "
+                           "The flat rows workbook was still saved.")
             return
         # Keep the rows in memory so the user can later append them to
         # an Ordered Report without re-running the fetch.

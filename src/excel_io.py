@@ -2103,3 +2103,145 @@ def write_zenith_pnr_bulk_from_details(path: Path, details: list) -> int:
     results = [(d.pnr_code, d) for d in details if getattr(d, "pnr_code", "")]
     write_zenith_pnr_bulk(path, results, errors={})
     return len(results)
+
+
+# ---------------------------------------------------------------------------
+# Alternative output formats for a Flight Loads pull
+#
+# The pull holds every row in memory, so the format is only a choice of writer.
+# The flat sheet is always written; these are the extras offered in the tab's
+# "Report format" picker. All three read the SAME pulled rows, so the numbers
+# cannot drift between formats.
+# ---------------------------------------------------------------------------
+
+FLIGHT_LOAD_FORMATS = (
+    "Flat rows only",
+    "Cross-tab (Ordered layout)",
+    "Load Factor in Seats",
+    "Daily Flight Load snapshot",
+)
+
+# how many forward dates a snapshot sheet shows, matching the ops team's file
+_SNAPSHOT_WINDOW_DAYS = 15
+
+
+def flight_load_leg_totals(rows) -> dict:
+    """(date, flight, leg) -> {capacity, sold} from pulled FlightLoadRows.
+
+    A leg can appear once per cabin, so cabins are summed. Capacity comes from
+    'seats_available' ("13/410 97%" -> 410) and sold from 'seats_confirmed'
+    ("[152]") — both already parsed by the cross-tab writer, so every format
+    agrees by construction. Rows whose numbers can't be read are skipped rather
+    than counted as zero.
+    """
+    out: dict[tuple, dict] = {}
+    for r in rows:
+        cap, _pct = _seats_available_to_numbers(getattr(r, "seats_available", "") or "")
+        sold = _bracketed_int(getattr(r, "seats_confirmed", "") or "")
+        if cap is None and sold is None:
+            continue
+        key = (str(getattr(r, "flight_date", "")).strip(),
+               "".join(str(getattr(r, "flight_number", "")).strip().upper().split()),
+               str(getattr(r, "leg_route", "")).strip().upper())
+        agg = out.setdefault(key, {"capacity": 0, "sold": 0, "std": "",
+                                   "aircraft": ""})
+        agg["capacity"] += cap or 0
+        agg["sold"] += sold or 0
+        agg["std"] = agg["std"] or str(getattr(r, "departure_time", "") or "")
+        agg["aircraft"] = agg["aircraft"] or str(getattr(r, "aircraft", "") or "")
+    return out
+
+
+def write_flight_loads_daily_snapshot(path: Path, rows, *,
+                                      window_days: int = _SNAPSHOT_WINDOW_DAYS) -> None:
+    """Write the ops team's "Daily Flight Load" shape: one sheet per date, the next
+    `window_days` departure dates across the columns, seats sold in the cells.
+
+    Mirrors the received files closely enough that the same reader parses it back.
+    """
+    totals = flight_load_leg_totals(rows)
+    if not totals:
+        raise ValueError("Nothing to write — no readable capacity/seat figures in the pull.")
+
+    def _d(text):
+        return datetime.strptime(text, "%d/%m/%Y").date()
+
+    dates = sorted({_d(k[0]) for k in totals if k[0]})
+    legs = sorted({(k[1], k[2]) for k in totals})
+    std_of = {}
+    for (dtxt, f, leg), v in totals.items():
+        std_of.setdefault((f, leg), v.get("std", ""))
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for day in dates:
+        window = [d for d in dates if 0 <= (d - day).days < window_days]
+        ws = wb.create_sheet(day.strftime("%d-%b-%Y").upper()[:31])
+        ws.cell(1, 4, "Daily Flight Load")
+        for j, d in enumerate(window):
+            ws.cell(2, 4 + j, datetime(d.year, d.month, d.day))
+            ws.cell(3, 4 + j, d.strftime("%a").upper())
+        for c, h in enumerate(("ROUTE", "FLIGHT NO", "STD"), 1):
+            ws.cell(3, c, h)
+        r = 4
+        for flight, leg in legs:
+            if not any((d.strftime("%d/%m/%Y"), flight, leg) in totals for d in window):
+                continue
+            ws.cell(r, 1, leg)
+            ws.cell(r, 2, flight)
+            ws.cell(r, 3, std_of.get((flight, leg), ""))
+            for j, d in enumerate(window):
+                v = totals.get((d.strftime("%d/%m/%Y"), flight, leg))
+                if v:
+                    ws.cell(r, 4 + j, v["sold"])
+            r += 1
+        for col, w in ((1, 11), (2, 11), (3, 14)):
+            ws.column_dimensions[get_column_letter(col)].width = w
+        ws.freeze_panes = "D4"
+    wb.save(path)
+
+
+def write_flight_loads_seats_report(path: Path, rows) -> None:
+    """Build the Load Factor in Seats analysis straight from a pull.
+
+    Delegates to the shared reporting builder so the layout and the
+    domestic / international / domestic-sector-of-international split stay in ONE
+    place. Capacity here is the figure Zenith reported for that very departure, so
+    unlike the daily-file route nothing is estimated.
+    """
+    try:
+        import pandas as pd
+        from reporting.builders import load_factor_seats as lfs
+    except ImportError as exc:  # pragma: no cover - packaging guard
+        raise RuntimeError(
+            "The reporting library is not installed in this build, so the "
+            f"Load Factor in Seats format is unavailable. ({exc})") from exc
+
+    totals = flight_load_leg_totals(rows)
+    recs = []
+    for (dtxt, flight, leg), v in totals.items():
+        if not dtxt or not v.get("capacity"):
+            continue                      # no capacity -> no load factor; skip, never guess
+        d = datetime.strptime(dtxt, "%d/%m/%Y").date()
+        recs.append({"d": d, "y": f"{d.year}", "flight": flight, "leg": leg,
+                     "capacity": float(v["capacity"]), "flown": float(v["sold"])})
+    if not recs:
+        raise ValueError("Nothing to build — no departures with a readable capacity.")
+    df = pd.DataFrame(recs)
+    stats, tree, dates_by_year, cells, mixed, intl_dest = lfs.shape(df)
+    wb = lfs.build(stats, tree, dates_by_year, cells, mixed, intl_dest,
+                   sorted(dates_by_year))
+    wb.save(path)
+
+
+def build_flight_load_format_path(folder: Path, fmt: str, stem_dt=None) -> Path:
+    """Output path for one of the extra formats (never collides with the flat file)."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    ts = (stem_dt or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    slug = {
+        "Cross-tab (Ordered layout)": "flight_loads_ordered",
+        "Load Factor in Seats": "load_factor_seats",
+        "Daily Flight Load snapshot": "daily_flight_load",
+    }.get(fmt, "flight_loads_extra")
+    return folder / f"{slug}_{ts}.xlsx"
