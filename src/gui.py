@@ -8005,17 +8005,24 @@ class App(WhatsAppMixin, HealthMixin):
         # the problem and carry on.
         fmt = cfg.get("fmt") or excel_io.FLIGHT_LOAD_FORMATS[0]
         if fmt != excel_io.FLIGHT_LOAD_FORMATS[0]:
+            out_dir = Path(cfg["out_path"]).parent
             try:
-                extra = excel_io.build_flight_load_format_path(
-                    Path(cfg["out_path"]).parent, fmt)
+                written: list = []
                 if fmt == "Cross-tab (Ordered layout)":
+                    dest = excel_io.build_flight_load_format_path(out_dir, fmt)
                     excel_io.append_flight_loads_to_ordered_report(
-                        extra, rows, create_if_missing=True)
+                        dest, rows, create_if_missing=True)
+                    written = [dest]
                 elif fmt == "Load Factor in Seats":
-                    excel_io.write_flight_loads_seats_report(extra, rows)
+                    dest = excel_io.build_flight_load_format_path(out_dir, fmt)
+                    excel_io.write_flight_loads_seats_report(dest, rows)
+                    written = [dest]
                 elif fmt == "Daily Flight Load snapshot":
-                    excel_io.write_flight_loads_daily_snapshot(extra, rows)
-                self._post(MSG_ZENITH_FL_LOG, f"{fmt} written: {extra}")
+                    # a Domestic AND an International workbook, matching how the
+                    # ops team's files arrive (their sector rides on the filename)
+                    written = excel_io.write_flight_loads_daily_snapshots(out_dir, rows)
+                for dest in written:
+                    self._post(MSG_ZENITH_FL_LOG, f"{fmt} written: {dest}")
             except Exception as exc:  # noqa: BLE001
                 log.exception("Flight-loads extra format failed")
                 self._post(MSG_ZENITH_FL_LOG,

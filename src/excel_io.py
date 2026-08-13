@@ -2152,6 +2152,47 @@ def flight_load_leg_totals(rows) -> dict:
     return out
 
 
+# Both endpoints here => the leg is DOMESTIC. The received files are split into a
+# Domestic and an International workbook, and the sector is carried by the FILE
+# NAME, so a combined file would be read back with the wrong sector.
+_BD_AIRPORTS = frozenset({"DAC", "CGP", "CXB", "ZYL", "JSR", "RJH", "BZL", "SPD"})
+
+
+def is_domestic_leg_route(leg: str) -> bool:
+    ends = [e.strip().upper() for e in str(leg or "").split("-")]
+    return len(ends) == 2 and all(e in _BD_AIRPORTS for e in ends)
+
+
+def write_flight_loads_daily_snapshots(folder: Path, rows, *, stem_dt=None,
+                                       window_days: int = _SNAPSHOT_WINDOW_DAYS) -> list:
+    """Write the ops team's PAIR of snapshot workbooks — Domestic and
+    International — exactly as they are received.
+
+    Splitting matters beyond tidiness: the sector of these files is carried by the
+    file NAME, so one mixed workbook would be read back as entirely international.
+    A sector with no legs in the pull is skipped rather than written empty.
+    Returns the paths actually written.
+    """
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    ts = (stem_dt or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    out = []
+    for label, want_dom in (("Domestic", True), ("International", False)):
+        subset = [r for r in rows
+                  if is_domestic_leg_route(getattr(r, "leg_route", "")) == want_dom]
+        if not subset:
+            continue
+        path = folder / f"Daily {label} Flight Load {ts}.xlsx"
+        try:
+            write_flight_loads_daily_snapshot(path, subset, window_days=window_days)
+        except ValueError:
+            continue          # nothing readable in this sector — skip, don't fail the run
+        out.append(path)
+    if not out:
+        raise ValueError("Nothing to write — no readable capacity/seat figures in the pull.")
+    return out
+
+
 def write_flight_loads_daily_snapshot(path: Path, rows, *,
                                       window_days: int = _SNAPSHOT_WINDOW_DAYS) -> None:
     """Write the ops team's "Daily Flight Load" shape: one sheet per date, the next

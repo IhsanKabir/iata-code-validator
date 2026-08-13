@@ -15,7 +15,9 @@ from src.excel_io import (
     FLIGHT_LOAD_FORMATS,
     build_flight_load_format_path,
     flight_load_leg_totals,
+    is_domestic_leg_route,
     write_flight_loads_daily_snapshot,
+    write_flight_loads_daily_snapshots,
 )
 
 
@@ -123,3 +125,40 @@ def test_seats_report_totals_match_the_pulled_rows(tmp_path):
     assert ws.cell(r, c + 7).value == want_cap       # Total Seats Offered
     assert ws.cell(r, c + 8).value == want_sold      # Total Seats Filled
     assert ws.cell(r, c + 9).value == want_cap - want_sold   # Total Empty Seats
+
+
+# --- the ops team's files come as a Domestic + an International workbook ---------
+
+def test_domestic_leg_classification():
+    assert is_domestic_leg_route("DAC-CGP") and is_domestic_leg_route("CXB-DAC")
+    assert not is_domestic_leg_route("CGP-DXB") and not is_domestic_leg_route("DAC-SIN")
+    assert not is_domestic_leg_route("DAC")            # malformed is never domestic
+
+
+def test_snapshot_writes_a_sector_split_pair(tmp_path):
+    """One mixed workbook would be read back as entirely international, because the
+    sector of these files rides on the FILE NAME — so the pair must be split."""
+    reader = pytest.importorskip("reporting.daily_load_reader")
+    made = write_flight_loads_daily_snapshots(tmp_path, _rows())
+    names = sorted(p.name for p in made)
+    assert len(made) == 2
+    assert any(n.startswith("Daily Domestic Flight Load") for n in names)
+    assert any(n.startswith("Daily International Flight Load") for n in names)
+
+    by_sector = {}
+    for p in made:
+        for r in reader.read_workbook(p):
+            by_sector.setdefault(r.sector, set()).add(r.leg_route)
+    assert by_sector["DOM"] == {"DAC-CGP"}          # BS101 + BS343's DAC-CGP sector
+    assert by_sector["INTL"] == {"CGP-DXB"}
+
+
+def test_snapshot_pair_skips_a_sector_with_no_legs(tmp_path):
+    only_dom = [r for r in _rows() if is_domestic_leg_route(r.leg_route)]
+    made = write_flight_loads_daily_snapshots(tmp_path, only_dom)
+    assert len(made) == 1 and made[0].name.startswith("Daily Domestic")
+
+
+def test_snapshot_pair_refuses_an_empty_pull(tmp_path):
+    with pytest.raises(ValueError):
+        write_flight_loads_daily_snapshots(tmp_path, [])
