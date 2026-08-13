@@ -162,3 +162,73 @@ def test_snapshot_pair_skips_a_sector_with_no_legs(tmp_path):
 def test_snapshot_pair_refuses_an_empty_pull(tmp_path):
     with pytest.raises(ValueError):
         write_flight_loads_daily_snapshots(tmp_path, [])
+
+
+# --- presentation: shading by FILL RATIO, merged bands, totals -------------------
+
+def test_cells_are_shaded_by_fill_ratio_not_raw_seats(tmp_path):
+    """A full 72-seat ATR and a full 410-seat widebody must BOTH read green — a
+    colour scale over raw seat counts would paint the ATR red."""
+    from src.excel_io import load_gradient_fill
+    p = tmp_path / "Daily Domestic Flight Load x.xlsx"
+    write_flight_loads_daily_snapshot(p, _rows())
+    ws = load_workbook(p)["12-AUG-2026"]
+
+    pos = {(ws.cell(r, 2).value, ws.cell(r, 1).value): r for r in range(4, ws.max_row + 1)}
+    small = ws.cell(pos[("BS101", "DAC-CGP")], 4)      # 70 of 72  -> ~97%
+    big = ws.cell(pos[("BS343", "DAC-CGP")], 4)        # 397 of 410 -> ~97%
+    assert small.value == 70 and big.value == 397
+
+    def _rgb(cell):
+        h = cell.fill.fgColor.rgb[-6:]
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+    # 97.2% vs 96.8% full — the colours track the RATIO, so they land within a
+    # few points of each other despite 70 vs 397 seats (a raw-count scale would
+    # put these at opposite ends)
+    assert all(abs(a - b) <= 6 for a, b in zip(_rgb(small), _rgb(big)))
+    assert small.fill.fgColor.rgb.endswith(load_gradient_fill(70 / 72).fgColor.rgb)
+    r, g, _b = _rgb(small)
+    assert g > r                                   # unmistakably on the green side
+
+
+def test_empty_flight_is_red_and_full_flight_is_green(tmp_path):
+    rows = [_Row("12/08/2026", "BS101", "DAC-CGP", "72/72 0%", "[0]"),
+            _Row("12/08/2026", "BS102", "CGP-DAC", "0/72 100%", "[72]")]
+    p = tmp_path / "Daily Domestic Flight Load y.xlsx"
+    write_flight_loads_daily_snapshot(p, rows)
+    ws = load_workbook(p)["12-AUG-2026"]
+    pos = {ws.cell(r, 2).value: r for r in range(4, ws.max_row + 1)}
+    assert ws.cell(pos["BS101"], 4).fill.fgColor.rgb.endswith("F8696B")   # red
+    assert ws.cell(pos["BS102"], 4).fill.fgColor.rgb.endswith("63BE7B")   # green
+
+
+def test_layout_matches_the_received_files(tmp_path):
+    p = tmp_path / "Daily Domestic Flight Load z.xlsx"
+    write_flight_loads_daily_snapshot(p, _rows())
+    ws = load_workbook(p)["12-AUG-2026"]
+    merged = {str(m) for m in ws.merged_cells.ranges}
+    assert "A1:C2" in merged                       # legend block, as in the source
+    assert any(m.startswith("D1:") for m in merged)  # title band over the dates
+    assert ws.cell(3, 1).value == "ROUTE" and ws.cell(3, 2).value == "FLIGHT NO"
+    assert ws.cell(3, 1).font.b and ws.cell(3, 1).font.sz == 14
+    assert ws.freeze_panes == "D4"
+    assert round(ws.column_dimensions["A"].width, 1) == 12.9
+
+
+def test_total_row_sums_seats_sold_per_date(tmp_path):
+    p = tmp_path / "Daily Domestic Flight Load t.xlsx"
+    write_flight_loads_daily_snapshot(p, _rows())
+    ws = load_workbook(p)["12-AUG-2026"]
+    last = ws.max_row
+    assert ws.cell(last, 1).value == "TOTAL"
+    # 12 Aug: BS343 DAC-CGP 397 + BS343 CGP-DXB 400 + BS101 DAC-CGP 70
+    assert ws.cell(last, 4).value == 397 + 400 + 70
+
+
+def test_total_row_is_not_read_back_as_a_flight(tmp_path):
+    """The TOTAL row must not survive a round-trip as a phantom leg."""
+    reader = pytest.importorskip("reporting.daily_load_reader")
+    p = tmp_path / "Daily Domestic Flight Load r.xlsx"
+    write_flight_loads_daily_snapshot(p, _rows())
+    assert all(r.flight_number.startswith("BS") for r in reader.read_workbook(p))

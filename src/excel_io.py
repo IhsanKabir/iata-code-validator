@@ -2193,13 +2193,42 @@ def write_flight_loads_daily_snapshots(folder: Path, rows, *, stem_dt=None,
     return out
 
 
+_SNAP_GRADIENT: dict = {}
+
+
+def load_gradient_fill(ratio: float):
+    """Excel's classic 3-colour scale: red (empty) -> yellow -> green (full).
+
+    Shading is driven by seats filled / CAPACITY, never by the raw seat count: a
+    full 72-seat ATR and a full 410-seat widebody must both read green, which a
+    scale over raw numbers would get exactly backwards.
+    """
+    from openpyxl.styles import PatternFill
+    ratio = max(0.0, min(1.0, float(ratio)))
+    red, yellow, green = (0xF8, 0x69, 0x6B), (0xFF, 0xEB, 0x84), (0x63, 0xBE, 0x7B)
+    a, b, t = ((red, yellow, ratio / 0.5) if ratio <= 0.5
+               else (yellow, green, (ratio - 0.5) / 0.5))
+    key = "%02X%02X%02X" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    f = _SNAP_GRADIENT.get(key)
+    if f is None:
+        f = _SNAP_GRADIENT[key] = PatternFill("solid", fgColor=key)
+    return f
+
+
 def write_flight_loads_daily_snapshot(path: Path, rows, *,
-                                      window_days: int = _SNAPSHOT_WINDOW_DAYS) -> None:
+                                      window_days: int = _SNAPSHOT_WINDOW_DAYS,
+                                      title: str = "Daily Flight Load") -> None:
     """Write the ops team's "Daily Flight Load" shape: one sheet per date, the next
     `window_days` departure dates across the columns, seats sold in the cells.
 
-    Mirrors the received files closely enough that the same reader parses it back.
+    Formatting follows the received files — merged title band over the date
+    columns, bold centred cells, thin borders — plus two things they lack: each
+    seat figure is shaded by how FULL that departure was (red -> green), and a
+    TOTAL row closes each sheet. Layout is unchanged where it matters, so the
+    reader written for the received files still parses this back.
     """
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
     totals = flight_load_leg_totals(rows)
     if not totals:
         raise ValueError("Nothing to write — no readable capacity/seat figures in the pull.")
@@ -2213,31 +2242,99 @@ def write_flight_loads_daily_snapshot(path: Path, rows, *,
     for (dtxt, f, leg), v in totals.items():
         std_of.setdefault((f, leg), v.get("std", ""))
 
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    title_fill = PatternFill("solid", fgColor="C4E59F")     # the source's green band
+    head_fill = PatternFill("solid", fgColor="FFFFFF")
+    total_fill = PatternFill("solid", fgColor="EDF0F5")
+    bold14 = Font(bold=True, size=14)
+    centre = Alignment(horizontal="center", vertical="center")
+
     wb = Workbook()
     wb.remove(wb.active)
     for day in dates:
         window = [d for d in dates if 0 <= (d - day).days < window_days]
         ws = wb.create_sheet(day.strftime("%d-%b-%Y").upper()[:31])
-        ws.cell(1, 4, "Daily Flight Load")
+        last_col = 3 + len(window)
+
+        # title band over the date columns, legend over the identity columns
+        c = ws.cell(1, 4, f"{title} — {day:%d %b %Y}")
+        c.font = Font(bold=True, size=14)
+        c.fill = title_fill
+        c.alignment = centre
+        c.border = border
+        if last_col > 4:
+            ws.merge_cells(start_row=1, start_column=4, end_row=1, end_column=last_col)
+        for col in range(4, last_col + 1):
+            ws.cell(1, col).fill = title_fill
+            ws.cell(1, col).border = border
+        legend = ws.cell(1, 1, "Shading = seats filled ÷ capacity  (red = empty, green = full)")
+        legend.font = Font(size=9, italic=True, color="595959")
+        legend.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=3)
+
         for j, d in enumerate(window):
-            ws.cell(2, 4 + j, datetime(d.year, d.month, d.day))
-            ws.cell(3, 4 + j, d.strftime("%a").upper())
-        for c, h in enumerate(("ROUTE", "FLIGHT NO", "STD"), 1):
-            ws.cell(3, c, h)
+            cell = ws.cell(2, 4 + j, datetime(d.year, d.month, d.day))
+            cell.number_format = "DD/MM/YYYY"
+            cell.font = bold14
+            cell.alignment = centre
+            cell.border = border
+            wd = ws.cell(3, 4 + j, d.strftime("%a").upper())
+            wd.font = bold14
+            wd.alignment = centre
+            wd.border = border
+        for col, h in enumerate(("ROUTE", "FLIGHT NO", "STD"), 1):
+            cell = ws.cell(3, col, h)
+            cell.font = bold14
+            cell.fill = head_fill
+            cell.alignment = centre
+            cell.border = border
+
         r = 4
         for flight, leg in legs:
             if not any((d.strftime("%d/%m/%Y"), flight, leg) in totals for d in window):
                 continue
-            ws.cell(r, 1, leg)
-            ws.cell(r, 2, flight)
-            ws.cell(r, 3, std_of.get((flight, leg), ""))
+            for col, val in ((1, leg), (2, flight), (3, std_of.get((flight, leg), ""))):
+                cell = ws.cell(r, col, val)
+                cell.font = bold14
+                cell.alignment = centre
+                cell.border = border
             for j, d in enumerate(window):
                 v = totals.get((d.strftime("%d/%m/%Y"), flight, leg))
-                if v:
-                    ws.cell(r, 4 + j, v["sold"])
+                cell = ws.cell(r, 4 + j)
+                cell.border = border
+                cell.alignment = centre
+                cell.font = bold14
+                if not v:
+                    continue                    # did not operate — left blank, not zero
+                cell.value = v["sold"]
+                cap = v.get("capacity") or 0
+                if cap:
+                    cell.fill = load_gradient_fill(v["sold"] / cap)
             r += 1
-        for col, w in ((1, 11), (2, 11), (3, 14)):
+
+        tot = ws.cell(r, 1, "TOTAL")
+        tot.font = bold14
+        tot.alignment = centre
+        tot.fill = total_fill
+        tot.border = border
+        for col in (2, 3):
+            ws.cell(r, col).fill = total_fill
+            ws.cell(r, col).border = border
+        for j, d in enumerate(window):
+            dtxt = d.strftime("%d/%m/%Y")
+            sold = sum(v["sold"] for (dd, _f, _l), v in totals.items() if dd == dtxt)
+            cell = ws.cell(r, 4 + j, sold or None)
+            cell.font = bold14
+            cell.alignment = centre
+            cell.fill = total_fill
+            cell.border = border
+
+        for col, w in ((1, 12.9), (2, 13.6), (3, 16.0)):
             ws.column_dimensions[get_column_letter(col)].width = w
+        for col in range(4, last_col + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 11.0
+        ws.row_dimensions[1].height = 30
         ws.freeze_panes = "D4"
     wb.save(path)
 
