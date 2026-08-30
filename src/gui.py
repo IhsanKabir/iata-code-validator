@@ -86,6 +86,12 @@ MSG_BD_DONE = "bd_done"
 MSG_BD_ERROR = "bd_error"
 MSG_BD_REFRESHED = "bd_refreshed"   # payload: (count:int, last_refresh:str)
 
+# Flight Change Authenticator worker → GUI message types
+MSG_FCA_LOG = "fca_log"
+MSG_FCA_PROGRESS = "fca_progress"      # payload: (done, total, msg)
+MSG_FCA_DONE = "fca_done"              # payload: dict(path, cases, flagged)
+MSG_FCA_ERROR = "fca_error"
+
 # NATTA (Nepal) member-directory worker → GUI message types
 MSG_NATTA_LOG = "natta_log"
 MSG_NATTA_PROGRESS = "natta_progress"   # payload: (done:int, total:int, msg:str)
@@ -157,6 +163,10 @@ MSG_ZENITH_PAXDET_ERROR = "zenith_paxdet_error"        # payload: str
 
 # Zenith host options. The default usba host is CloudFront-fronted and 504-storms on slow
 # Dossier renders; the direct asia origin waits them out. "" = no override (default usba).
+# What the empty-string option resolves to. Must be a literal: comparing it to
+# BASE_URL would be circular and match every host.
+_ZENITH_DEFAULT_HOST = "https://asia.ttinteractive.com"
+
 ZENITH_HOST_OPTIONS = {
     "Direct origin — asia.ttinteractive.com (default, avoids 504 storms)": "",
     "usba.ttinteractive.com (via CloudFront — only if asia is unavailable)":
@@ -197,6 +207,7 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_OEP_DONE: ("oep_movement", None),
     MSG_TRAFFIC_DONE: ("traffic_movement", None),
     MSG_NATTA_DONE: ("natta_extract", "count"),
+    MSG_FCA_DONE: ("flight_change_audit", "cases"),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
     MSG_UPDATE_FOUND: ("update_available", None),
     MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
@@ -212,6 +223,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
     MSG_OEP_ERROR: "oep_error",
     MSG_TRAFFIC_ERROR: "traffic_error",
     MSG_NATTA_ERROR: "natta_error",
+    MSG_FCA_ERROR: "flight_change_audit_error",
     MSG_ZENITH_ERROR: "zenith_customer_error",
     MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
     MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
@@ -265,6 +277,21 @@ class App(WhatsAppMixin, HealthMixin):
 
         # Flight Loads: which EXTRA report the pull writes (flat is always written)
         self.zenith_fl_format = tk.StringVar(value=excel_io.FLIGHT_LOAD_FORMATS[0])
+
+        # ----- Flight Change Authenticator state -----
+        # Every rule number is a setting: the entitlement desk changes these, not
+        # the code. Defaults are the airline's current policy.
+        self.fca_input_path = tk.StringVar(value="")
+        self.fca_sheet_name = tk.StringVar(value="")
+        self.fca_column_name = tk.StringVar(value="PNR")
+        self.fca_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.fca_domestic_min = tk.IntVar(value=30)
+        self.fca_international_min = tk.IntVar(value=60)
+        self.fca_window_days = tk.IntVar(value=30)
+        self.fca_inclusive = tk.BooleanVar(value=True)     # exactly 30 min qualifies
+        self.fca_basis = tk.StringVar(value="cumulative")
+        self._fca_stop_flag = threading.Event()
+        self._fca_worker: threading.Thread | None = None
 
         # ----- NATTA (Nepal) sub-tab state -----
         self.natta_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
@@ -4179,6 +4206,34 @@ class App(WhatsAppMixin, HealthMixin):
             self._bd_log(f"ERROR: {payload}")
             messagebox.showerror("BD Agency Lookup — Error", str(payload))
             self._bd_reset_buttons()
+        # ------ Flight Change Authenticator messages ------
+        elif kind == MSG_FCA_LOG:
+            self._fca_log(str(payload))
+        elif kind == MSG_FCA_PROGRESS:
+            done, total, msg = payload  # type: ignore[misc]
+            self.fca_progress_bar["maximum"] = max(1, total)
+            self.fca_progress_bar["value"] = done
+            self.fca_progress_label.configure(text=msg)
+        elif kind == MSG_FCA_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            note = " (stopped early)" if info.get("stopped") else ""
+            self._fca_log(
+                f"Done{note}: {info.get('cases', 0):,} reissue(s) across "
+                f"{info.get('pnrs', 0):,} PNR(s); {info.get('flagged', 0):,} not "
+                f"justified, {info.get('same_agent', 0):,} done by the same person "
+                f"who moved the schedule. File: {info.get('path', '')}")
+            self.fca_progress_label.configure(text=f"Done{note}.")
+            messagebox.showinfo(
+                "Flight Change Authenticator",
+                f"{info.get('cases', 0):,} reissue(s) checked{note}.\n"
+                f"{info.get('flagged', 0):,} not justified.\n\n"
+                f"{info.get('path', '')}")
+            self._fca_reset_buttons()
+        elif kind == MSG_FCA_ERROR:
+            self._fca_log(f"ERROR: {payload}")
+            self.fca_progress_label.configure(text="Failed.")
+            messagebox.showerror("Flight Change Authenticator", str(payload))
+            self._fca_reset_buttons()
         # ------ NATTA (Nepal) messages ------
         elif kind == MSG_NATTA_LOG:
             self._natta_log(str(payload))
@@ -5488,7 +5543,10 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_host_choice = tk.StringVar(value=self._zenith_host_saved_label())
         host_combo = ttk.Combobox(
             server_row, textvariable=self.zenith_host_choice, state="readonly", width=52,
-            values=list(ZENITH_HOST_OPTIONS.keys()),
+            # include the live label when it is a host we do not otherwise offer,
+            # so a readonly combobox can actually display it
+            values=list(dict.fromkeys(
+                list(ZENITH_HOST_OPTIONS.keys()) + [self.zenith_host_choice.get()])),
         )
         host_combo.pack(side="left", padx=(0, 8))
         host_combo.bind("<<ComboboxSelected>>", lambda _e: self._zenith_save_host())
@@ -5757,6 +5815,251 @@ class App(WhatsAppMixin, HealthMixin):
         # Flight Loads inner tab
         # ==============================================================
         self._build_zenith_flight_subtab(flight_inner)
+
+    # ==================================================================
+    # Flight Change Authenticator — was a free (FOC) reissue earned?
+    # ==================================================================
+
+    def _build_zenith_fca_tab(self, parent: ttk.Frame) -> None:
+        body = self._section(
+            parent, "Flight Change Authenticator  ·  FOC reissue check",
+            help_text=(
+                "For every PNR in your list this reads the change history, finds "
+                "each reissue (the Issued→Exchanged coupon event), finds the "
+                "schedule change that came before it, and judges whether the free "
+                "reissue was earned: the departure must have moved by at least the "
+                "sector's threshold, and the reissue must fall inside the window. "
+                "It also names who moved the schedule and who reissued, and flags "
+                "when that is the same person."
+            ),
+        )
+        input_entry = ttk.Entry(body, textvariable=self.fca_input_path)
+        input_btn = ttk.Button(body, text="Browse…", command=self._fca_pick_input)
+        self._form_row(body, 0, "PNR Excel:", input_entry, suffix=input_btn)
+        self.fca_sheet_combo = ttk.Combobox(
+            body, textvariable=self.fca_sheet_name, state="readonly")
+        self.fca_sheet_combo.bind("<<ComboboxSelected>>",
+                                  lambda _e: self._fca_reload_columns())
+        self._form_row(body, 1, "Sheet:", self.fca_sheet_combo)
+        self.fca_col_combo = ttk.Combobox(
+            body, textvariable=self.fca_column_name, state="readonly")
+        self._form_row(body, 2, "PNR column:", self.fca_col_combo)
+
+        # ----- the policy numbers -----
+        rules = self._section(
+            parent, "Entitlement rules",
+            help_text=(
+                "A reissue is earned when the departure moved by at least the "
+                "threshold for that sector AND the reissue happened within the "
+                "window. 'At least' includes the exact value — a domestic flight "
+                "moved by exactly 30 minutes qualifies — untick to make it strict."
+            ),
+        )
+        row = ttk.Frame(rules)
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text="Domestic (min):").pack(side="left", padx=(2, 4))
+        ttk.Spinbox(row, from_=0, to=600, width=6,
+                    textvariable=self.fca_domestic_min).pack(side="left")
+        ttk.Label(row, text="   International (min):").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(row, from_=0, to=600, width=6,
+                    textvariable=self.fca_international_min).pack(side="left")
+        ttk.Label(row, text="   Reissue window (days):").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(row, from_=1, to=365, width=6,
+                    textvariable=self.fca_window_days).pack(side="left")
+        row2 = ttk.Frame(rules)
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(row2, text="Exactly at the threshold qualifies",
+                        variable=self.fca_inclusive).pack(side="left", padx=2)
+        ttk.Label(row2, text="   Judge on:").pack(side="left", padx=(12, 4))
+        ttk.Combobox(row2, textvariable=self.fca_basis, state="readonly", width=14,
+                     values=["cumulative", "governing"]).pack(side="left")
+        ttk.Label(
+            row2, style="Hint.TLabel",
+            text=("  cumulative = all moves added up (fairest to the agent); "
+                  "governing = only the move just before the reissue"),
+        ).pack(side="left", padx=(6, 0))
+
+        # ----- output + run -----
+        out_body = self._section(parent, "Output")
+        out_entry = ttk.Entry(out_body, textvariable=self.fca_output_dir)
+        out_btn = ttk.Button(out_body, text="Browse…", command=self._fca_pick_output)
+        self._form_row(out_body, 0, "Folder:", out_entry, suffix=out_btn)
+
+        ctl = ttk.Frame(out_body)
+        ctl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.btn_fca_run = ttk.Button(
+            ctl, text="Authenticate flight changes", command=self._fca_run,
+            style="Primary.TButton")
+        self.btn_fca_run.pack(side="left")
+        self.btn_fca_stop = ttk.Button(
+            ctl, text="Stop", command=self._fca_stop, state="disabled",
+            style="Danger.TButton")
+        self.btn_fca_stop.pack(side="left", padx=(8, 0))
+
+        prog = self._section(parent, "Progress")
+        self.fca_progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.fca_progress_bar.pack(fill="x")
+        self.fca_progress_label = ttk.Label(
+            prog, text="Sign in to Zenith, pick your PNR list, then run.",
+            style="Hint.TLabel")
+        self.fca_progress_label.pack(anchor="w", pady=(2, 0))
+
+        log_body = self._section(parent, "Log")
+        box = ttk.Frame(log_body)
+        box.pack(fill="both", expand=True)
+        self.fca_log_text = tk.Text(
+            box, height=10, wrap="none", font=("Consolas", 9), relief="flat",
+            borderwidth=1, highlightthickness=1, highlightbackground="#cbd5e1")
+        self.fca_log_text.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(box, command=self.fca_log_text.yview)
+        sb.pack(side="right", fill="y")
+        self.fca_log_text.configure(yscrollcommand=sb.set, state="disabled")
+
+    def _fca_pick_input(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Pick the Excel with your PNR list",
+            filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")])
+        if not f:
+            return
+        self.fca_input_path.set(f)
+        try:
+            names = excel_io.list_sheet_names(Path(f))
+            self.fca_sheet_combo.configure(values=names)
+            if names:
+                self.fca_sheet_name.set(names[0])
+                self._fca_reload_columns()
+        except Exception as exc:  # noqa: BLE001
+            self._fca_log(f"Could not read that workbook: {exc}")
+
+    def _fca_reload_columns(self) -> None:
+        try:
+            cols = excel_io.list_columns(Path(self.fca_input_path.get()),
+                                         self.fca_sheet_name.get())
+        except Exception as exc:  # noqa: BLE001
+            self._fca_log(f"Could not read sheet headers: {exc}")
+            return
+        self.fca_col_combo.configure(values=cols)
+        for guess in ("PNR", "Pnr", "pnr", "PNR CODE", "Record Locator"):
+            if guess in cols:
+                self.fca_column_name.set(guess)
+                return
+        if cols:
+            self.fca_column_name.set(cols[0])
+
+    def _fca_pick_output(self) -> None:
+        d = filedialog.askdirectory(title="Choose output folder")
+        if d:
+            self.fca_output_dir.set(d)
+
+    def _fca_log(self, msg: str) -> None:
+        self._append_log(self.fca_log_text, msg)
+
+    def _fca_stop(self) -> None:
+        self._fca_stop_flag.set()
+        self._fca_log("Stopping after the current PNR — partial results are still written.")
+
+    def _fca_reset_buttons(self) -> None:
+        self.btn_fca_run.configure(state="normal")
+        self.btn_fca_stop.configure(state="disabled")
+
+    def _fca_config(self):
+        from .flight_change_auth import AuthConfig
+        return AuthConfig(
+            domestic_minutes=int(self.fca_domestic_min.get()),
+            international_minutes=int(self.fca_international_min.get()),
+            reissue_window_days=int(self.fca_window_days.get()),
+            inclusive=bool(self.fca_inclusive.get()),
+            basis=str(self.fca_basis.get() or "cumulative"),
+        )
+
+    def _fca_run(self) -> None:
+        if self._zenith_session is None:
+            messagebox.showerror("Flight Change Authenticator",
+                                 "Sign in to Zenith first.")
+            return
+        if self._fca_worker is not None and self._fca_worker.is_alive():
+            return
+        path, sheet, col = (self.fca_input_path.get().strip(),
+                            self.fca_sheet_name.get().strip(),
+                            self.fca_column_name.get().strip())
+        if not path or not sheet or not col:
+            messagebox.showerror("Flight Change Authenticator",
+                                 "Pick the PNR Excel, its sheet and the PNR column.")
+            return
+        try:
+            codes = excel_io.read_pnr_codes_from_excel(
+                Path(path), sheet_name=sheet, column_name=col)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Flight Change Authenticator",
+                                 f"Could not read PNRs: {exc}")
+            return
+        if not codes:
+            messagebox.showerror("Flight Change Authenticator",
+                                 "No PNRs found in that column.")
+            return
+
+        cfg = self._fca_config()
+        self._fca_stop_flag.clear()
+        self.btn_fca_run.configure(state="disabled")
+        self.btn_fca_stop.configure(state="normal")
+        self.fca_progress_bar.configure(value=0, maximum=len(codes))
+        self._fca_log(
+            f"Checking {len(codes):,} PNR(s) — domestic {cfg.domestic_minutes} min, "
+            f"international {cfg.international_minutes} min, window "
+            f"{cfg.reissue_window_days} days, "
+            f"{'inclusive' if cfg.inclusive else 'strict'}, judged on {cfg.basis}.")
+        self._fca_worker = threading.Thread(
+            target=self._fca_worker_run,
+            args=(codes, cfg, Path(self.fca_output_dir.get().strip() or str(Path.home()))),
+            daemon=True)
+        self._fca_worker.start()
+
+    def _fca_worker_run(self, codes, cfg, out_dir: Path) -> None:
+        from collections import defaultdict
+
+        from . import zenith_pnr_history_downloader as dl
+        from .flight_change_auth import JUSTIFIED, authenticate_pnr
+        from .flight_change_report import (
+            build_flight_change_audit_path, write_flight_change_audit,
+        )
+
+        def progress(done, total, pnr):
+            self._post(MSG_FCA_PROGRESS, (done, total, f"{done:,}/{total:,} · {pnr}"))
+
+        try:
+            events, stats = dl.scrape_dossier_events(
+                self._zenith_session, codes,
+                stop_flag=lambda: self._fca_stop_flag.is_set(),
+                progress_cb=progress)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Flight Change Authenticator scrape failed")
+            self._post(MSG_FCA_ERROR, f"{type(exc).__name__}: {exc}")
+            return
+
+        by_pnr = defaultdict(list)
+        for e in events:
+            by_pnr[(getattr(e, "pnr", "") or "").strip().upper()].append(e)
+        # keep PNRs that returned nothing visible in the output rather than silently
+        # dropping them — "no history" is itself a finding
+        for c in codes:
+            by_pnr.setdefault(c.strip().upper(), [])
+
+        try:
+            cases = [case for pnr, evs in by_pnr.items()
+                     for case in authenticate_pnr(pnr, evs, cfg)]
+            out = build_flight_change_audit_path(out_dir)
+            write_flight_change_audit(out, cases, cfg, by_pnr)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Flight Change Authenticator report failed")
+            self._post(MSG_FCA_ERROR, f"Report failed: {exc}")
+            return
+
+        flagged = sum(1 for c in cases if c.verdict != JUSTIFIED)
+        self._post(MSG_FCA_DONE, {
+            "path": str(out), "cases": len(cases), "flagged": flagged,
+            "pnrs": len(by_pnr), "same_agent": sum(1 for c in cases if c.same_agent),
+            "stopped": self._fca_stop_flag.is_set(),
+        })
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a
@@ -6234,6 +6537,17 @@ class App(WhatsAppMixin, HealthMixin):
 
     def _build_zenith_pnr_bulk_tab(self, parent: ttk.Frame) -> None:
         """Standalone bulk lookup: Excel of PNRs in → Excel with route/customer out."""
+        # Both jobs work from a PNR list, so Flight Change Auth lives HERE rather
+        # than as a sibling: pick your PNRs once, then choose what to run.
+        pnr_nb = ttk.Notebook(parent)
+        pnr_nb.pack(fill="both", expand=True)
+        bulk_inner = ttk.Frame(pnr_nb)
+        fca_inner = ttk.Frame(pnr_nb)
+        pnr_nb.add(bulk_inner, text="Bulk Lookup")
+        pnr_nb.add(fca_inner, text="Flight Change Auth")
+        self._build_zenith_fca_tab(fca_inner)
+        parent = bulk_inner          # the existing form packs into sub-tab 1
+
         parent = self._make_scrollable(parent)
 
         self._section(
@@ -7647,15 +7961,22 @@ class App(WhatsAppMixin, HealthMixin):
             )
 
     def _zenith_host_saved_label(self) -> str:
-        """The dropdown label matching the persisted host override (default if none/unknown)."""
-        try:
-            saved = config.ZENITH_HOST_FILE.read_text(encoding="utf-8").strip()
-        except OSError:
-            saved = ""
+        """The dropdown label for the host ACTUALLY IN USE.
+
+        Derived from zenith_client.BASE_URL — the same value the header shows — not
+        from the saved file. The old version string-matched the file's contents, so
+        any variant in it (trailing slash, missing scheme, an older build's default)
+        fell through to the DEFAULT label while the app talked to the other host:
+        the picker said "asia" while every request went to usba. Reading the live
+        value means the picker cannot disagree with reality.
+        """
+        live = zenith_client.BASE_URL.rstrip("/").lower()
         for label, url in ZENITH_HOST_OPTIONS.items():
-            if url == saved:
+            # "" means "no override" -> the module default
+            target = (url or _ZENITH_DEFAULT_HOST).rstrip("/").lower()
+            if target == live:
                 return label
-        return next(iter(ZENITH_HOST_OPTIONS))      # unknown custom value -> show default
+        return f"{live.split('://')[-1]}  (in use)"   # a host we do not offer
 
     def _zenith_save_host(self) -> None:
         """Persist the chosen Zenith host; it's applied on next launch (main.py reads it
