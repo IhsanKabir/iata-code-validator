@@ -98,6 +98,10 @@ MSG_CTR_PROGRESS = "ctr_progress"      # payload: (done, total, msg)
 MSG_CTR_DONE = "ctr_done"              # payload: dict(path, counters, employees…)
 MSG_CTR_ERROR = "ctr_error"
 
+MSG_VIS_PROGRESS = "vis_progress"      # payload: (done, total, msg)
+MSG_VIS_DONE = "vis_done"              # payload: dict(path, reps, visits…)
+MSG_VIS_ERROR = "vis_error"
+
 # NATTA (Nepal) member-directory worker → GUI message types
 MSG_NATTA_LOG = "natta_log"
 MSG_NATTA_PROGRESS = "natta_progress"   # payload: (done:int, total:int, msg:str)
@@ -215,6 +219,7 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_NATTA_DONE: ("natta_extract", "count"),
     MSG_FCA_DONE: ("flight_change_audit", "cases"),
     MSG_CTR_DONE: ("counter_master", "counters"),
+    MSG_VIS_DONE: ("visit_master", "visits"),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
     MSG_UPDATE_FOUND: ("update_available", None),
     MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
@@ -232,6 +237,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
     MSG_NATTA_ERROR: "natta_error",
     MSG_FCA_ERROR: "flight_change_audit_error",
     MSG_CTR_ERROR: "counter_master_error",
+    MSG_VIS_ERROR: "visit_master_error",
     MSG_ZENITH_ERROR: "zenith_customer_error",
     MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
     MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
@@ -319,6 +325,15 @@ class App(WhatsAppMixin, HealthMixin):
         self._ctr_warehouse = None       # set once the local sales data is probed
         self._ctr_stop_flag = threading.Event()
         self._ctr_worker: threading.Thread | None = None
+
+        # ----- Agency Visits state -----
+        self.vis_input = tk.StringVar(value="")
+        self.vis_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.vis_month = tk.StringVar(value=f"{_today.month:02d}")
+        self.vis_year = tk.IntVar(value=_today.year)
+        self._vis_files: list[Path] = []
+        self._vis_stop_flag = threading.Event()
+        self._vis_worker: threading.Thread | None = None
         self._ctr_period_worker: threading.Thread | None = None
 
         # ----- NATTA (Nepal) sub-tab state -----
@@ -4339,6 +4354,39 @@ class App(WhatsAppMixin, HealthMixin):
                    if info.get("not_submitted_counters") else "")
                 + f"\n\n{info.get('path', '')}")
             self._ctr_reset_buttons()
+        # ------ Agency Visits messages ------
+        elif kind == MSG_VIS_PROGRESS:
+            done, total, msg = payload  # type: ignore[misc]
+            self.vis_progress_bar["maximum"] = max(1, total)
+            self.vis_progress_bar["value"] = done
+            self.vis_progress_label.configure(text=msg)
+        elif kind == MSG_VIS_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            note = " (stopped early)" if info.get("stopped") else ""
+            self._vis_log(
+                f"Done{note}: {info.get('reps', 0)} rep(s) · "
+                f"{info.get('visits', 0):,} visit(s) · "
+                f"{info.get('agencies', 0):,} agencies · "
+                f"{info.get('days', 0)} day(s) · "
+                f"{info.get('repeats', 0):,} repeat visit(s)")
+            self._vis_log(
+                f"Billing figure written on "
+                f"{info.get('figure_rate', 0):.0%} of visits; "
+                f"{info.get('zone_blank', 0):,} visit(s) name no zone")
+            self._vis_log(f"File: {info.get('path', '')}")
+            self.vis_progress_label.configure(text=f"Done{note}.")
+            messagebox.showinfo(
+                "Agency Visits",
+                f"{info.get('reps', 0)} rep(s), {info.get('visits', 0):,} "
+                f"visit(s), {info.get('agencies', 0):,} agencies{note}.\n"
+                f"Billing figure written on {info.get('figure_rate', 0):.0%} "
+                f"of visits.\n\n{info.get('path', '')}")
+            self._vis_reset_buttons()
+        elif kind == MSG_VIS_ERROR:
+            self._vis_log(f"ERROR: {payload}")
+            self.vis_progress_label.configure(text="Failed.")
+            messagebox.showerror("Agency Visits", str(payload))
+            self._vis_reset_buttons()
         elif kind == MSG_CTR_ERROR:
             self._ctr_log(f"ERROR: {payload}")
             self.ctr_progress_label.configure(text="Failed.")
@@ -5730,16 +5778,19 @@ class App(WhatsAppMixin, HealthMixin):
         history_inner = ttk.Frame(inner_nb)
         pnr_bulk_inner = ttk.Frame(inner_nb)
         counter_inner = ttk.Frame(inner_nb)
+        visits_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
         inner_nb.add(history_inner, text="Flight History Analyzer")
         inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
         inner_nb.add(counter_inner, text="Counter Activity")
+        inner_nb.add(visits_inner, text="Agency Visits")
         inner_nb.add(reports_inner, text="Reports")
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
         self._build_zenith_counter_tab(counter_inner)
+        self._build_zenith_visits_tab(visits_inner)
         self._build_zenith_reports_tab(reports_inner)
 
         # From here, the existing Customer Lookup form goes into
@@ -6551,6 +6602,223 @@ class App(WhatsAppMixin, HealthMixin):
             "not_submitted_counters": list(result.not_submitted_counters),
             "window": result.window,
             "gap_source": result.gap_source,
+        })
+
+    # ------------------------------------------------------------------
+    # Agency Visits — the reps' own daily visit reports -> one master sheet
+    # ------------------------------------------------------------------
+    def _build_zenith_visits_tab(self, parent: ttk.Frame) -> None:
+        body = self._section(
+            parent, "Agency Visits  ·  master summary",
+            help_text=(
+                "Point this at the sales reps' monthly visit reports — one "
+                "sheet per rep, a block per working day — and it produces a "
+                "single master sheet: who saw how many agencies, zone "
+                "coverage, the agencies by the billing they declared, what "
+                "those agencies say they sell, and what the reports leave "
+                "blank.\n\n"
+                "No Zenith sign-in is needed.\n\n"
+                "Reps are ranked by agencies actually SEEN rather than visits "
+                "logged, because revisiting one agency ten times is not ten "
+                "agencies. A billing figure nobody wrote is counted as not "
+                "written, never as zero, and a range like '3-5 lakh' is left "
+                "out rather than read as 3."
+            ),
+        )
+        in_entry = ttk.Entry(body, textvariable=self.vis_input)
+        in_entry.bind("<KeyRelease>", lambda _e: self._vis_manual_entry())
+        picks = ttk.Frame(body)
+        ttk.Button(picks, text="Folder…",
+                   command=self._vis_pick_folder).pack(side="left")
+        ttk.Button(picks, text="Files…",
+                   command=self._vis_pick_files).pack(side="left", padx=(4, 0))
+        self._form_row(body, 0, "Visit reports:", in_entry, suffix=picks)
+        self.vis_found_label = ttk.Label(
+            body, text="Choose a folder, or pick individual reports.",
+            style="Hint.TLabel")
+        self.vis_found_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
+
+        period = self._section(
+            parent, "Reporting month",
+            help_text=(
+                "The month these reports cover. Some reps write only '2 Aug, "
+                "Sunday' with no year, and some blocks carry a date left over "
+                "from another month — the day is kept and the month is taken "
+                "from here, with the discrepancy reported on the sheet."
+            ),
+        )
+        prow = ttk.Frame(period)
+        prow.pack(fill="x", pady=(2, 0))
+        ttk.Label(prow, text="Month:").pack(side="left", padx=(2, 4))
+        ttk.Combobox(prow, textvariable=self.vis_month, state="readonly",
+                     width=5,
+                     values=[f"{m:02d}" for m in range(1, 13)]).pack(side="left")
+        ttk.Label(prow, text="   Year:").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(prow, from_=2020, to=2100, width=7,
+                    textvariable=self.vis_year).pack(side="left")
+
+        out_body = self._section(parent, "Output")
+        out_entry = ttk.Entry(out_body, textvariable=self.vis_output_dir)
+        out_btn = ttk.Button(out_body, text="Browse…",
+                             command=self._vis_pick_output)
+        self._form_row(out_body, 0, "Folder:", out_entry, suffix=out_btn)
+
+        ctl = ttk.Frame(out_body)
+        ctl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.btn_vis_run = ttk.Button(
+            ctl, text="Build visit summary", command=self._vis_run,
+            style="Primary.TButton")
+        self.btn_vis_run.pack(side="left")
+        self.btn_vis_stop = ttk.Button(
+            ctl, text="Stop", command=self._vis_stop, state="disabled",
+            style="Danger.TButton")
+        self.btn_vis_stop.pack(side="left", padx=(8, 0))
+
+        prog = self._section(parent, "Progress")
+        self.vis_progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.vis_progress_bar.pack(fill="x")
+        self.vis_progress_label = ttk.Label(
+            prog, text="Choose the visit reports, then build.",
+            style="Hint.TLabel")
+        self.vis_progress_label.pack(anchor="w", pady=(2, 0))
+
+        log_body = self._section(parent, "Log")
+        box = ttk.Frame(log_body)
+        box.pack(fill="both", expand=True)
+        self.vis_log_text = tk.Text(
+            box, height=10, wrap="none", font=("Consolas", 9), relief="flat",
+            borderwidth=1, highlightthickness=1, highlightbackground="#cbd5e1")
+        self.vis_log_text.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(box, command=self.vis_log_text.yview)
+        sb.pack(side="right", fill="y")
+        self.vis_log_text.configure(yscrollcommand=sb.set, state="disabled")
+
+    def _vis_pick_folder(self) -> None:
+        d = filedialog.askdirectory(title="Folder holding the visit reports")
+        if not d:
+            return
+        self._vis_files = []
+        self.vis_input.set(d)
+        self._vis_refresh_found()
+
+    def _vis_pick_files(self) -> None:
+        files = filedialog.askopenfilenames(
+            title="Pick the visit reports",
+            filetypes=[("Excel workbooks", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        if not files:
+            return
+        self._vis_files = [Path(f) for f in files]
+        self.vis_input.set(str(self._vis_files[0]) if len(self._vis_files) == 1
+                           else f"{len(self._vis_files)} files selected")
+        self._vis_refresh_found()
+
+    def _vis_manual_entry(self) -> None:
+        self._vis_files = []
+        self._vis_refresh_found()
+
+    def _vis_selection(self):
+        return self._vis_files or self.vis_input.get()
+
+    def _vis_refresh_found(self) -> None:
+        from . import visit_master
+        sel = self._vis_selection()
+        if not sel:
+            self.vis_found_label.configure(
+                text="Choose a folder, or pick individual reports.")
+            return
+        try:
+            found = visit_master.resolve_visit_inputs(sel)
+        except Exception as exc:  # noqa: BLE001
+            self.vis_found_label.configure(text=f"Could not read that: {exc}")
+            return
+        if not found:
+            self.vis_found_label.configure(text="No Excel workbooks found there.")
+            return
+        names = ", ".join(p.stem for p in found[:3])
+        more = f" … +{len(found) - 3} more" if len(found) > 3 else ""
+        self.vis_found_label.configure(
+            text=f"{len(found)} report(s): {names}{more}")
+
+    def _vis_pick_output(self) -> None:
+        d = filedialog.askdirectory(title="Choose output folder")
+        if d:
+            self.vis_output_dir.set(d)
+
+    def _vis_log(self, msg: str) -> None:
+        self._append_log(self.vis_log_text, msg)
+
+    def _vis_stop(self) -> None:
+        self._vis_stop_flag.set()
+        self._vis_log("Stopping after the current report — the reps read so "
+                      "far are still written.")
+
+    def _vis_reset_buttons(self) -> None:
+        self.btn_vis_run.configure(state="normal")
+        self.btn_vis_stop.configure(state="disabled")
+
+    def _vis_run(self) -> None:
+        from . import visit_master
+        if self._vis_worker is not None and self._vis_worker.is_alive():
+            return
+        sel = self._vis_selection()
+        if not sel:
+            messagebox.showerror("Agency Visits",
+                                 "Choose a folder of visit reports, or pick "
+                                 "the files.")
+            return
+        try:
+            found = visit_master.resolve_visit_inputs(sel)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Agency Visits", f"Could not read input: {exc}")
+            return
+        if not found:
+            messagebox.showerror(
+                "Agency Visits",
+                f"No Excel visit reports found in:\n{self.vis_input.get()}")
+            return
+        try:
+            month, year = int(self.vis_month.get()), int(self.vis_year.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Agency Visits", "Pick a valid month and year.")
+            return
+
+        self._vis_stop_flag.clear()
+        self.btn_vis_run.configure(state="disabled")
+        self.btn_vis_stop.configure(state="normal")
+        self.vis_progress_bar.configure(value=0, maximum=len(found))
+        self._vis_log(f"Reading {len(found)} visit report(s) for "
+                      f"{month:02d}/{year}…")
+        self._vis_worker = threading.Thread(
+            target=self._vis_worker_run,
+            args=(found, month, year,
+                  Path(self.vis_output_dir.get().strip() or str(Path.home()))),
+            daemon=True)
+        self._vis_worker.start()
+
+    def _vis_worker_run(self, paths, month: int, year: int,
+                        out_dir: Path) -> None:
+        from . import visit_master
+
+        def progress(done, total, name):
+            self._post(MSG_VIS_PROGRESS, (done, total, f"{done}/{total} · {name}"))
+
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            result = visit_master.build_master(
+                paths, visit_master.build_master_path(out_dir, month, year),
+                month=month, year=year, progress_cb=progress,
+                stop_flag=lambda: self._vis_stop_flag.is_set())
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Agency Visits build failed")
+            self._post(MSG_VIS_ERROR, f"{type(exc).__name__}: {exc}")
+            return
+
+        self._post(MSG_VIS_DONE, {
+            "path": str(result.path), "reps": result.reps,
+            "visits": result.visits, "agencies": result.agencies,
+            "days": result.days, "repeats": result.repeats,
+            "figure_rate": result.figure_rate, "zone_blank": result.zone_blank,
+            "window": result.window, "stopped": result.stopped,
         })
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
