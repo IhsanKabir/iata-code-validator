@@ -5,6 +5,7 @@ and staff names, which must not land in the repo. Each case below mirrors a
 defect actually found in the August 2026 files.
 """
 from datetime import date
+from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -618,3 +619,71 @@ def test_no_rate_leaves_the_row_exactly_as_written(tmp_path):
     assert rows[0].amount == 500.0
     assert rows[0].currency == "SGD"          # untouched, and so not rankable
     assert applied == {}
+
+
+def test_the_zenith_lookup_survives_the_second_comparison(tmp_path, monkeypatch):
+    """The comparison runs twice -- once to derive rates, once on the restated
+    rows. Enriching the first pass and then replacing it made 158 live calls to
+    Zenith and put none of the answers on the sheet."""
+    folder = tmp_path / "c"
+    folder.mkdir()
+    _make_counter_workbook(folder / "alpha counter aug 26.xlsx")
+
+    class _Sales:
+        lines = []
+        first_day = last_day = None
+        points_of_sale = {}
+        rows_read = 0
+        voided = 0
+
+    calls = []
+
+    class _Details:
+        customer_name = ""
+        phone = ""
+        pnr_status = "Issued"
+        pax_count = 1
+        booked_route = "DAC-CXB-DAC"
+
+    def fake_lookup(_session, code):
+        calls.append(code)
+        return _Details()
+
+    from src import counter_blocks, counter_reconcile
+
+    finding = counter_reconcile.Finding(
+        kind=counter_reconcile.UNREPORTED, counter="Alpha",
+        pos="DAC-99 Alpha", day=date(2026, 8, 1), locator="0A1111",
+        block="ISSUE", system_amount=1000.0)
+
+    # a comparison that yields one omitted sale, however many times it runs
+    def fake_reconcile(*_a, **_k):
+        res = counter_reconcile.ReconResult()
+        res.findings = [finding]
+        res.first_day = res.last_day = date(2026, 8, 1)
+        return res
+
+    monkeypatch.setattr(counter_reconcile, "read_sales_from_warehouse",
+                        lambda *a, **k: _Sales())
+    monkeypatch.setattr(counter_reconcile, "find_sales_warehouse",
+                        lambda *a, **k: cm_dummy_source())
+    monkeypatch.setattr(counter_reconcile, "suggest_mapping",
+                        lambda *a, **k: ({}, {}, [], [], {}))
+    monkeypatch.setattr(counter_reconcile, "reconcile", fake_reconcile)
+    monkeypatch.setattr("src.zenith_pnr_client.lookup_pnr", fake_lookup)
+
+    cm.build_from_inputs(folder, tmp_path / "m.xlsx", month=8, year=2026,
+                         use_warehouse=True, zenith_session=object())
+
+    assert calls == ["0A1111"]
+    # the enrichment must be on the finding that was actually rendered
+    assert "Issued" in finding.note
+    assert "DAC-CXB-DAC" in finding.note
+
+
+def cm_dummy_source():
+    from src.counter_reconcile import WarehouseSource
+    src = WarehouseSource(path=Path("x"), kind="gold")
+    src.first_day = date(2026, 8, 1)
+    src.last_day = date(2026, 8, 31)
+    return src

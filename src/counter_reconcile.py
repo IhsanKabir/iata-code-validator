@@ -328,6 +328,7 @@ class ReconResult:
     currency_suspect: dict = field(default_factory=dict)
     currency_rates: dict = field(default_factory=dict)
     duplicate_rows: list = field(default_factory=list)
+    duplicates_removed: int = 0      # survives a second pass, unlike the rows
     ambiguous: dict = field(default_factory=dict)
     clean_matches: int = 0
     mapping: dict = field(default_factory=dict)
@@ -814,8 +815,8 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
               f"largest first, top {detail_limit}")
     hdr = r
     r = _headers(ws, r, ["Date", "Counter", "PNR", "Type", "System value",
-                         "Sale agent", "Customer", "Sheet filed?"]
-                 + [""] * 13)
+                         "Sale agent", "Customer", "Sheet filed?",
+                         "Booking detail"] + [""] * 12)
     detail = sorted(res.of(UNREPORTED),
                     key=lambda f: -f.system_amount)[:detail_limit]
     for f in detail:
@@ -832,7 +833,10 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
                  else ("NOT SUBMITTED" if not f.submitted else "NO SHEET"))
         _cell(ws, r, 8, state, size=8, border=True, align="center",
               fill=None if f.day_filed else (BAD if not f.submitted else WARN))
-        for j in range(9, 22):
+        # whatever the live lookup added -- without this column the enrichment
+        # made its calls and had nowhere to put the answers
+        _cell(ws, r, 9, f.note or None, size=8, color=GREY, border=True)
+        for j in range(10, 22):
             _cell(ws, r, j, None, border=True)
         r += 1
     if detail:
@@ -840,7 +844,7 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
             f"E{hdr+1}:E{r-1}",
             DataBarRule(start_type="num", start_value=0, end_type="max",
                         color="C00000", showValue=True))
-        ws.auto_filter.ref = f"A{hdr}:H{r-1}"
+        ws.auto_filter.ref = f"A{hdr}:I{r-1}"
     ws.freeze_panes = "A9"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"

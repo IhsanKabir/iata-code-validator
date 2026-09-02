@@ -774,16 +774,6 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             sales, all_sales, mapping, base_currency=base_currency,
             currency_by_counter={m["counter"]: m["currency"] for m in metas},
             filed_days=filed_days, ambiguous=ambiguous)
-        if zenith_session is not None:
-            # the sales data names a Sale agent, but for a PNR nobody wrote down
-            # a live lookup is the only way left to put detail against it
-            from .zenith_pnr_client import lookup_pnr
-            counter_blocks.enrich_from_zenith(
-                zenith_session, recon.omitted, lookup=lookup_pnr,
-                max_lookups=max_lookups, stop_flag=stop_flag,
-                progress_cb=(lambda d, n, code: progress_cb(
-                    d, n, f"Zenith lookup {d}/{n} · {code}"))
-                if progress_cb else None)
 
     # With the rates in hand, restate every counter in base currency so one
     # table can hold them all. Nothing external is assumed: each rate came from
@@ -812,7 +802,19 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         recon.currency_rates, recon.currency_suspect = rates, suspect
         for c, n in dupes.items():          # the second pass no longer sees them
             recon.per_counter.setdefault(c, {})["dupe_n"] = n
-        recon.duplicate_rows = [None] * duplicates
+        recon.duplicates_removed = duplicates
+
+    if recon is not None and zenith_session is not None:
+        # AFTER the final comparison, not before: enriching the first pass and
+        # then replacing it discarded every lookup, so the run made 158 live
+        # calls to Zenith and put none of the answers on the sheet.
+        from .zenith_pnr_client import lookup_pnr
+        counter_blocks.enrich_from_zenith(
+            zenith_session, recon.omitted, lookup=lookup_pnr,
+            max_lookups=max_lookups, stop_flag=stop_flag,
+            progress_cb=(lambda d, n, code: progress_cb(
+                d, n, f"Zenith lookup {d}/{n} · {code}"))
+            if progress_cb else None)
 
     dom = [c for c in ctr.values() if c.currency == base_currency]
     foreign = [c for c in ctr.values() if c.currency != base_currency]
