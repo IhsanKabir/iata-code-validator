@@ -22,6 +22,8 @@ from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+
+from . import counter_blocks
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -60,7 +62,10 @@ CHANNELS = {
     "invoice": "Invoice", "alipay": "Alipay", "wechat": "WeChat",
 }
 CHANNEL_ORDER = ["Cash", "bKash", "Card", "Cheque", "Bank", "Invoice",
-                 "Alipay", "WeChat", "Unallocated"]
+                 "Alipay", "WeChat", "Not written", "Did not reconcile"]
+
+# a blank the staff never filled -- never inferred, always reported as itself
+NOT_WRITTEN = "not written"
 
 # columns that hold a REFERENCE, not money -- "Bkash/ Card No", "Transaction no"
 _REF_COLUMN = re.compile(r"\bno\b|\bnumber\b|\bref\b|\bapp?r\b")
@@ -134,6 +139,7 @@ class SaleRow:
     currency: str
     payments: dict = field(default_factory=dict)
     allocated: bool = False
+    pay_status: str = "ok"     # ok | not written | mismatch | no amount
 
 
 @dataclass
@@ -220,7 +226,12 @@ def _split_payments(row, cmap, amount, issues, counter, amount_col=None,
         return got
 
     if not amount:
-        return {}, False
+        return {}, False, "no amount"
+    # nothing in any channel column: the staff did not write it. That is a
+    # different fact from "the channels do not add up", and blending the two
+    # made a reporting gap look like a reconciliation failure.
+    if not any(read(o) for o in (0, 1, -1)):
+        return {}, False, NOT_WRITTEN
     # A whole data row can sit one column off its own header (a merged cell or a
     # hand-inserted serial column above it). Try the row as written first, then
     # shifted by one either way, and keep the reading that actually adds up to
@@ -241,10 +252,10 @@ def _split_payments(row, cmap, amount, issues, counter, amount_col=None,
             first = found
         total = sum(found.values())
         if abs(total - amount) <= max(1.0, abs(amount) * PAY_TOLERANCE):
-            return found, True
+            return found, True, "ok"
         exact = [c for c, v in found.items() if abs(v - amount) <= 1]
         if exact:
-            return {exact[0]: amount}, True
+            return {exact[0]: amount}, True, "ok"
     # Nothing split cleanly. The sale may simply have been READ from a payment
     # column, because some counters leave Sales Amount blank and fill only the
     # channel they were paid through. Then the sale IS that channel, in full.
@@ -252,16 +263,20 @@ def _split_payments(row, cmap, amount, issues, counter, amount_col=None,
         own = next((k for k, j in cmap.items() if j == amount_col), "")
         ch = _channel_of(own)
         if ch:
-            return {ch: amount}, True
+            return {ch: amount}, True, "ok"
     if first is None:
-        return {}, False
+        return {}, False, NOT_WRITTEN
     issues.append(Issue(counter, "payment_mismatch",
                         f"channels={sum(first.values()):,.0f} vs sale={amount:,.0f}"))
-    return first, False
+    return first, False, "mismatch"
 
 
 def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], dict]:
-    """Read one counter workbook. Returns (sales, issues, meta)."""
+    """Read one counter workbook. Returns (sales, issues, meta).
+
+    meta["activity"] carries the enquiry log and the timesheet, which are
+    reported with their blanks counted rather than left out.
+    """
     counter = _clean_counter_name(path.stem)
     # read_only: only values are needed, and loading the styles of ~30 heavily
     # formatted day-sheets per file dominated the runtime (14s a workbook, so
@@ -270,6 +285,8 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
     sales: list[SaleRow] = []
     issues: list[Issue] = []
     currencies = Counter()
+    activity: list = []
+    native: Counter = Counter()      # the channel labels this counter really uses
     day_sources = Counter()
     days_seen: set[int] = set()
     populated = 0
@@ -288,6 +305,7 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
             continue
         populated += 1
         day, src = _resolve_day(ws.title, grid, ordinal, month)
+        activity.append(counter_blocks.parse_activity(grid, counter, day, EMP_ID))
         day_sources[src] += 1
         if day:
             days_seen.add(day)
@@ -302,6 +320,7 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
                 i += 1
                 continue
             cmap = {k: j for j, k in enumerate(keys) if k}
+            hdr_i = i
             amt_j = next((j for j, k in enumerate(keys)
                           if k.startswith(("sales amount", "refund amount"))), None)
             currency = "BDT"
@@ -348,16 +367,19 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
                                 amount, amount_col = v, j
                                 break
                     amount = abs(amount) if amount else 0.0
-                    pays, ok = _split_payments(raw, cmap, amount, issues, counter,
-                                               amount_col=amount_col,
-                                               header_col=amt_j)
+                    pays, ok, why = _split_payments(
+                        raw, cmap, amount, issues, counter,
+                        amount_col=amount_col, header_col=amt_j)
+                    for key, j in cmap.items():
+                        if _channel_of(key) and j < len(raw) and _money(raw[j]):
+                            native[_n(grid[hdr_i][j]) or key.title()] += 1
                     if not amount:
                         issues.append(Issue(counter, "no_amount",
                                             f"day {day} {eid} {pnr}"))
                     if not pnr:
                         issues.append(Issue(counter, "no_pnr", f"day {day} {eid}"))
                     sales.append(SaleRow(counter, day, block, eid, name, pnr,
-                                         amount, currency, pays, ok))
+                                         amount, currency, pays, ok, why))
                 i += 1
     wb.close()
 
@@ -372,6 +394,8 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
         "days": days_seen,
         "day_sources": dict(day_sources),
         "file": path.name,
+        "native_channels": native,
+        "activity": counter_blocks.merge(activity),
     }
     return sales, issues, meta
 
@@ -447,7 +471,9 @@ def aggregate(sales, metas):
                 for ch, v in s.payments.items():
                     a.pay[ch] += v
             elif s.amount:
-                a.pay["Unallocated"] += s.amount
+                bucket = ("Not written" if s.pay_status == NOT_WRITTEN
+                          else "Did not reconcile")
+                a.pay[bucket] += s.amount
                 a.unallocated += s.amount
         if s.emp_name:
             names[s.emp_id][s.emp_name] += 1
@@ -558,7 +584,8 @@ def _pay_cells(ws, r, agg, start_col=14):
 def build_master(paths, out_path: Path, *, month: int, year: int,
                  base_currency: str = "BDT", progress_cb=None,
                  stop_flag=None, sales_report=None,
-                 use_warehouse: bool = False) -> MasterResult:
+                 use_warehouse: bool = False, zenith_session=None,
+                 max_lookups: int = 300) -> MasterResult:
     """Read every counter workbook and write ONE master sheet.
 
     `progress_cb(done, total, name)` is called per workbook so a UI can show
@@ -641,7 +668,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         ("Cash share", pay_tot.get("Cash", 0) / grand_pay, PCT, None),
         ("Digital (bKash+Card)", (pay_tot.get("bKash", 0) + pay_tot.get("Card", 0))
          / grand_pay, PCT, None),
-        ("Unallocated payments", pay_tot.get("Unallocated", 0) / grand_pay, PCT,
+        ("Payment not written", pay_tot.get("Not written", 0) / grand_pay, PCT,
          "C00000"),
         ("Overseas counters", len(foreign), "0", None),
         ("Days reported", reported, "0", None),
@@ -650,7 +677,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
 
     # ---- payment mix -----------------------------------------------------
     r = _band(ws, r, "PAYMENT TYPES — how the money actually came in",
-              "unallocated = the sheet's channel columns did not add up to the sale")
+              "'Not written' means the staff left every channel column blank; it is "
+              "reported, never guessed")
     pay_hdr = r
     r = _headers(ws, r, ["Payment type", "Amount", "Share", "% bar", "", "", "",
                          "", "", "", "", "", "", "", "", "", "", "", "", "", ""])
@@ -662,7 +690,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         v = pay_tot.get(ch, 0.0)
         if not v:
             continue
-        tone = BAD if ch == "Unallocated" else (WARN if ch == "Cash" else None)
+        tone = (BAD if ch in ("Not written", "Did not reconcile")
+                else (WARN if ch == "Cash" else None))
         _cell(ws, r, 1, ch, bold=True, size=10, border=True, fill=tone)
         _cell(ws, r, 2, v, fmt=MONEY, size=10, border=True, align="right")
         _cell(ws, r, 3, v / grand_pay, fmt=PCT, size=10, border=True,
@@ -830,6 +859,104 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.auto_filter.ref = f"A{emp_hdr}:U{emp_last}"
     r += 1
 
+    # ---- payment channels as the counters record them --------------------
+    r = _band(ws, r, "PAYMENT CHANNELS AS RECORDED",
+              "each counter's own labels — the overseas desks have no bKash, and "
+              "some record no channel at all")
+    r = _headers(ws, r, ["Counter", "Cur", "Sale rows",
+                         "Value with no channel written",
+                         "Channels the staff use"] + [""] * 16)
+    for m in sorted(metas, key=lambda x: -len(x.get("native_channels") or {})):
+        cname = m["counter"]
+        a = ctr.get(cname)
+        if a is None:
+            continue
+        nat = m.get("native_channels") or Counter()
+        rows_amt = sum(a.n.values())
+        blank = a.pay.get("Not written", 0)
+        _cell(ws, r, 1, cname, bold=True, size=10, border=True)
+        _cell(ws, r, 2, m.get("currency", ""), size=8, border=True, align="center")
+        _cell(ws, r, 3, rows_amt or None, size=9, border=True, align="center")
+        _cell(ws, r, 4, blank or None, fmt=MONEY, size=9, border=True,
+              align="right", fill=BAD if blank and not nat else None)
+        label = (", ".join(f"{k} ({v})" for k, v in nat.most_common(6))
+                 or "none recorded — not written")
+        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=21)
+        _cell(ws, r, 5, label, size=9, border=True,
+              color="C00000" if not nat else "000000")
+        r += 1
+    r += 1
+
+    # ---- enquiries -------------------------------------------------------
+    act = counter_blocks.merge([m["activity"] for m in metas])
+    r = _band(ws, r, "ENQUIRIES — walk-in, phone and WhatsApp",
+              "the conversion rate is taken ONLY over rows whose outcome was "
+              "written; the rest are counted, not assumed")
+    r = _headers(ws, r, ["Counter", "Enquiries", "Converted", "Lost", "Pending",
+                         "Outcome not written", "Outcome coverage",
+                         "Conversion (of those written)", "Named a person",
+                         "", "", "", "", "", "", "", "", "", "", "", ""])
+    per = act.by_counter()
+    for cname in sorted(per, key=lambda c: -per[c].get("queries", 0)):
+        v = per[cname]
+        q = v.get("queries", 0)
+        if not q:
+            continue
+        conv, lost = v.get("converted", 0), v.get("lost", 0)
+        blank = v.get(counter_blocks.NOT_WRITTEN, 0)
+        _cell(ws, r, 1, cname, bold=True, size=10, border=True)
+        _cell(ws, r, 2, q, size=9, border=True, align="center")
+        _cell(ws, r, 3, conv or None, size=9, border=True, align="center")
+        _cell(ws, r, 4, lost or None, size=9, border=True, align="center")
+        _cell(ws, r, 5, v.get("pending", 0) or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 6, blank or None, size=9, border=True, align="center",
+              fill=BAD if blank > q / 2 else None)
+        cover = (conv + lost) / q if q else 0
+        _cell(ws, r, 7, cover, fmt=PCT, size=9, border=True, align="center",
+              fill=BAD if cover < 0.25 else (WARN if cover < 0.6 else None))
+        # a rate over a handful of written rows is not a rate; say so instead
+        _cell(ws, r, 8,
+              (conv / (conv + lost)) if cover >= 0.25 else "too few written",
+              fmt=PCT if cover >= 0.25 else None, size=10, bold=True,
+              border=True, align="center")
+        _cell(ws, r, 9, v.get("attributed", 0) or None, size=9, border=True,
+              align="center")
+        for j in range(10, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    r += 1
+
+    # ---- time ------------------------------------------------------------
+    r = _band(ws, r, "TIME LOGGED",
+              "counted from the rows that carry a duration; rows without one are "
+              "shown as not written and are NOT treated as zero")
+    r = _headers(ws, r, ["Counter", "Task rows", "With a duration",
+                         "Duration not written", "Whole-shift rows",
+                         "Task hours logged", "Coverage of rows",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "", ""])
+    for cname in sorted(per, key=lambda c: -per[c].get("minutes", 0)):
+        v = per[cname]
+        rows_t = v.get("time_rows", 0)
+        if not rows_t:
+            continue
+        blank = v.get("time_blank", 0)
+        _cell(ws, r, 1, cname, bold=True, size=10, border=True)
+        _cell(ws, r, 2, rows_t, size=9, border=True, align="center")
+        _cell(ws, r, 3, rows_t - blank, size=9, border=True, align="center")
+        _cell(ws, r, 4, blank or None, size=9, border=True, align="center",
+              fill=BAD if blank > rows_t / 2 else None)
+        _cell(ws, r, 5, v.get("shift_rows", 0) or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 6, v.get("minutes", 0) / 60, fmt='#,##0.0', size=10,
+              bold=True, border=True, align="right")
+        _cell(ws, r, 7, (rows_t - blank) / rows_t, fmt=PCT, size=9, border=True,
+              align="center")
+        for j in range(8, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    r += 1
+
     # ---- data quality ----------------------------------------------------
     r = _band(ws, r, "DATA QUALITY — read every number above against this",
               "a low-coverage counter cannot be compared with a complete one")
@@ -929,6 +1056,16 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             sales, all_sales, mapping, base_currency=base_currency,
             currency_by_counter={m["counter"]: m["currency"] for m in metas},
             filed_days=filed_days, ambiguous=ambiguous)
+        if zenith_session is not None:
+            # the sales data names a Sale agent, but for a PNR nobody wrote down
+            # a live lookup is the only way left to put detail against it
+            from .zenith_pnr_client import lookup_pnr
+            counter_blocks.enrich_from_zenith(
+                zenith_session, recon.omitted, lookup=lookup_pnr,
+                max_lookups=max_lookups, stop_flag=stop_flag,
+                progress_cb=(lambda d, n, code: progress_cb(
+                    d, n, f"Zenith lookup {d}/{n} · {code}"))
+                if progress_cb else None)
         cr.write_reconciliation(wb.create_sheet("Unreported"), recon,
                                 base_currency=base_currency,
                                 filed_days=filed_days)
@@ -1052,14 +1189,16 @@ def build_master_path(out_dir, month: int, year: int) -> Path:
 
 def build_from_inputs(selection, out_path, *, month: int, year: int,
                       progress_cb=None, stop_flag=None, sales_report=None,
-                      use_warehouse: bool = False) -> MasterResult:
+                      use_warehouse: bool = False,
+                      zenith_session=None) -> MasterResult:
     """Build from a folder, a file, or any mix of the two."""
     paths = resolve_counter_inputs(selection)
     if not paths:
         raise ValueError(f"No .xlsx counter workbooks found in {selection}")
     return build_master(paths, out_path, month=month, year=year,
                         progress_cb=progress_cb, stop_flag=stop_flag,
-                        sales_report=sales_report, use_warehouse=use_warehouse)
+                        sales_report=sales_report, use_warehouse=use_warehouse,
+                        zenith_session=zenith_session)
 
 
 # kept as the folder-shaped name the first callers used

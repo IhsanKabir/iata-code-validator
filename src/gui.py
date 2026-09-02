@@ -315,6 +315,7 @@ class App(WhatsAppMixin, HealthMixin):
         self.ctr_year = tk.IntVar(value=_today.year)
         self.ctr_sales_path = tk.StringVar(value="")
         self.ctr_use_warehouse = tk.BooleanVar(value=False)
+        self.ctr_lookup_pnrs = tk.BooleanVar(value=False)
         self._ctr_warehouse = None       # set once the local sales data is probed
         self._ctr_stop_flag = threading.Event()
         self._ctr_worker: threading.Thread | None = None
@@ -6249,11 +6250,21 @@ class App(WhatsAppMixin, HealthMixin):
             sales, text="Looking for the sales data…", style="Hint.TLabel")
         self.ctr_sales_label.grid(row=1, column=0, columnspan=3, sticky="w",
                                   padx=(20, 0))
+        ttk.Checkbutton(
+            sales, variable=self.ctr_lookup_pnrs,
+            text="Also look each unreported PNR up in Zenith to name it "
+                 "(needs sign-in, slower)",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(
+            sales, style="Hint.TLabel",
+            text="Adds the booking's status, route and customer to the "
+                 "unreported list. A PNR that cannot be read is marked unknown.",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=(20, 0))
         # an explicit export still works, for a machine without the warehouse
         sales_entry = ttk.Entry(sales, textvariable=self.ctr_sales_path)
         sales_btn = ttk.Button(sales, text="Browse…",
                                command=self._ctr_pick_sales)
-        self._form_row(sales, 2, "or a sales report file:", sales_entry,
+        self._form_row(sales, 4, "or a sales report file:", sales_entry,
                        suffix=sales_btn)
         self._ctr_find_warehouse()
 
@@ -6468,6 +6479,11 @@ class App(WhatsAppMixin, HealthMixin):
         self.btn_ctr_run.configure(state="disabled")
         self.btn_ctr_stop.configure(state="normal")
         self.ctr_progress_bar.configure(value=0, maximum=len(found))
+        if self.ctr_lookup_pnrs.get() and self._zenith_session is None:
+            messagebox.showerror(
+                "Counter Activity",
+                "Sign in to Zenith first, or untick the PNR lookup.")
+            return
         gap = ("the local sales data" if self.ctr_use_warehouse.get()
                else (Path(self.ctr_sales_path.get()).name
                      if self.ctr_sales_path.get().strip() else ""))
@@ -6479,12 +6495,14 @@ class App(WhatsAppMixin, HealthMixin):
             args=(found, month, year,
                   Path(self.ctr_output_dir.get().strip() or str(Path.home())),
                   self.ctr_sales_path.get().strip() or None,
-                  bool(self.ctr_use_warehouse.get())),
+                  bool(self.ctr_use_warehouse.get()),
+                  self._zenith_session if self.ctr_lookup_pnrs.get() else None),
             daemon=True)
         self._ctr_worker.start()
 
     def _ctr_worker_run(self, paths, month: int, year: int, out_dir: Path,
-                        sales_report=None, use_warehouse: bool = False) -> None:
+                        sales_report=None, use_warehouse: bool = False,
+                        zenith_session=None) -> None:
         from . import counter_master
 
         def progress(done, total, name):
@@ -6498,7 +6516,8 @@ class App(WhatsAppMixin, HealthMixin):
                 paths, counter_master.build_master_path(out_dir, month, year),
                 month=month, year=year, progress_cb=progress,
                 stop_flag=lambda: self._ctr_stop_flag.is_set(),
-                sales_report=sales_report, use_warehouse=use_warehouse)
+                sales_report=sales_report, use_warehouse=use_warehouse,
+                zenith_session=zenith_session)
         except Exception as exc:  # noqa: BLE001
             log.exception("Counter Activity master build failed")
             self._post(MSG_CTR_ERROR, f"{type(exc).__name__}: {exc}")

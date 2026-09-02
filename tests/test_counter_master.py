@@ -119,7 +119,7 @@ def _cmap(headers):
 def test_payments_are_credited_when_they_add_up():
     headers = ["Sales Amount (BDT)", "Cash", "Bkash", "Card"]
     row = [10000, 6000, 4000, None]
-    pays, ok = cm._split_payments(row, _cmap(headers), 10000, [], "X",
+    pays, ok, _why = cm._split_payments(row, _cmap(headers), 10000, [], "X",
                                   amount_col=0)
     assert ok is True
     assert pays == {"Cash": 6000.0, "bKash": 4000.0}
@@ -129,7 +129,7 @@ def test_a_row_shifted_one_column_off_its_header_still_reconciles():
     """A merged cell above pushes the data one column right of its own header."""
     headers = ["Sales Amount (BDT)", "Cash", "Bkash", "Card"]
     row = [None, 10000, 10000, None]     # amount and cash both sit one to the right
-    pays, ok = cm._split_payments(row, _cmap(headers), 10000, [], "X",
+    pays, ok, _why = cm._split_payments(row, _cmap(headers), 10000, [], "X",
                                   amount_col=1, header_col=0)
     assert ok is True
     assert pays == {"Cash": 10000.0}   # cash, NOT the bKash column it sits under
@@ -139,7 +139,7 @@ def test_payments_that_do_not_reconcile_are_left_unallocated():
     headers = ["Sales Amount (BDT)", "Cash", "Bkash"]
     row = [10000, 6000, 1000]            # 7,000 collected against a 10,000 sale
     issues = []
-    _pays, ok = cm._split_payments(row, _cmap(headers), 10000, issues, "X",
+    _pays, ok, _why = cm._split_payments(row, _cmap(headers), 10000, issues, "X",
                                    amount_col=0, header_col=0)
     assert ok is False
     assert [i.kind for i in issues] == ["payment_mismatch"]
@@ -148,7 +148,7 @@ def test_payments_that_do_not_reconcile_are_left_unallocated():
 def test_a_card_number_is_never_read_as_a_payment():
     headers = ["Sales Amount (BDT)", "Cash", "Bkash/ Card No"]
     row = [8098, 8098, "4748****6144"]
-    pays, ok = cm._split_payments(row, _cmap(headers), 8098, [], "X",
+    pays, ok, _why = cm._split_payments(row, _cmap(headers), 8098, [], "X",
                                   amount_col=0, header_col=0)
     assert ok is True
     assert pays == {"Cash": 8098.0}
