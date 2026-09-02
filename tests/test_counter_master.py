@@ -1,0 +1,362 @@
+"""Counter Activity master sheet.
+
+The fixtures are synthetic: real counter workbooks carry customer mobile numbers
+and staff names, which must not land in the repo. Each case below mirrors a
+defect actually found in the August 2026 files.
+"""
+from datetime import date
+
+import pytest
+from openpyxl import Workbook, load_workbook
+
+from src import counter_master as cm
+
+
+# --------------------------------------------------------------------------
+# value typing
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("raw, expected", [
+    (12345, 12345.0),
+    ("12,345", 12345.0),
+    ("3847", 3847.0),
+    (0, None),
+    (None, None),
+    ("", None),
+    ("01712414786", None),       # a customer mobile, not money
+    ("+8801712414786", None),
+    ("4748****6144", None),      # a masked card reference
+    ("0172***499", None),
+    ("APPR CODE:370063", None),
+    (True, None),               # a bool is not an amount
+])
+def test_money_accepts_only_real_amounts(raw, expected):
+    assert cm._money(raw) == expected
+
+
+@pytest.mark.parametrize("header, channel", [
+    ("Cash", "Cash"),
+    ("CASH", "Cash"),
+    ("Cash/CHEQUE", "Cash"),
+    ("Bkash", "bKash"),
+    ("Bkash/Nagad", "bKash"),
+    ("Card", "Card"),
+    ("Cheque", "Cheque"),
+    ("Invoice", "Invoice"),
+    ("Alipay", "Alipay"),
+    ("Wechat", "WeChat"),
+    ("Bank", "Bank"),
+    # one counter spells a single channel seven different ways
+    ("Online Transaction to scb", "Bank"),
+    ("Online Transacttion to Scb", "Bank"),
+    ("Online Transaction deposited to scb", "Bank"),
+    ("Online Transaction  on SCB", "Bank"),
+    ("online transaction on scb", "Bank"),
+])
+def test_channel_of_tolerates_how_it_was_typed(header, channel):
+    assert cm._channel_of(header) == channel
+
+
+@pytest.mark.parametrize("header", [
+    "Bkash/ Card No",           # holds a reference, not an amount
+    "Transaction no (if Applicable)",
+    "PNR",
+    "Employee Name",
+    "",
+])
+def test_channel_of_rejects_reference_columns(header):
+    assert cm._channel_of(header) is None
+
+
+# --------------------------------------------------------------------------
+# counter naming
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("stem, expected", [
+    ("baridhara counter aug 26", "Baridhara"),
+    ("DXB Counterr aug 26", "DXB"),
+    ("RJH Counte auh 26", "RJH"),          # 'auh' is a typo for 'aug' HERE
+    ("AUH Counter aug 26", "AUH"),         # ...but AUH is also a real station
+    ("Mirpur Counter Aug 26", "Mirpur"),
+    ("cox bazar counter aug 26", "Cox Bazar"),
+])
+def test_counter_name_survives_hand_typed_filenames(stem, expected):
+    assert cm._clean_counter_name(stem) == expected
+
+
+# --------------------------------------------------------------------------
+# dating
+# --------------------------------------------------------------------------
+def test_day_comes_from_the_sheet_name():
+    grid = [["Counter Daily Activities"], []]
+    assert cm._resolve_day("06 AUG", grid, 5, 8) == (6, "sheetname")
+
+
+def test_day_comes_from_the_title_when_the_name_has_none():
+    grid = [["Counter Daily Activities of  01 Aug 2026"], []]
+    assert cm._resolve_day("Sheet2", grid, 1, 8) == (1, "title")
+
+
+def test_a_stale_month_in_the_title_is_flagged_but_the_day_is_kept():
+    """Sheet3 of an AUGUST workbook says '2 Jul 2026' -- the template was copied
+    from last month. The day is still right; the month must not be believed."""
+    grid = [["Counter Daily Activities of  2 Jul 2026"], []]
+    day, source = cm._resolve_day("Sheet3", grid, 2, 8)
+    assert day == 2
+    assert source == "title(stale-month)"
+
+
+def test_ordinal_is_the_last_resort():
+    grid = [["Counter Daily Activities"], []]
+    assert cm._resolve_day("Sheet8", grid, 7, 8) == (7, "ordinal")
+
+
+# --------------------------------------------------------------------------
+# payment reconciliation
+# --------------------------------------------------------------------------
+def _cmap(headers):
+    return {cm._hkey(h): j for j, h in enumerate(headers) if h}
+
+
+def test_payments_are_credited_when_they_add_up():
+    headers = ["Sales Amount (BDT)", "Cash", "Bkash", "Card"]
+    row = [10000, 6000, 4000, None]
+    pays, ok = cm._split_payments(row, _cmap(headers), 10000, [], "X",
+                                  amount_col=0)
+    assert ok is True
+    assert pays == {"Cash": 6000.0, "bKash": 4000.0}
+
+
+def test_a_row_shifted_one_column_off_its_header_still_reconciles():
+    """A merged cell above pushes the data one column right of its own header."""
+    headers = ["Sales Amount (BDT)", "Cash", "Bkash", "Card"]
+    row = [None, 10000, 10000, None]     # amount and cash both sit one to the right
+    pays, ok = cm._split_payments(row, _cmap(headers), 10000, [], "X",
+                                  amount_col=1, header_col=0)
+    assert ok is True
+    assert pays == {"Cash": 10000.0}   # cash, NOT the bKash column it sits under
+
+
+def test_payments_that_do_not_reconcile_are_left_unallocated():
+    headers = ["Sales Amount (BDT)", "Cash", "Bkash"]
+    row = [10000, 6000, 1000]            # 7,000 collected against a 10,000 sale
+    issues = []
+    _pays, ok = cm._split_payments(row, _cmap(headers), 10000, issues, "X",
+                                   amount_col=0, header_col=0)
+    assert ok is False
+    assert [i.kind for i in issues] == ["payment_mismatch"]
+
+
+def test_a_card_number_is_never_read_as_a_payment():
+    headers = ["Sales Amount (BDT)", "Cash", "Bkash/ Card No"]
+    row = [8098, 8098, "4748****6144"]
+    pays, ok = cm._split_payments(row, _cmap(headers), 8098, [], "X",
+                                  amount_col=0, header_col=0)
+    assert ok is True
+    assert pays == {"Cash": 8098.0}
+
+
+# --------------------------------------------------------------------------
+# end to end
+# --------------------------------------------------------------------------
+HEADERS = ["Counter Name", "Action", "Count PNR", "Employee Name ", " Employee ID",
+           "PNR", "", "Customer Mobile No", "", "Sales Amount (BDT)", "Cash",
+           "Bkash", "Card", "Bkash/ Card No"]
+
+
+def _day_sheet(wb, title, rows, day_label):
+    ws = wb.create_sheet(title)
+    ws.append([f"Counter Daily Activities of {day_label}"])
+    ws.append(HEADERS)
+    for r in rows:
+        ws.append(r)
+    return ws
+
+
+def _make_counter_workbook(path, *, drift=False, extra_days=0):
+    wb = Workbook()
+    wb.remove(wb.active)
+    rows = [
+        ["TEST SALES", "Ticket Issue", 2, "ALEX ROY", "USBA-90001", "0A1111",
+         None, "01700000001", None, 10000, 10000, None, None, None],
+        [None, None, None, "ALEX ROY", "USBA-90001", "0A2222",
+         None, "01700000002", None, 5000, None, 5000, None, None],
+        [None, None, None, "SAM LEE", "USBA-90002", "0A3333",
+         None, "01700000003", None, 4000, 4000, None, None, None],
+    ]
+    if drift:
+        # every data row sits one column right of its header, as a merged cell
+        # above the block causes in the real files
+        rows = [[None] + r[:-1] for r in rows]
+    _day_sheet(wb, "01 AUG", rows, "01 Aug 2026")
+    _day_sheet(wb, "02 AUG", [
+        [None, "Ticket Refund", 1, "SAM LEE", "USBA-90002", "0A4444",
+         None, "01700000004", None, 1500, 1500, None, None, None],
+    ], "02 Aug 2026")
+    for d in range(3, 3 + extra_days):        # pad the month to lift coverage
+        _day_sheet(wb, f"{d:02d} AUG", [
+            [None, "Ticket Issue", 1, "ALEX ROY", "USBA-90001", f"0A5{d:03d}",
+             None, "01700000009", None, 1000, 1000, None, None, None],
+        ], f"{d:02d} Aug 2026")
+    wb.save(path)
+
+
+def test_master_sheet_totals_and_layout(tmp_path):
+    folder = tmp_path / "counters"
+    folder.mkdir()
+    _make_counter_workbook(folder / "alpha counter aug 26.xlsx")
+    out = tmp_path / "master.xlsx"
+
+    seen = []
+    result = cm.build_from_folder(folder, out, month=8, year=2026,
+                                  progress_cb=lambda d, t, n: seen.append(n))
+
+    assert result.path == out
+    assert result.counters == 1
+    assert result.employees == 2
+    assert result.rows == 4                     # 3 issues + 1 refund
+    assert seen == ["alpha counter aug 26"]
+    # 19,000 issued less a 1,500 refund
+    assert result.net == pytest.approx(17_500)
+    assert result.unallocated_pct == pytest.approx(0.0)
+
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["Master"]          # ONE sheet, by design
+    text = "\n".join(
+        str(c.value) for row in wb["Master"].iter_rows() for c in row
+        if c.value is not None)
+    for section in ("AT A GLANCE", "PAYMENT TYPES", "COUNTER LEAGUE TABLE",
+                    "EMPLOYEE SCORECARD", "DATA QUALITY"):
+        assert section in text
+    assert "Alpha" in text                      # counter name cleaned
+    assert "USBA-90001" in text
+    wb.close()
+
+
+def test_column_drift_does_not_change_the_totals(tmp_path):
+    """The same figures, with every row shifted one column off its header."""
+    straight, shifted = tmp_path / "a", tmp_path / "b"
+    straight.mkdir()
+    shifted.mkdir()
+    _make_counter_workbook(straight / "alpha counter aug 26.xlsx")
+    _make_counter_workbook(shifted / "alpha counter aug 26.xlsx", drift=True)
+
+    a = cm.build_from_folder(straight, tmp_path / "a.xlsx", month=8, year=2026)
+    b = cm.build_from_folder(shifted, tmp_path / "b.xlsx", month=8, year=2026)
+
+    assert b.rows == a.rows
+    assert b.net == a.net
+    assert b.employees == a.employees
+
+
+def test_a_counter_that_filed_nothing_is_reported_not_guessed(tmp_path):
+    """A counter that files nothing must appear as a finding, not vanish -- and it
+    must not drag a counter that DID file into the same bucket."""
+    folder = tmp_path / "counters"
+    folder.mkdir()
+    _make_counter_workbook(folder / "alpha counter aug 26.xlsx", extra_days=24)
+    quiet = Workbook()
+    quiet.active.title = "01 AUG"
+    quiet.save(folder / "quiet counter aug 26.xlsx")
+
+    result = cm.build_from_folder(folder, tmp_path / "m.xlsx", month=8, year=2026)
+
+    assert result.counters == 2
+    assert result.not_reporting == ("Quiet",)
+
+
+def test_stop_flag_abandons_the_run_but_still_writes(tmp_path):
+    folder = tmp_path / "counters"
+    folder.mkdir()
+    for name in ("alpha", "beta", "gamma"):
+        _make_counter_workbook(folder / f"{name} counter aug 26.xlsx")
+
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] > 2          # let one workbook through, then stop
+
+    result = cm.build_from_folder(folder, tmp_path / "m.xlsx", month=8, year=2026,
+                                  stop_flag=stop)
+    assert result.stopped is True
+    assert result.counters < 3
+    assert result.path.exists()
+
+
+def test_a_single_file_can_be_the_whole_input(tmp_path):
+    """A counter that re-sends its workbook alone must be usable on its own."""
+    one = tmp_path / "alpha counter aug 26.xlsx"
+    _make_counter_workbook(one)
+    assert cm.resolve_counter_inputs(one) == [one]
+    assert cm.resolve_counter_inputs(str(one)) == [one]
+
+    result = cm.build_from_inputs(one, tmp_path / "m.xlsx", month=8, year=2026)
+    assert result.counters == 1
+    assert result.rows == 4
+
+
+def test_files_and_folders_can_be_mixed_and_are_de_duplicated(tmp_path):
+    folder = tmp_path / "counters"
+    folder.mkdir()
+    a = folder / "alpha counter aug 26.xlsx"
+    b = folder / "beta counter aug 26.xlsx"
+    loose = tmp_path / "gamma counter aug 26.xlsx"
+    for p in (a, b, loose):
+        _make_counter_workbook(p)
+
+    # the folder ALREADY contains a -- naming it again must not read it twice
+    found = cm.resolve_counter_inputs([folder, a, loose])
+    assert [p.name for p in found] == [a.name, b.name, loose.name]
+
+    result = cm.build_from_inputs([folder, a, loose], tmp_path / "m.xlsx",
+                                  month=8, year=2026)
+    assert result.counters == 3
+    assert result.rows == 12          # 4 rows each, alpha counted once
+
+
+def test_resolver_ignores_junk_selections(tmp_path):
+    _make_counter_workbook(tmp_path / "alpha counter aug 26.xlsx")
+    (tmp_path / "notes.txt").write_text("not a workbook", encoding="utf-8")
+    (tmp_path / "~$alpha counter aug 26.xlsx").write_bytes(b"")
+
+    assert cm.resolve_counter_inputs(tmp_path / "notes.txt") == []
+    assert cm.resolve_counter_inputs(tmp_path / "nope.xlsx") == []
+    assert cm.resolve_counter_inputs("") == []
+    assert cm.resolve_counter_inputs(None) == []
+    # a folder selection still filters to real workbooks
+    assert [p.name for p in cm.resolve_counter_inputs(tmp_path)] == [
+        "alpha counter aug 26.xlsx"]
+
+
+def test_quoted_paths_from_copy_paste_are_accepted(tmp_path):
+    one = tmp_path / "alpha counter aug 26.xlsx"
+    _make_counter_workbook(one)
+    assert cm.resolve_counter_inputs(f'"{one}"') == [one]
+
+
+def test_lock_files_are_ignored(tmp_path):
+    (tmp_path / "~$alpha counter aug 26.xlsx").write_bytes(b"")
+    _make_counter_workbook(tmp_path / "alpha counter aug 26.xlsx")
+    found = cm.find_counter_workbooks(tmp_path)
+    assert [p.name for p in found] == ["alpha counter aug 26.xlsx"]
+
+
+def test_master_path_names_the_month(tmp_path):
+    p = cm.build_master_path(tmp_path, 8, 2026)
+    assert p.name == "Counter_Master_Aug2026.xlsx"
+    assert p.parent == tmp_path
+
+
+def test_an_empty_folder_is_an_error_not_an_empty_report(tmp_path):
+    with pytest.raises(ValueError, match="No .xlsx"):
+        cm.build_from_folder(tmp_path, tmp_path / "m.xlsx", month=8, year=2026)
+
+
+def test_days_in_month_is_respected_for_coverage(tmp_path):
+    """February has 28 days, so one filed day is worth more coverage than in August."""
+    folder = tmp_path / "c"
+    folder.mkdir()
+    _make_counter_workbook(folder / "alpha counter feb 26.xlsx")
+    feb = cm.build_from_folder(folder, tmp_path / "f.xlsx", month=2, year=2026)
+    aug = cm.build_from_folder(folder, tmp_path / "g.xlsx", month=8, year=2026)
+    assert feb.coverage > aug.coverage
+    assert date(2026, 2, 1)      # sanity: the month is real

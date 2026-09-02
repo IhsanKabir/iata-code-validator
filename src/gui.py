@@ -92,6 +92,11 @@ MSG_FCA_PROGRESS = "fca_progress"      # payload: (done, total, msg)
 MSG_FCA_DONE = "fca_done"              # payload: dict(path, cases, flagged)
 MSG_FCA_ERROR = "fca_error"
 
+MSG_CTR_PERIOD = "ctr_period"          # payload: dict(month, year, agreement)
+MSG_CTR_PROGRESS = "ctr_progress"      # payload: (done, total, msg)
+MSG_CTR_DONE = "ctr_done"              # payload: dict(path, counters, employees…)
+MSG_CTR_ERROR = "ctr_error"
+
 # NATTA (Nepal) member-directory worker → GUI message types
 MSG_NATTA_LOG = "natta_log"
 MSG_NATTA_PROGRESS = "natta_progress"   # payload: (done:int, total:int, msg:str)
@@ -208,6 +213,7 @@ _USAGE_EVENTS: "dict[str, tuple[str, str | None]]" = {
     MSG_TRAFFIC_DONE: ("traffic_movement", None),
     MSG_NATTA_DONE: ("natta_extract", "count"),
     MSG_FCA_DONE: ("flight_change_audit", "cases"),
+    MSG_CTR_DONE: ("counter_master", "counters"),
     MSG_MAIL_DONE: ("mailer_send", "sent"),
     MSG_UPDATE_FOUND: ("update_available", None),
     MSG_UPDATE_DOWNLOADED: ("update_downloaded", None),
@@ -224,6 +230,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
     MSG_TRAFFIC_ERROR: "traffic_error",
     MSG_NATTA_ERROR: "natta_error",
     MSG_FCA_ERROR: "flight_change_audit_error",
+    MSG_CTR_ERROR: "counter_master_error",
     MSG_ZENITH_ERROR: "zenith_customer_error",
     MSG_ZENITH_LOGIN_FAILED: "zenith_login_failed",
     MSG_ZENITH_FL_ERROR: "zenith_flight_loads_error",
@@ -292,6 +299,23 @@ class App(WhatsAppMixin, HealthMixin):
         self.fca_basis = tk.StringVar(value="cumulative")
         self._fca_stop_flag = threading.Event()
         self._fca_worker: threading.Thread | None = None
+
+        # ----- Counter Activity master report state -----
+        # Offline: this reads the counters' own monthly workbooks, so it needs no
+        # Zenith session. It lives here because the counters are Zenith stations.
+        from datetime import date as _date
+        _today = _date.today()
+        # the input may be a folder OR an explicit set of workbooks; the entry
+        # shows what was chosen, and _ctr_files holds the set when it is files
+        self.ctr_input_dir = tk.StringVar(value="")
+        self._ctr_files: list[Path] = []
+        self.ctr_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.ctr_month = tk.StringVar(value=f"{_today.month:02d}")
+        self.ctr_year = tk.IntVar(value=_today.year)
+        self.ctr_sales_path = tk.StringVar(value="")
+        self._ctr_stop_flag = threading.Event()
+        self._ctr_worker: threading.Thread | None = None
+        self._ctr_period_worker: threading.Thread | None = None
 
         # ----- NATTA (Nepal) sub-tab state -----
         self.natta_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
@@ -4234,6 +4258,72 @@ class App(WhatsAppMixin, HealthMixin):
             self.fca_progress_label.configure(text="Failed.")
             messagebox.showerror("Flight Change Authenticator", str(payload))
             self._fca_reset_buttons()
+        # ------ Counter Activity messages ------
+        elif kind == MSG_CTR_PERIOD:
+            info = payload if isinstance(payload, dict) else {}
+            if info.get("error"):
+                self.ctr_period_label.configure(
+                    text=f"  could not read the month: {info['error']}")
+            elif info.get("month"):
+                self.ctr_month.set(f"{int(info['month']):02d}")
+                if info.get("year"):
+                    self.ctr_year.set(int(info["year"]))
+                agree, dissent = info.get("agreement", 0), info.get("dissent", 0)
+                note = (f", {dissent} sheet(s) disagree" if dissent else "")
+                self.ctr_period_label.configure(
+                    text=f"  read from the files ({agree:.0%} agreement{note})")
+            else:
+                self.ctr_period_label.configure(
+                    text="  the files do not name a month — set it here")
+        elif kind == MSG_CTR_PROGRESS:
+            done, total, msg = payload  # type: ignore[misc]
+            self.ctr_progress_bar["maximum"] = max(1, total)
+            self.ctr_progress_bar["value"] = done
+            self.ctr_progress_label.configure(text=msg)
+        elif kind == MSG_CTR_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            note = " (stopped early)" if info.get("stopped") else ""
+            quiet = info.get("not_reporting") or []
+            self._ctr_log(
+                f"Done{note}: {info.get('counters', 0)} counter(s), "
+                f"{info.get('employees', 0)} employee(s), "
+                f"{info.get('rows', 0):,} transactions · "
+                f"coverage {info.get('coverage', 0):.0%} · "
+                f"net {info.get('net', 0):,.0f} · "
+                f"unallocated {info.get('unallocated_pct', 0):.1%}")
+            if quiet:
+                # not an error: a counter that filed nothing is a finding, and the
+                # totals above are only meaningful once the reader knows who is missing
+                self._ctr_log("Barely reporting: " + ", ".join(quiet))
+            if info.get("window"):
+                sites = info.get("no_report_sites") or []
+                self._ctr_log(
+                    f"Unreported check ({info['window']}): "
+                    f"{info.get('unreported_n', 0):,} sale(s) worth "
+                    f"{info.get('unreported_amount', 0):,.0f} were never written "
+                    f"down · {len(sites)} selling location(s) filed no report")
+                if sites:
+                    self._ctr_log("No report at all: " + ", ".join(sites[:6])
+                                  + (" …" if len(sites) > 6 else ""))
+            self._ctr_log(f"File: {info.get('path', '')}")
+            self.ctr_progress_label.configure(text=f"Done{note}.")
+            messagebox.showinfo(
+                "Counter Activity",
+                f"{info.get('counters', 0)} counter(s), "
+                f"{info.get('employees', 0)} employee(s){note}.\n"
+                f"Reporting coverage {info.get('coverage', 0):.0%}"
+                + (f"\nBarely reporting: {', '.join(quiet)}" if quiet else "")
+                + (f"\n\nUnreported ({info['window']}): "
+                   f"{info.get('unreported_n', 0):,} sale(s) worth "
+                   f"{info.get('unreported_amount', 0):,.0f}"
+                   if info.get("window") else "")
+                + f"\n\n{info.get('path', '')}")
+            self._ctr_reset_buttons()
+        elif kind == MSG_CTR_ERROR:
+            self._ctr_log(f"ERROR: {payload}")
+            self.ctr_progress_label.configure(text="Failed.")
+            messagebox.showerror("Counter Activity", str(payload))
+            self._ctr_reset_buttons()
         # ------ NATTA (Nepal) messages ------
         elif kind == MSG_NATTA_LOG:
             self._natta_log(str(payload))
@@ -5619,14 +5709,17 @@ class App(WhatsAppMixin, HealthMixin):
         flight_inner = ttk.Frame(inner_nb)
         history_inner = ttk.Frame(inner_nb)
         pnr_bulk_inner = ttk.Frame(inner_nb)
+        counter_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
         inner_nb.add(history_inner, text="Flight History Analyzer")
         inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
+        inner_nb.add(counter_inner, text="Counter Activity")
         inner_nb.add(reports_inner, text="Reports")
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
+        self._build_zenith_counter_tab(counter_inner)
         self._build_zenith_reports_tab(reports_inner)
 
         # From here, the existing Customer Lookup form goes into
@@ -6059,6 +6152,304 @@ class App(WhatsAppMixin, HealthMixin):
             "path": str(out), "cases": len(cases), "flagged": flagged,
             "pnrs": len(by_pnr), "same_agent": sum(1 for c in cases if c.same_agent),
             "stopped": self._fca_stop_flag.is_set(),
+        })
+
+    # ------------------------------------------------------------------
+    # Counter Activity — the counters' own monthly workbooks -> one master sheet
+    # ------------------------------------------------------------------
+    def _build_zenith_counter_tab(self, parent: ttk.Frame) -> None:
+        body = self._section(
+            parent, "Counter Activity  ·  master summary",
+            help_text=(
+                "Point this at the counters' monthly workbooks — one file per "
+                "counter, a sheet per day — and it produces a single master "
+                "sheet: estate totals, payment types, a counter league table, an "
+                "employee scorecard, and a data-quality verdict per counter.\n\n"
+                "Choose a whole folder, or pick individual workbooks when only a "
+                "few counters have come in. Picking files replaces the folder, "
+                "and typing a path by hand replaces both.\n\n"
+                "No Zenith sign-in is needed: this reads the counters' own files.\n\n"
+                "Values are recognised by shape (PNR / mobile / money) rather than "
+                "by column position, because columns drift between sheets. A "
+                "payment is credited to a channel only when it reconciles against "
+                "the sale; anything left over is shown as Unallocated instead of "
+                "being guessed."
+            ),
+        )
+        in_entry = ttk.Entry(body, textvariable=self.ctr_input_dir)
+        # typing a path by hand replaces any explicit file selection
+        in_entry.bind("<KeyRelease>", lambda _e: self._ctr_manual_entry())
+        picks = ttk.Frame(body)
+        ttk.Button(picks, text="Folder…",
+                   command=self._ctr_pick_folder).pack(side="left")
+        ttk.Button(picks, text="Files…",
+                   command=self._ctr_pick_files).pack(side="left", padx=(4, 0))
+        self._form_row(body, 0, "Counter reports:", in_entry, suffix=picks)
+        self.ctr_found_label = ttk.Label(
+            body, text="Choose a folder, or pick individual workbooks.",
+            style="Hint.TLabel")
+        self.ctr_found_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
+
+        period = self._section(
+            parent, "Reporting month",
+            help_text=(
+                "Read from the workbooks themselves — each day-sheet titles itself "
+                "'Counter Daily Activities of 01 Aug 2026'.\n\n"
+                "It is decided by majority vote rather than by the first sheet "
+                "found, because some sheets carry a title left over from the "
+                "previous month's template. Override it here if the vote is wrong."
+            ),
+        )
+        prow = ttk.Frame(period)
+        prow.pack(fill="x", pady=(2, 0))
+        ttk.Label(prow, text="Month:").pack(side="left", padx=(2, 4))
+        ttk.Combobox(
+            prow, textvariable=self.ctr_month, state="readonly", width=5,
+            values=[f"{m:02d}" for m in range(1, 13)],
+        ).pack(side="left")
+        ttk.Label(prow, text="   Year:").pack(side="left", padx=(8, 4))
+        ttk.Spinbox(prow, from_=2020, to=2100, width=7,
+                    textvariable=self.ctr_year).pack(side="left")
+        self.ctr_period_label = ttk.Label(
+            prow, text="  choose the workbooks and the month is read from them",
+            style="Hint.TLabel")
+        self.ctr_period_label.pack(side="left", padx=(10, 0))
+
+        sales = self._section(
+            parent, "Sales report  ·  unreported-sales check (optional)",
+            help_text=(
+                "Add the airline sales report and the output gains a second sheet "
+                "showing what the system recorded but the counters never wrote "
+                "down — by counter, by sale agent, and PNR by PNR.\n\n"
+                "Only the days the sales report actually covers are judged, so a "
+                "one-week export does not report three weeks of imaginary gaps. A "
+                "sale the counter logged on a different day is reported as "
+                "date-shifted, not as missing.\n\n"
+                "Overseas counters are compared on COUNTS only: they write their "
+                "sheets in local currency while the sales report is in base "
+                "currency, so the amounts are not the same measure."
+            ),
+        )
+        sales_entry = ttk.Entry(sales, textvariable=self.ctr_sales_path)
+        sales_btn = ttk.Button(sales, text="Browse…",
+                               command=self._ctr_pick_sales)
+        self._form_row(sales, 0, "Sales report:", sales_entry, suffix=sales_btn)
+        self.ctr_sales_label = ttk.Label(
+            sales, text="Leave empty to skip the unreported check.",
+            style="Hint.TLabel")
+        self.ctr_sales_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
+
+        out_body = self._section(parent, "Output")
+        out_entry = ttk.Entry(out_body, textvariable=self.ctr_output_dir)
+        out_btn = ttk.Button(out_body, text="Browse…", command=self._ctr_pick_output)
+        self._form_row(out_body, 0, "Folder:", out_entry, suffix=out_btn)
+
+        ctl = ttk.Frame(out_body)
+        ctl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.btn_ctr_run = ttk.Button(
+            ctl, text="Build master summary", command=self._ctr_run,
+            style="Primary.TButton")
+        self.btn_ctr_run.pack(side="left")
+        self.btn_ctr_stop = ttk.Button(
+            ctl, text="Stop", command=self._ctr_stop, state="disabled",
+            style="Danger.TButton")
+        self.btn_ctr_stop.pack(side="left", padx=(8, 0))
+
+        prog = self._section(parent, "Progress")
+        self.ctr_progress_bar = ttk.Progressbar(prog, mode="determinate")
+        self.ctr_progress_bar.pack(fill="x")
+        self.ctr_progress_label = ttk.Label(
+            prog, text="Choose the folder of counter workbooks, then build.",
+            style="Hint.TLabel")
+        self.ctr_progress_label.pack(anchor="w", pady=(2, 0))
+
+        log_body = self._section(parent, "Log")
+        box = ttk.Frame(log_body)
+        box.pack(fill="both", expand=True)
+        self.ctr_log_text = tk.Text(
+            box, height=10, wrap="none", font=("Consolas", 9), relief="flat",
+            borderwidth=1, highlightthickness=1, highlightbackground="#cbd5e1")
+        self.ctr_log_text.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(box, command=self.ctr_log_text.yview)
+        sb.pack(side="right", fill="y")
+        self.ctr_log_text.configure(yscrollcommand=sb.set, state="disabled")
+
+    def _ctr_pick_folder(self) -> None:
+        d = filedialog.askdirectory(title="Folder holding the counter workbooks")
+        if not d:
+            return
+        self._ctr_files = []
+        self.ctr_input_dir.set(d)
+        self._ctr_refresh_found()
+
+    def _ctr_pick_files(self) -> None:
+        """Pick workbooks directly — counters often arrive one at a time."""
+        files = filedialog.askopenfilenames(
+            title="Pick the counter workbooks",
+            filetypes=[("Excel workbooks", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        if not files:
+            return
+        self._ctr_files = [Path(f) for f in files]
+        self.ctr_input_dir.set(
+            str(self._ctr_files[0]) if len(self._ctr_files) == 1
+            else f"{len(self._ctr_files)} files selected")
+        self._ctr_refresh_found()
+
+    def _ctr_manual_entry(self) -> None:
+        """A hand-typed path wins over whatever was picked from the dialog."""
+        self._ctr_files = []
+        self._ctr_refresh_found()
+
+    def _ctr_selection(self):
+        """Explicit files if any were picked, otherwise whatever the box says."""
+        return self._ctr_files or self.ctr_input_dir.get()
+
+    def _ctr_refresh_found(self) -> None:
+        """Say how many workbooks were seen before the user commits to a run."""
+        from . import counter_master
+        sel = self._ctr_selection()
+        if not sel:
+            self.ctr_found_label.configure(
+                text="Choose a folder, or pick individual workbooks.")
+            return
+        try:
+            found = counter_master.resolve_counter_inputs(sel)
+        except Exception as exc:  # noqa: BLE001
+            self.ctr_found_label.configure(text=f"Could not read that: {exc}")
+            return
+        if not found:
+            self.ctr_found_label.configure(text="No Excel workbooks found there.")
+            return
+        names = ", ".join(p.stem for p in found[:4])
+        more = f" … +{len(found) - 4} more" if len(found) > 4 else ""
+        self.ctr_found_label.configure(
+            text=f"{len(found)} workbook(s): {names}{more}")
+        self._ctr_detect_period()
+
+    def _ctr_pick_sales(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Pick the airline sales report",
+            filetypes=[("Excel workbooks", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        if not f:
+            return
+        self.ctr_sales_path.set(f)
+        self.ctr_sales_label.configure(
+            text="Will be compared against what the counters reported.")
+
+    def _ctr_detect_period(self) -> None:
+        """Read the month out of the workbooks, off the UI thread (~9s)."""
+        if self._ctr_period_worker is not None and self._ctr_period_worker.is_alive():
+            return
+        sel = self._ctr_selection()
+        if not sel:
+            return
+        self.ctr_period_label.configure(text="  reading the month from the files…")
+
+        def work():
+            from . import counter_master
+            try:
+                month, year, votes, agree = counter_master.detect_period(sel)
+            except Exception as exc:  # noqa: BLE001
+                self._post(MSG_CTR_PERIOD, {"error": str(exc)})
+                return
+            self._post(MSG_CTR_PERIOD, {
+                "month": month, "year": year, "agreement": agree,
+                "dissent": sum(v for k, v in votes.items()
+                               if (month, year) != k) if votes else 0,
+            })
+
+        self._ctr_period_worker = threading.Thread(target=work, daemon=True)
+        self._ctr_period_worker.start()
+
+    def _ctr_pick_output(self) -> None:
+        d = filedialog.askdirectory(title="Choose output folder")
+        if d:
+            self.ctr_output_dir.set(d)
+
+    def _ctr_log(self, msg: str) -> None:
+        self._append_log(self.ctr_log_text, msg)
+
+    def _ctr_stop(self) -> None:
+        self._ctr_stop_flag.set()
+        self._ctr_log("Stopping after the current workbook — "
+                      "the counters read so far are still written.")
+
+    def _ctr_reset_buttons(self) -> None:
+        self.btn_ctr_run.configure(state="normal")
+        self.btn_ctr_stop.configure(state="disabled")
+
+    def _ctr_run(self) -> None:
+        from . import counter_master
+        if self._ctr_worker is not None and self._ctr_worker.is_alive():
+            return
+        sel = self._ctr_selection()
+        if not sel:
+            messagebox.showerror(
+                "Counter Activity",
+                "Choose a folder of counter workbooks, or pick the files.")
+            return
+        try:
+            found = counter_master.resolve_counter_inputs(sel)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Counter Activity", f"Could not read input: {exc}")
+            return
+        if not found:
+            messagebox.showerror(
+                "Counter Activity",
+                f"No Excel counter workbooks found in:\n{self.ctr_input_dir.get()}")
+            return
+        try:
+            month, year = int(self.ctr_month.get()), int(self.ctr_year.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Counter Activity", "Pick a valid month and year.")
+            return
+
+        self._ctr_stop_flag.clear()
+        self.btn_ctr_run.configure(state="disabled")
+        self.btn_ctr_stop.configure(state="normal")
+        self.ctr_progress_bar.configure(value=0, maximum=len(found))
+        self._ctr_log(f"Reading {len(found)} counter workbook(s) for "
+                      f"{month:02d}/{year}…")
+        self._ctr_worker = threading.Thread(
+            target=self._ctr_worker_run,
+            args=(found, month, year,
+                  Path(self.ctr_output_dir.get().strip() or str(Path.home())),
+                  self.ctr_sales_path.get().strip() or None),
+            daemon=True)
+        self._ctr_worker.start()
+
+    def _ctr_worker_run(self, paths, month: int, year: int, out_dir: Path,
+                        sales_report=None) -> None:
+        from . import counter_master
+
+        def progress(done, total, name):
+            # the sales-report pass reports rows, not files, so it sends 0/0
+            msg = name if not total else f"{done}/{total} · {name}"
+            self._post(MSG_CTR_PROGRESS, (done, total, msg))
+
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            result = counter_master.build_master(
+                paths, counter_master.build_master_path(out_dir, month, year),
+                month=month, year=year, progress_cb=progress,
+                stop_flag=lambda: self._ctr_stop_flag.is_set(),
+                sales_report=sales_report)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Counter Activity master build failed")
+            self._post(MSG_CTR_ERROR, f"{type(exc).__name__}: {exc}")
+            return
+
+        self._post(MSG_CTR_DONE, {
+            "path": str(result.path), "counters": result.counters,
+            "employees": result.employees, "rows": result.rows,
+            "coverage": result.coverage, "net": result.net,
+            "unallocated_pct": result.unallocated_pct,
+            "not_reporting": list(result.not_reporting),
+            "stopped": result.stopped,
+            "unreported_n": result.unreported_n,
+            "unreported_amount": result.unreported_amount,
+            "no_report_sites": list(result.no_report_sites),
+            "window": result.window,
         })
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
