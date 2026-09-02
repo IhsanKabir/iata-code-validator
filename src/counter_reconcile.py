@@ -288,6 +288,9 @@ def suggest_mapping(counter_names, points_of_sale):
 # below this many sales a month, a point of sale is unlikely to be a staffed desk
 LOW_VOLUME = 5
 
+# matched pairs needed before the ratio between them is trusted as a rate
+MIN_RATE_PAIRS = 8
+
 MATCHED, UNREPORTED, DATE_SHIFTED, NOT_IN_SYSTEM, BLOCK_MISMATCH = (
     "MATCHED", "UNREPORTED", "DATE-SHIFTED", "NOT IN SYSTEM", "BLOCK MISMATCH")
 
@@ -321,6 +324,7 @@ class ReconResult:
     unmapped_pos: list = field(default_factory=list)
     non_comparable: list = field(default_factory=list)
     currency_suspect: dict = field(default_factory=dict)
+    currency_rates: dict = field(default_factory=dict)
     ambiguous: dict = field(default_factory=dict)
     clean_matches: int = 0
     mapping: dict = field(default_factory=dict)
@@ -344,6 +348,20 @@ class ReconResult:
 
     def comparable(self, counter: str) -> bool:
         return counter not in set(self.non_comparable)
+
+    def rate_for(self, counter: str):
+        """The counter's own exchange rate, only when the data supports one.
+
+        Derived from sales that appear on BOTH sides: the system records the
+        base-currency figure and the counter records its own, so their ratio IS
+        the rate that counter was using. Nothing external is assumed. It is
+        refused when there are too few pairs to be sure, or when the pairs
+        disagree -- a sheet written in two currencies has no single rate.
+        """
+        info = self.currency_rates.get(counter)
+        if not info or info["pairs"] < MIN_RATE_PAIRS or info["mixed"]:
+            return None
+        return info
 
     @property
     def omitted(self) -> list:
@@ -539,6 +557,13 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
             continue
         rs = sorted(rs)
         median = rs[len(rs) // 2]
+        # The SPREAD decides whether one rate can stand for the whole sheet.
+        # SIN writes some rows in SGD and some already in BDT, so its pairs sit
+        # at both 97 and 1.00 -- a single rate there would be fiction.
+        lo, hi = rs[len(rs) // 10], rs[9 * len(rs) // 10]
+        spread = (hi - lo) / median if median else 99
+        res.currency_rates[cnt] = {"rate": median, "pairs": len(rs),
+                                   "spread": spread, "mixed": spread > 0.1}
         if median > 2 or median < 0.5:
             res.currency_suspect[cnt] = median
             if cnt not in res.non_comparable:

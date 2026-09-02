@@ -514,9 +514,9 @@ def test_the_leaderboards_rank_by_value_and_show_a_per_day_column(tmp_path):
     book.close()
 
 
-def test_a_local_currency_counter_is_named_rather_than_ranked(tmp_path):
-    """Ranking a CNY sheet against BDT ones would put it wherever the exchange
-    rate happens to land it."""
+def test_a_local_currency_counter_is_named_when_no_rate_can_be_derived(tmp_path):
+    """With no sales data there are no matched pairs, so there is no rate to
+    convert with. Ranking anyway would place it arbitrarily."""
     folder = tmp_path / "c"
     folder.mkdir()
     for name, cur, amount in (("alpha", "BDT", 100000), ("can", "CNY", 5000)):
@@ -535,7 +535,7 @@ def test_a_local_currency_counter_is_named_rather_than_ranked(tmp_path):
     book = load_workbook(out)
     _h, rows, note = _leaderboard_rows(book["Master"], "BY VALUE ISSUED")
     assert [r[3] for r in rows] == ["Alpha"]        # only the BDT counter ranks
-    assert "another currency" in note
+    assert "no rate could be derived" in note
     assert "CAN" in note          # a three-letter station keeps its capitals
     book.close()
 

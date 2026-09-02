@@ -706,6 +706,54 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     reported = sum(len(m["days"]) for m in metas)
     expected = len(metas) * days_in_month
 
+    recon, gap_source = None, ""
+    # Stop was only checked while reading workbooks, so pressing it during the
+    # sales pass did nothing for the ~11s that takes. The master sheet is already
+    # built at this point, so skipping the gap sheet still leaves a usable file.
+    if (sales_report or use_warehouse) and not (stop_flag is not None and stop_flag()):
+        # a second sheet in the SAME workbook: the unreported check only means
+        # anything read next to what was reported
+        from . import counter_reconcile as cr
+        note = ((lambda n: progress_cb(0, 0, f"sales data: {n:,} rows"))
+                if progress_cb else None)
+        if sales_report:
+            sales = cr.read_sales_report(sales_report, progress_cb=note)
+            gap_source = Path(sales_report).name
+        else:
+            # the whole month straight from the local warehouse -- no exporting,
+            # merging or normalising by hand
+            src = cr.find_sales_warehouse()
+            if src is None:
+                raise ValueError(
+                    "No sales warehouse found on this machine, so the gap sheet "
+                    "cannot be built. Untick the box, or point ANALYSIS_HOME at "
+                    "the data root.")
+            if not src.covers(month, year):
+                raise ValueError(
+                    f"The local sales data covers {src.first_day:%d %b %Y} to "
+                    f"{src.last_day:%d %b %Y}, which does not include "
+                    f"{date(year, month, 1):%B %Y}.")
+            sales = cr.read_sales_from_warehouse(src, month=month, year=year,
+                                                 progress_cb=note)
+            gap_source = src.label
+        mapping, _scores, _uc, _up, ambiguous = cr.suggest_mapping(
+            sorted(ctr), sales.points_of_sale)
+        filed_days = {m["counter"]: m["days"] for m in metas}
+        recon = cr.reconcile(
+            sales, all_sales, mapping, base_currency=base_currency,
+            currency_by_counter={m["counter"]: m["currency"] for m in metas},
+            filed_days=filed_days, ambiguous=ambiguous)
+        if zenith_session is not None:
+            # the sales data names a Sale agent, but for a PNR nobody wrote down
+            # a live lookup is the only way left to put detail against it
+            from .zenith_pnr_client import lookup_pnr
+            counter_blocks.enrich_from_zenith(
+                zenith_session, recon.omitted, lookup=lookup_pnr,
+                max_lookups=max_lookups, stop_flag=stop_flag,
+                progress_cb=(lambda d, n, code: progress_cb(
+                    d, n, f"Zenith lookup {d}/{n} · {code}"))
+                if progress_cb else None)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Master"
@@ -941,27 +989,43 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
 
     # ---- who sold the most ------------------------------------------------
     r = _band(ws, r, "BEST SALES PEOPLE",
-              "ranked across the estate by value; the per-active-day column is "
-              "there because footfall and attendance differ")
+              "ranked across the estate by value; overseas sheets are converted "
+              "at the rate their OWN matched sales imply, never an assumed one")
+
+    def _rate_for(counter):
+        """The counter's own rate, from sales that appear on BOTH sides."""
+        return recon.rate_for(counter) if recon is not None else None
+
+    def _in_base(a, block):
+        """(value in base currency, the rate used or None, ranked?)."""
+        if a.currency == base_currency and a.counter not in (
+                recon.currency_suspect if recon else {}):
+            return a.val[block], None, True
+        info = _rate_for(a.counter)
+        if info is None:
+            return a.val[block], None, False
+        return a.val[block] * info["rate"], info, True
 
     def _leaderboard(row, block, title, unit, top=15):
-        # local-currency sheets cannot be ranked against BDT ones, so they are
-        # named underneath rather than mixed into the order
-        pool = [a for k, a in emp.items()
-                if k and a.currency == base_currency and a.val[block] > 0]
-        other = sorted({a.counter for k, a in emp.items()
-                        if k and a.currency != base_currency and a.val[block] > 0})
+        pool, other = [], []
+        for k, a in emp.items():
+            if not k or a.val[block] <= 0:
+                continue
+            value, info, ranked = _in_base(a, block)
+            (pool if ranked else other).append((a, value, info))
+        other = sorted({a.counter for a, _v, _i in other})
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=21)
         _cell(ws, row, 1, f"   {title}", bold=True, size=10, color=NAVY,
               fill=LIGHT)
         row += 1
         row = _headers(ws, row, [
-            "#", "Employee", "Employee ID", "Counter", unit, "Value",
-            "Avg ticket", "Days active", "Value per active day", "Share of top",
-            "", "", "", "", "", "", "", "", "", "", ""])
-        best = max((a.val[block] for a in pool), default=0)
-        for pos, a in enumerate(sorted(pool, key=lambda x: -x.val[block])[:top],
-                                start=1):
+            "#", "Employee", "Employee ID", "Counter", unit,
+            f"Value ({base_currency})", "Avg each", "Days active",
+            "Value per active day", "Share of top", "Rate applied",
+            "", "", "", "", "", "", "", "", "", ""])
+        best = max((v for _a, v, _i in pool), default=0)
+        for pos, (a, value, info) in enumerate(
+                sorted(pool, key=lambda x: -x[1])[:top], start=1):
             days = len(a.days) or 1
             _cell(ws, row, 1, pos, bold=pos <= 3, size=10, border=True,
                   align="center", fill=GOOD if pos == 1 else None)
@@ -969,26 +1033,30 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             _cell(ws, row, 3, a.key, size=8, color=GREY, border=True)
             _cell(ws, row, 4, a.counter, size=9, border=True)
             _cell(ws, row, 5, a.n[block], size=9, border=True, align="center")
-            _cell(ws, row, 6, a.val[block], fmt=MONEY, bold=True, size=10,
+            _cell(ws, row, 6, value, fmt=MONEY, bold=True, size=10,
                   border=True, align="right")
-            _cell(ws, row, 7, a.val[block] / a.n[block] if a.n[block] else None,
-                  fmt=MONEY, size=9, border=True, align="right")   # avg each
+            _cell(ws, row, 7, value / a.n[block] if a.n[block] else None,
+                  fmt=MONEY, size=9, border=True, align="right")
             _cell(ws, row, 8, len(a.days) or None, size=9, border=True,
                   align="center")
-            _cell(ws, row, 9, a.val[block] / days, fmt=MONEY, size=9,
+            _cell(ws, row, 9, value / days, fmt=MONEY, size=9,
                   border=True, align="right")
-            _cell(ws, row, 10, a.val[block] / best if best else None, fmt=PCT,
+            _cell(ws, row, 10, value / best if best else None, fmt=PCT,
                   size=9, border=True, align="center")
-            for j in range(11, 22):
+            _cell(ws, row, 11,
+                  (f"x{info['rate']:.2f} from {info['pairs']} matched sales"
+                   if info else ""), size=8, color=GREY, border=True)
+            for j in range(12, 22):
                 _cell(ws, row, j, None, border=True)
             row += 1
         if other:
             ws.merge_cells(start_row=row, start_column=1, end_row=row,
                            end_column=21)
             _cell(ws, row, 1,
-                  "   not ranked — these counters write their sheets in another "
-                  "currency: " + ", ".join(other),
-                  size=8, color=GREY, fill=PAPER)
+                  "   not ranked — no rate could be derived for: "
+                  + ", ".join(other)
+                  + " (too few sales matched on both sides, or the sheet mixes "
+                    "currencies)", size=8, color="C00000", fill=PAPER)
             row += 1
         if pool:
             first_data = row - len(pool[:top]) - (1 if other else 0)
@@ -1161,57 +1229,11 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
 
-    recon, gap_source = None, ""
-    # Stop was only checked while reading workbooks, so pressing it during the
-    # sales pass did nothing for the ~11s that takes. The master sheet is already
-    # built at this point, so skipping the gap sheet still leaves a usable file.
-    if (sales_report or use_warehouse) and not (stop_flag is not None and stop_flag()):
-        # a second sheet in the SAME workbook: the unreported check only means
-        # anything read next to what was reported
-        from . import counter_reconcile as cr
-        note = ((lambda n: progress_cb(0, 0, f"sales data: {n:,} rows"))
-                if progress_cb else None)
-        if sales_report:
-            sales = cr.read_sales_report(sales_report, progress_cb=note)
-            gap_source = Path(sales_report).name
-        else:
-            # the whole month straight from the local warehouse -- no exporting,
-            # merging or normalising by hand
-            src = cr.find_sales_warehouse()
-            if src is None:
-                raise ValueError(
-                    "No sales warehouse found on this machine, so the gap sheet "
-                    "cannot be built. Untick the box, or point ANALYSIS_HOME at "
-                    "the data root.")
-            if not src.covers(month, year):
-                raise ValueError(
-                    f"The local sales data covers {src.first_day:%d %b %Y} to "
-                    f"{src.last_day:%d %b %Y}, which does not include "
-                    f"{date(year, month, 1):%B %Y}.")
-            sales = cr.read_sales_from_warehouse(src, month=month, year=year,
-                                                 progress_cb=note)
-            gap_source = src.label
-        mapping, _scores, _uc, _up, ambiguous = cr.suggest_mapping(
-            sorted(ctr), sales.points_of_sale)
-        filed_days = {m["counter"]: m["days"] for m in metas}
-        recon = cr.reconcile(
-            sales, all_sales, mapping, base_currency=base_currency,
-            currency_by_counter={m["counter"]: m["currency"] for m in metas},
-            filed_days=filed_days, ambiguous=ambiguous)
-        if zenith_session is not None:
-            # the sales data names a Sale agent, but for a PNR nobody wrote down
-            # a live lookup is the only way left to put detail against it
-            from .zenith_pnr_client import lookup_pnr
-            counter_blocks.enrich_from_zenith(
-                zenith_session, recon.omitted, lookup=lookup_pnr,
-                max_lookups=max_lookups, stop_flag=stop_flag,
-                progress_cb=(lambda d, n, code: progress_cb(
-                    d, n, f"Zenith lookup {d}/{n} · {code}"))
-                if progress_cb else None)
+
+    if recon is not None:
         cr.write_reconciliation(wb.create_sheet("Unreported"), recon,
                                 base_currency=base_currency,
                                 filed_days=filed_days)
-
     out_path = Path(out_path)
     wb.save(out_path)
     return MasterResult(
