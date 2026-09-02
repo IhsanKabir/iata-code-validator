@@ -680,3 +680,86 @@ def test_rows_that_neither_sum_nor_match_singly_are_left_alone(tmp_path):
     assert res.per_counter["Baridhara"]["rep_amt"] == pytest.approx(25000)
     flagged = [f for f in res.of(cr.MATCHED) if f.note]
     assert len(flagged) == 1              # reported as an amount mismatch
+
+
+# --------------------------------------------------------------------------
+# the mapping is proved, not assumed
+# --------------------------------------------------------------------------
+def _sales_with(tmp_path, placements):
+    """placements: (locator, point of sale) pairs the SYSTEM recorded."""
+    return _data(tmp_path, [_line(16, "Ticket payment", loc, pos, 1000)
+                            for loc, pos in placements])
+
+
+def test_a_name_match_is_confirmed_by_the_counters_own_pnrs(tmp_path):
+    data = _sales_with(tmp_path, [(f"0A{i:04d}", "DAC-07 Baridhara")
+                                  for i in range(8)])
+    rows = _rows(*[("Baridhara", 16, "ISSUE", f"0A{i:04d}", 1000, "BDT")
+                   for i in range(8)])
+    resolved, proofs = cr.verify_mapping(MAP, rows, data)
+    assert resolved["Baridhara"] == "DAC-07 Baridhara"
+    assert proofs["Baridhara"].verdict == cr.CONFIRMED
+    assert proofs["Baridhara"].share == pytest.approx(1.0)
+
+
+def test_the_evidence_outranks_the_name(tmp_path):
+    """'Uttara' matches DAC-06 by name, but if its PNRs all sit under the
+    USBA-Office desk then that is the desk it is."""
+    data = _sales_with(tmp_path, [(f"0A{i:04d}", "DAC-17 Uttara USBA-Office")
+                                  for i in range(8)])
+    rows = _rows(*[("Uttara", 16, "ISSUE", f"0A{i:04d}", 1000, "BDT")
+                   for i in range(8)])
+    resolved, proofs = cr.verify_mapping({"Uttara": "DAC-06 Uttara"}, rows, data)
+    assert resolved["Uttara"] == "DAC-17 Uttara USBA-Office"
+    assert proofs["Uttara"].verdict == cr.CORRECTED
+    assert proofs["Uttara"].suggested == "DAC-06 Uttara"
+
+
+def test_a_counter_working_two_desks_is_referred_not_guessed(tmp_path):
+    placements = [(f"0A{i:04d}", "ZYL-2 Sylhet City") for i in range(5)]
+    placements += [(f"0B{i:04d}", "ZYL-1 Airport (Sylhet)") for i in range(5)]
+    data = _sales_with(tmp_path, placements)
+    rows = _rows(*[("ZYL", 16, "ISSUE", loc, 1000, "BDT")
+                   for loc, _pos in placements])
+    _resolved, proofs = cr.verify_mapping({"ZYL": "ZYL-2 Sylhet City"}, rows, data)
+    assert proofs["ZYL"].verdict == cr.SPLIT
+    assert proofs["ZYL"].rival
+
+
+def test_too_few_pnrs_to_check_says_so_rather_than_claiming_proof(tmp_path):
+    data = _sales_with(tmp_path, [("0A0001", "INT Doha (Qatar)")])
+    rows = _rows(("DOH", 16, "ISSUE", "0A0001", 1000, "BDT"))
+    _resolved, proofs = cr.verify_mapping({"DOH": "INT Doha (Qatar)"}, rows, data)
+    assert proofs["DOH"].verdict == cr.UNPROVEN
+
+
+def test_gds_placements_never_prove_a_counter(tmp_path):
+    data = _sales_with(tmp_path, [(f"0A{i:04d}", "EXTRANET AGENC.")
+                                  for i in range(8)])
+    rows = _rows(*[("Baridhara", 16, "ISSUE", f"0A{i:04d}", 1000, "BDT")
+                   for i in range(8)])
+    _resolved, proofs = cr.verify_mapping(MAP, rows, data)
+    assert proofs["Baridhara"].verdict == cr.UNPROVEN
+
+
+def test_a_human_decision_is_kept_and_reloaded(tmp_path):
+    path = tmp_path / "counter_points_of_sale.json"
+    proofs = {"DOH": cr.MappingProof("DOH", "INT Doha (Qatar)",
+                                     "INT Doha (Qatar)", cr.UNPROVEN, 0, 0)}
+    cr.save_mapping(path, {"DOH": "INT Doha (Qatar)"}, proofs)
+    assert path.is_file()
+    assert cr.load_mapping_overrides(path) == {"DOH": "INT Doha (Qatar)"}
+
+    # a human edits it; that decision must survive
+    import json
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["counters"]["DOH"]["point_of_sale"] = "INT Muscat (Oman)"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert cr.load_mapping_overrides(path) == {"DOH": "INT Muscat (Oman)"}
+
+
+def test_a_missing_or_broken_mapping_file_is_not_an_error(tmp_path):
+    assert cr.load_mapping_overrides(tmp_path / "nope.json") == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert cr.load_mapping_overrides(bad) == {}

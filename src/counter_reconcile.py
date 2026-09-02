@@ -324,6 +324,7 @@ class ReconResult:
     per_counter: dict = field(default_factory=dict)
     per_agent: dict = field(default_factory=dict)
     unmapped_pos: list = field(default_factory=list)
+    proofs: dict = field(default_factory=dict)
     non_comparable: list = field(default_factory=list)
     currency_suspect: dict = field(default_factory=dict)
     currency_rates: dict = field(default_factory=dict)
@@ -645,6 +646,9 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
           f"  The sales report covers {window} — ONLY those days are judged. "
           f"{res.sales_rows:,} rows read. A sale the counter logged on another "
           f"day counts as date-shifted, not as missing. OMITTED means the counter filed a sheet that day and the sale is not on it; NO SHEET means no sheet exists for that day at all."
+          + (f"   ·   {sum(1 for p in res.proofs.values() if p.verdict == CONFIRMED)}"
+             f" of {len(res.proofs)} counter-to-desk matches are proved by the "
+             f"counters' own PNRs" if res.proofs else "")
           + (f"   ·   For {', '.join(res.non_comparable)} the amount the "
              f"COUNTER wrote is in local currency and is not compared; what is "
              f"MISSING is the system's own figure and is counted in full."
@@ -754,6 +758,14 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
             note.append(f"sheet reads {res.currency_suspect[c]:.0f}x smaller")
         if c in res.ambiguous:
             note.append("also: " + ", ".join(res.ambiguous[c])[:40])
+        proof = res.proofs.get(c)
+        if proof and proof.verdict == UNPROVEN:
+            note.append("MAPPING UNPROVEN — too few PNRs to check")
+        elif proof and proof.verdict == SPLIT:
+            note.append(f"works two desks: {proof.share:.0%} here, "
+                        f"{proof.rival} too")
+        elif proof and proof.verdict == CORRECTED:
+            note.append(f"name said {proof.suggested}; its PNRs say otherwise")
         if v.get("dupe_n"):
             note.append(f"{v['dupe_n']} duplicated row(s) removed")
         if v.get("not_submitted") and v.get("sys_n", 0) < LOW_VOLUME:
@@ -1002,3 +1014,117 @@ def read_sales_from_warehouse(source: WarehouseSource, *, month: int, year: int,
                                         str(cust or "").strip()))
     _fold_groups(groups, data)
     return data
+
+
+# --------------------------------------------------------------------------
+# proving the mapping, rather than trusting it
+# --------------------------------------------------------------------------
+CONFIRMED, CORRECTED, SPLIT, UNPROVEN = (
+    "confirmed", "corrected", "split", "unproven")
+
+
+@dataclass
+class MappingProof:
+    """What the counter's OWN reported PNRs say about which desk it is."""
+    counter: str
+    suggested: str
+    chosen: str
+    verdict: str
+    hits: int = 0
+    total: int = 0
+    rival: str = ""
+    rival_hits: int = 0
+
+    @property
+    def share(self) -> float:
+        return self.hits / self.total if self.total else 0.0
+
+
+def verify_mapping(mapping, counter_rows, sales, *, min_pnrs=5,
+                   min_share=0.7):
+    """Check every mapping against where the system actually put those PNRs.
+
+    Name matching alone is a guess: several places have both a city desk and an
+    airport desk, and the counters spell themselves differently from the sales
+    system. But each counter reports PNRs, and the system knows which point of
+    sale each PNR belongs to -- so the counter's own work says which desk it is,
+    and the guess can be proved, corrected, or referred to a human.
+    """
+    where = defaultdict(set)
+    for ln in sales.lines:
+        where[ln.locator].add(ln.pos)
+
+    by_counter: dict = defaultdict(set)
+    for r in counter_rows:
+        if r.pnr:
+            by_counter[r.counter].add(r.pnr)
+
+    proofs: dict[str, MappingProof] = {}
+    resolved = dict(mapping)
+    for counter, pnrs in by_counter.items():
+        hits: Counter = Counter()
+        for pnr in pnrs:
+            for pos in where.get(pnr, ()):
+                if is_counter_pos(pos):
+                    hits[pos] += 1
+        suggested = mapping.get(counter, "")
+        if not hits or sum(hits.values()) < min_pnrs:
+            proofs[counter] = MappingProof(counter, suggested, suggested,
+                                           UNPROVEN, 0, len(pnrs))
+            continue
+        (best, n), = hits.most_common(1)
+        total = sum(hits.values())
+        rival, rival_n = (hits.most_common(2)[1] if len(hits) > 1 else ("", 0))
+        if n / total < min_share:
+            verdict = SPLIT                    # the counter works two desks
+        elif best == suggested:
+            verdict = CONFIRMED
+        else:
+            verdict = CORRECTED
+            resolved[counter] = best           # the evidence outranks the name
+        proofs[counter] = MappingProof(counter, suggested, resolved[counter],
+                                       verdict, n, total, rival, rival_n)
+    return resolved, proofs
+
+
+def load_mapping_overrides(path) -> dict:
+    """A human's decision about which desk a counter is, if one was recorded.
+
+    Kept beside the app rather than in the code so the two counters whose
+    mapping the data cannot prove can be settled once and stay settled.
+    """
+    import json
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    return {str(k): str(v["point_of_sale"] if isinstance(v, dict) else v)
+            for k, v in (data.get("counters", data) or {}).items()
+            if v}
+
+
+def save_mapping(path, resolved, proofs) -> None:
+    """Record what was used and why, so the next run starts from the evidence."""
+    import json
+    from datetime import datetime
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_note": ("Edit point_of_sale to correct a counter. Anything you "
+                      "set here wins over the automatic match."),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "counters": {
+                c: {"point_of_sale": pos,
+                    "verdict": proofs[c].verdict if c in proofs else "manual",
+                    "share_of_its_pnrs": round(proofs[c].share, 3)
+                    if c in proofs else None}
+                for c, pos in sorted(resolved.items())},
+        }
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+    except OSError:
+        pass          # a report must not fail because a cache could not be kept

@@ -708,7 +708,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
                  base_currency: str = "BDT", progress_cb=None,
                  stop_flag=None, sales_report=None,
                  use_warehouse: bool = False, zenith_session=None,
-                 max_lookups: int = 300) -> MasterResult:
+                 max_lookups: int = 300, mapping_file=None) -> MasterResult:
     """Read every counter workbook and write ONE master sheet.
 
     `progress_cb(done, total, name)` is called per workbook so a UI can show
@@ -738,6 +738,10 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
 
     recon, gap_source = None, ""
     cr = sales = mapping = ambiguous = filed_days = None
+    proofs: dict = {}
+    if mapping_file is None:
+        from . import config
+        mapping_file = config.APP_DIR / "counter_points_of_sale.json"
     # Stop was only checked while reading workbooks, so pressing it during the
     # sales pass did nothing for the ~11s that takes. The master sheet is already
     # built at this point, so skipping the gap sheet still leaves a usable file.
@@ -769,6 +773,12 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             gap_source = src.label
         mapping, _scores, _uc, _up, ambiguous = cr.suggest_mapping(
             sorted(ctr), sales.points_of_sale)
+        # Prove the name match against where the system actually put each
+        # counter's own PNRs, then let any human decision override both.
+        mapping, proofs = cr.verify_mapping(mapping, all_sales, sales)
+        overrides = cr.load_mapping_overrides(mapping_file)
+        mapping.update({c: p for c, p in overrides.items() if c in mapping})
+        cr.save_mapping(mapping_file, mapping, proofs)
         filed_days = {m["counter"]: m["days"] for m in metas}
         recon = cr.reconcile(
             sales, all_sales, mapping, base_currency=base_currency,
@@ -800,6 +810,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             currency_by_counter={m["counter"]: base_currency for m in metas},
             filed_days=filed_days, ambiguous=ambiguous)
         recon.currency_rates, recon.currency_suspect = rates, suspect
+        recon.proofs = proofs
         for c, n in dupes.items():          # the second pass no longer sees them
             recon.per_counter.setdefault(c, {})["dupe_n"] = n
         recon.duplicates_removed = duplicates
@@ -1448,8 +1459,8 @@ def build_master_path(out_dir, month: int, year: int) -> Path:
 
 def build_from_inputs(selection, out_path, *, month: int, year: int,
                       progress_cb=None, stop_flag=None, sales_report=None,
-                      use_warehouse: bool = False,
-                      zenith_session=None) -> MasterResult:
+                      use_warehouse: bool = False, zenith_session=None,
+                      mapping_file=None) -> MasterResult:
     """Build from a folder, a file, or any mix of the two."""
     paths = resolve_counter_inputs(selection)
     if not paths:
@@ -1457,7 +1468,7 @@ def build_from_inputs(selection, out_path, *, month: int, year: int,
     return build_master(paths, out_path, month=month, year=year,
                         progress_cb=progress_cb, stop_flag=stop_flag,
                         sales_report=sales_report, use_warehouse=use_warehouse,
-                        zenith_session=zenith_session)
+                        zenith_session=zenith_session, mapping_file=mapping_file)
 
 
 # kept as the folder-shaped name the first callers used
