@@ -93,6 +93,7 @@ MSG_FCA_DONE = "fca_done"              # payload: dict(path, cases, flagged)
 MSG_FCA_ERROR = "fca_error"
 
 MSG_CTR_PERIOD = "ctr_period"          # payload: dict(month, year, agreement)
+MSG_CTR_WAREHOUSE = "ctr_warehouse"    # payload: WarehouseSource | None
 MSG_CTR_PROGRESS = "ctr_progress"      # payload: (done, total, msg)
 MSG_CTR_DONE = "ctr_done"              # payload: dict(path, counters, employees…)
 MSG_CTR_ERROR = "ctr_error"
@@ -4261,6 +4262,8 @@ class App(WhatsAppMixin, HealthMixin):
             messagebox.showerror("Flight Change Authenticator", str(payload))
             self._fca_reset_buttons()
         # ------ Counter Activity messages ------
+        elif kind == MSG_CTR_WAREHOUSE:
+            self._ctr_apply_warehouse(payload)
         elif kind == MSG_CTR_PERIOD:
             info = payload if isinstance(payload, dict) else {}
             if info.get("error"):
@@ -6355,16 +6358,22 @@ class App(WhatsAppMixin, HealthMixin):
     def _ctr_find_warehouse(self) -> None:
         """Look for the merged sales data and set the checkbox accordingly.
 
-        Detection is a metadata read, so it is fast enough to do inline; the
-        month's rows are only pulled when the report is actually built.
+        Off the UI thread: the probe reads coverage out of a ~300 MB parquet and
+        touches several drive roots, either of which can stall on a slow or
+        network drive, and this runs while the tab is being opened.
         """
-        from . import counter_reconcile
+        def work():
+            from . import counter_reconcile
+            try:
+                src = counter_reconcile.find_sales_warehouse()
+            except Exception as exc:  # noqa: BLE001
+                src = None
+                log.debug("sales warehouse probe failed: %s", exc)
+            self._post(MSG_CTR_WAREHOUSE, src)
 
-        try:
-            src = counter_reconcile.find_sales_warehouse()
-        except Exception as exc:  # noqa: BLE001
-            src = None
-            log.debug("sales warehouse probe failed: %s", exc)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ctr_apply_warehouse(self, src) -> None:
         self._ctr_warehouse = src
         if src is None:
             self.ctr_use_warehouse.set(False)

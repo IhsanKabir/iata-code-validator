@@ -893,7 +893,10 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.page_setup.orientation = "landscape"
 
     recon, gap_source = None, ""
-    if sales_report or use_warehouse:
+    # Stop was only checked while reading workbooks, so pressing it during the
+    # sales pass did nothing for the ~11s that takes. The master sheet is already
+    # built at this point, so skipping the gap sheet still leaves a usable file.
+    if (sales_report or use_warehouse) and not (stop_flag is not None and stop_flag()):
         # a second sheet in the SAME workbook: the unreported check only means
         # anything read next to what was reported
         from . import counter_reconcile as cr

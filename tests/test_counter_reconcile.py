@@ -400,3 +400,46 @@ def test_coverage_is_assumed_when_it_could_not_be_read():
     src = cr.WarehouseSource(path=Path("x"), kind="gold")
     assert src.covers(1, 1999) is True
     assert "coverage unknown" in src.label
+
+
+def test_a_path_with_an_apostrophe_does_not_break_the_query(tmp_path):
+    """C:/Users/O'Brien/... is an ordinary Windows path and ended the SQL string."""
+    src = cr.WarehouseSource(path=Path("C:/Users/O'Brien/gold/sales_bi.parquet"),
+                             kind="gold")
+    with pytest.raises(Exception) as exc:
+        cr.read_sales_from_warehouse(src, month=8, year=2026)
+    # missing file is the right complaint; a parser error would mean the quote
+    # escaped the string literal
+    assert "syntax error" not in str(exc.value).lower()
+    assert "no files found" in str(exc.value).lower()
+
+
+def test_a_counter_row_at_the_month_edge_is_flagged_not_called_a_phantom(tmp_path):
+    """The system side is one month, so a ticket issued on 31 Jul and logged by
+    the counter on 1 Aug cannot match. That is not the same as an invention."""
+    data = _data(tmp_path, [
+        _line(1, "Ticket payment", "0A1111", "DAC-07 Baridhara", 1000),
+        _line(31, "Ticket payment", "0A2222", "DAC-07 Baridhara", 1000)])
+    rows = _rows(("Baridhara", 1, "ISSUE", "0A1111", 1000, "BDT"),
+                 ("Baridhara", 31, "ISSUE", "0A2222", 1000, "BDT"),
+                 ("Baridhara", 1, "ISSUE", "0A8888", 5000, "BDT"),
+                 ("Baridhara", 15, "ISSUE", "0A9999", 5000, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {1, 15, 31}})
+    notes = {f.locator: f.note for f in res.of(cr.NOT_IN_SYSTEM)}
+    assert "adjacent month" in notes["0A8888"]      # day 1
+    assert "adjacent month" not in notes["0A9999"]  # mid-month, a real ghost
+
+
+def test_partial_coverage_only_judges_the_days_that_are_there(tmp_path):
+    """Data ending mid-month must not report the rest of the month as missing."""
+    data = _data(tmp_path, [
+        _line(1, "Ticket payment", "0A1111", "DAC-07 Baridhara", 1000),
+        _line(2, "Ticket payment", "0A2222", "DAC-07 Baridhara", 1000)])
+    rows = _rows(("Baridhara", 1, "ISSUE", "0A1111", 1000, "BDT"),
+                 ("Baridhara", 2, "ISSUE", "0A2222", 1000, "BDT"),
+                 ("Baridhara", 20, "ISSUE", "0A3333", 9000, "BDT"))
+    res = cr.reconcile(data, rows, MAP,
+                       filed_days={"Baridhara": {1, 2, 20}})
+    assert res.of(cr.UNREPORTED) == []
+    assert res.of(cr.NOT_IN_SYSTEM) == []     # day 20 is outside the window
+    assert res.first_day.day == 1 and res.last_day.day == 2

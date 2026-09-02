@@ -481,9 +481,15 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
         cnt = slot["counter"]
         per_counter[cnt]["notsys_n"] += 1
         per_counter[cnt]["notsys_amt"] += slot["amount"]
+        # The system side is one month; a counter row on day 1-2 or 30-31 may
+        # belong to a ticket issued in the adjacent month, which this comparison
+        # cannot see. Flag it rather than call it a phantom.
+        edge = slot["day"] <= 2 or slot["day"] >= 30
         res.findings.append(Finding(
             NOT_IN_SYSTEM, cnt, key[0], None, key[2], key[3],
-            0.0, slot["amount"], note=f"counter day {slot['day']}"))
+            0.0, slot["amount"],
+            note=(f"counter day {slot['day']}"
+                  + (" — may be issued in the adjacent month" if edge else ""))))
 
     # A counter whose matched sales are consistently a different SIZE is keeping
     # its sheet in another currency, whatever its column header claims. Trusting
@@ -811,6 +817,7 @@ def find_sales_warehouse(extra_roots=(), *,
             try:
                 target = (src.path.as_posix() if src.kind == "gold"
                           else src.path.as_posix() + "/**/*.parquet")
+                target = target.replace("'", "''")
                 lo, hi, n = duckdb.connect().execute(
                     f'select min("Pure Date"), max("Pure Date"), count(*) '
                     f"from read_parquet('{target}')").fetchone()
@@ -834,6 +841,9 @@ def read_sales_from_warehouse(source: WarehouseSource, *, month: int, year: int,
                          "sales warehouse cannot be read.")
     target = (source.path.as_posix() if source.kind == "gold"
               else source.path.as_posix() + "/**/*.parquet")
+    # a perfectly ordinary Windows path can contain an apostrophe (C:/Users/
+    # O'Brien/...), which ends the SQL string literal early
+    target = target.replace("'", "''")
     if progress_cb is not None:
         progress_cb(0)
     con = duckdb.connect()
