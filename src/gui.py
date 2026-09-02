@@ -4309,7 +4309,16 @@ class App(WhatsAppMixin, HealthMixin):
                     f"{info.get('unreported_n', 0):,} sale(s) worth "
                     f"{info.get('unreported_amount', 0):,.0f} were never written "
                     f"down · {len(sites)} selling location(s) filed no report")
-                if sites:
+                unsent = info.get("not_submitted_counters") or []
+                if unsent:
+                    # the biggest gap of all is usually a counter nobody chased
+                    self._ctr_log(
+                        f"{len(unsent)} counter(s) sent NO report at all — "
+                        f"{info.get('not_submitted_n', 0):,} sale(s) worth "
+                        f"{info.get('not_submitted_amount', 0):,.0f} "
+                        f"unaccounted for: " + ", ".join(unsent[:6])
+                        + (" …" if len(unsent) > 6 else ""))
+                elif sites:
                     self._ctr_log("No report at all: " + ", ".join(sites[:6])
                                   + (" …" if len(sites) > 6 else ""))
             self._ctr_log(f"File: {info.get('path', '')}")
@@ -4324,6 +4333,10 @@ class App(WhatsAppMixin, HealthMixin):
                    f"{info.get('unreported_n', 0):,} sale(s) worth "
                    f"{info.get('unreported_amount', 0):,.0f}"
                    if info.get("window") else "")
+                + (f"\n{len(info['not_submitted_counters'])} counter(s) sent no "
+                   f"report at all, worth "
+                   f"{info.get('not_submitted_amount', 0):,.0f}"
+                   if info.get("not_submitted_counters") else "")
                 + f"\n\n{info.get('path', '')}")
             self._ctr_reset_buttons()
         elif kind == MSG_CTR_ERROR:
@@ -6533,6 +6546,9 @@ class App(WhatsAppMixin, HealthMixin):
             "unreported_n": result.unreported_n,
             "unreported_amount": result.unreported_amount,
             "no_report_sites": list(result.no_report_sites),
+            "not_submitted_n": result.not_submitted_n,
+            "not_submitted_amount": result.not_submitted_amount,
+            "not_submitted_counters": list(result.not_submitted_counters),
             "window": result.window,
             "gap_source": result.gap_source,
         })

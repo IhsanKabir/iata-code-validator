@@ -178,6 +178,9 @@ class MasterResult:
     unreported_n: int = 0          # missing though a sheet WAS filed that day
     unreported_amount: float = 0.0
     unfiled_n: int = 0             # missing because no sheet exists for the day
+    not_submitted_n: int = 0       # sales at a counter that sent no workbook
+    not_submitted_amount: float = 0.0
+    not_submitted_counters: tuple = ()
     gap_source: str = ""           # what the gap sheet was compared against
     no_report_sites: tuple = ()
     window: str = ""
@@ -1161,6 +1164,10 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         unreported_n=len(recon.omitted) if recon else 0,
         unreported_amount=recon.omitted_amount if recon else 0.0,
         unfiled_n=len(recon.unfiled) if recon else 0,
+        not_submitted_n=len(recon.not_submitted) if recon else 0,
+        not_submitted_amount=recon.not_submitted_amount if recon else 0.0,
+        not_submitted_counters=tuple(sorted(
+            {f.counter for f in recon.not_submitted})) if recon else (),
         gap_source=gap_source,
         no_report_sites=tuple(p for p, _ in recon.unmapped_pos) if recon else (),
         window=(f"{recon.first_day:%d %b} to {recon.last_day:%d %b %Y}"

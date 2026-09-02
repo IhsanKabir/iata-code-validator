@@ -237,11 +237,16 @@ def test_unreported_sales_are_attributed_to_the_system_agent(tmp_path):
     assert res.per_agent["R KRISHNO"] == {"n": 2, "amt": 15000}
 
 
-def test_an_unmapped_counter_is_skipped_rather_than_judged(tmp_path):
+def test_an_unmapped_counter_is_reported_as_missing_not_skipped(tmp_path):
+    """It used to be left out of the comparison entirely, which let a counter
+    that sent nothing look better than one that sent an imperfect report."""
     data = _data(tmp_path, [
         _line(16, "Ticket payment", "0A1111", "DAC-01 Airport (Dhaka)", 10000)])
     res = cr.reconcile(data, [], MAP)
-    assert res.of(cr.UNREPORTED) == []
+    missing = res.of(cr.UNREPORTED)
+    assert [f.counter for f in missing] == ["DAC-01 Airport (Dhaka)"]
+    assert missing[0].submitted is False
+    assert "no report submitted" in missing[0].note
     assert ("DAC-01 Airport (Dhaka)", 1) in res.unmapped_pos
 
 
@@ -443,3 +448,70 @@ def test_partial_coverage_only_judges_the_days_that_are_there(tmp_path):
     assert res.of(cr.UNREPORTED) == []
     assert res.of(cr.NOT_IN_SYSTEM) == []     # day 20 is outside the window
     assert res.first_day.day == 1 and res.last_day.day == 2
+
+
+# --------------------------------------------------------------------------
+# a counter that submitted nothing still belongs in the gap report
+# --------------------------------------------------------------------------
+def test_a_counter_that_sent_no_workbook_is_in_the_gap_table(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-07 Baridhara", 10000),
+        _line(16, "Ticket payment", "0A2222", "DAC-01 Airport (Dhaka)", 40000),
+        _line(17, "Ticket payment", "0A3333", "DAC-01 Airport (Dhaka)", 60000)])
+    rows = _rows(("Baridhara", 16, "ISSUE", "0A1111", 10000, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {16, 17}})
+
+    assert "DAC-01 Airport (Dhaka)" in res.per_counter
+    v = res.per_counter["DAC-01 Airport (Dhaka)"]
+    assert v["sys_n"] == 2
+    assert v["sys_amt"] == pytest.approx(100_000)
+    assert v["not_submitted"] == 1
+    assert res.not_submitted_amount == pytest.approx(100_000)
+    assert {f.counter for f in res.not_submitted} == {"DAC-01 Airport (Dhaka)"}
+
+
+def test_the_three_kinds_of_missing_do_not_overlap(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-07 Baridhara", 10000),
+        _line(17, "Ticket payment", "0A2222", "DAC-07 Baridhara", 20000),
+        _line(16, "Ticket payment", "0A3333", "DAC-01 Airport (Dhaka)", 40000)])
+    # Baridhara filed the 16th only, and left 0A1111 off it
+    rows = _rows(("Baridhara", 16, "ISSUE", "0A9999", 500, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {16}})
+
+    omitted = {f.locator for f in res.omitted}
+    unfiled = {f.locator for f in res.unfiled}
+    unsent = {f.locator for f in res.not_submitted}
+    assert omitted == {"0A1111"}      # a sheet existed and it is not on it
+    assert unfiled == {"0A2222"}      # no sheet for that day
+    assert unsent == {"0A3333"}       # no workbook for that counter at all
+    assert not (omitted & unfiled) and not (unfiled & unsent)
+    assert len(res.of(cr.UNREPORTED)) == 3
+
+
+def test_gds_and_web_channels_are_never_reported_as_missing_counters(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "EXTRANET AGENC.", 90000),
+        _line(16, "Ticket payment", "0A2222", "WEB", 50000),
+        _line(16, "Ticket payment", "0A3333", "Galileo 1G 1G", 70000)])
+    res = cr.reconcile(data, [], MAP)
+    assert res.not_submitted == []
+    assert res.per_counter == {}
+
+
+def test_an_unsubmitted_counter_is_ranked_with_the_rest_by_what_is_missing(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-01 Airport (Dhaka)", 900000),
+        _line(16, "Ticket payment", "0A2222", "DAC-07 Baridhara", 1000)])
+    res = cr.reconcile(data, [], MAP, filed_days={"Baridhara": {16}})
+    worst = max(res.per_counter.items(),
+                key=lambda kv: kv[1].get("unrep_amt", 0) + kv[1].get("unfiled_amt", 0))
+    assert worst[0] == "DAC-01 Airport (Dhaka)"
+
+
+def test_unsubmitted_sales_are_still_attributed_to_the_system_agent(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-01 Airport (Dhaka)", 5000,
+              agent="R KRISHNO")])
+    res = cr.reconcile(data, [], MAP)
+    assert res.per_agent["R KRISHNO"] == {"n": 1, "amt": 5000}

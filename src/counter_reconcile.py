@@ -303,6 +303,7 @@ class Finding:
     customer: str = ""
     note: str = ""
     day_filed: bool = True     # did the counter file a sheet for this day at all?
+    submitted: bool = True     # did this counter submit a workbook at all?
 
     @property
     def gap(self) -> float:
@@ -344,8 +345,18 @@ class ReconResult:
 
     @property
     def unfiled(self) -> list:
-        """Missing because no sheet exists for that day at all."""
-        return [f for f in self.of(UNREPORTED) if not f.day_filed]
+        """Missing because no sheet exists for that day, at a counter that did
+        submit a workbook."""
+        return [f for f in self.of(UNREPORTED) if not f.day_filed and f.submitted]
+
+    @property
+    def not_submitted(self) -> list:
+        """Everything a counter sold that never reached us at all."""
+        return [f for f in self.of(UNREPORTED) if not f.submitted]
+
+    @property
+    def not_submitted_amount(self) -> float:
+        return sum(f.system_amount for f in self.not_submitted)
 
     @property
     def omitted_amount(self) -> float:
@@ -408,6 +419,25 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
     for ln in sales.lines:
         counter = pos_to_counter.get(ln.pos)
         if counter is None:
+            # A selling location with no workbook at all. Everything it sold is
+            # missing, and it belongs in the same table as the counters that did
+            # report -- listing it separately let it read as a footnote.
+            if not is_counter_pos(ln.pos):
+                continue                      # a GDS or web channel, not a desk
+            c = per_counter[ln.pos]
+            c["sys_n"] += 1
+            c["sys_amt"] += ln.amount
+            c["unfiled_n"] += 1
+            c["unfiled_amt"] += ln.amount
+            c["not_submitted"] = 1
+            a = per_agent[ln.agent or "(no agent)"]
+            a["n"] += 1
+            a["amt"] += ln.amount
+            res.findings.append(Finding(
+                UNREPORTED, ln.pos, ln.pos, ln.day, ln.locator, ln.block,
+                ln.amount, 0.0, ln.agent, ln.customer,
+                day_filed=False, submitted=False,
+                note="no report submitted for this counter"))
             continue
         day = ln.day.day
         c = per_counter[counter]
@@ -561,14 +591,15 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         ("Reported value", tot["rep_amt"], MONEY, None),
         ("OMITTED (sheet filed)", len(res.omitted), "#,##0", "C00000"),
         ("Omitted value", res.omitted_amount, MONEY, "C00000"),
-        ("No sheet that day", len(res.unfiled), "#,##0", "C00000"),
+        ("No report submitted", res.not_submitted_amount, MONEY, "C00000"),
     ])
     r = _kpi_strip(ws, r, [
+        ("No sheet that day", len(res.unfiled), "#,##0", "C00000"),
+        ("Counters that sent nothing", len(
+            {f.counter for f in res.not_submitted}), "0", "C00000"),
         ("Date-shifted", len(res.of(DATE_SHIFTED)), "#,##0", None),
         ("Not in system", len(res.of(NOT_IN_SYSTEM)), "#,##0", None),
         ("Block mismatch", len(res.of(BLOCK_MISMATCH)), "#,##0", None),
-        ("Amount mismatch", len(mismatched), "#,##0", None),
-        ("Sites with no report", len(res.unmapped_pos), "0", "C00000"),
         ("Missing total value", res.unreported_amount, MONEY, "C00000"),
         ("Matched cleanly", res.clean_matches, "#,##0", "1F6F3C"),
     ])
@@ -593,7 +624,9 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         filed_n = len(filed_days.get(c, ())) if filed_days else None
         # A counter that barely filed at all is that, first: judging its currency
         # or its omissions off two or three sheets says nothing useful.
-        if filed_n is not None and filed_n <= 3:
+        if v.get("not_submitted"):
+            verdict, tone = "NO REPORT SUBMITTED", BAD
+        elif filed_n is not None and filed_n <= 3:
             verdict, tone = "FILED NOTHING", BAD
         elif c in res.currency_suspect:
             verdict, tone = "CURRENCY MISMATCH", WARN
@@ -664,8 +697,9 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
 
     # ---- selling locations with no counter report at all ----
     if res.unmapped_pos:
-        r = _band(ws, r, "SELLING LOCATIONS WITH NO COUNTER REPORT",
-                  "these sold tickets in the window but filed no workbook")
+        r = _band(ws, r, "SELLING LOCATIONS THAT SENT NO REPORT",
+                  "also listed in the table above, where their whole month is "
+                  "counted as missing")
         r = _headers(ws, r, ["Point of sale", "Transactions"] + [""] * 19)
         for pos, n in res.unmapped_pos:
             _cell(ws, r, 1, pos, bold=True, size=10, border=True, fill=BAD)
@@ -711,9 +745,10 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
               align="right")
         _cell(ws, r, 6, f.agent, size=8, border=True)
         _cell(ws, r, 7, f.customer[:40], size=8, color=GREY, border=True)
-        _cell(ws, r, 8, "yes" if f.day_filed else "NO SHEET", size=8,
-              border=True, align="center",
-              fill=None if f.day_filed else WARN)
+        state = ("yes" if f.day_filed
+                 else ("NOT SUBMITTED" if not f.submitted else "NO SHEET"))
+        _cell(ws, r, 8, state, size=8, border=True, align="center",
+              fill=None if f.day_filed else (BAD if not f.submitted else WARN))
         for j in range(9, 22):
             _cell(ws, r, j, None, border=True)
         r += 1
