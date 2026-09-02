@@ -4,6 +4,7 @@ Fixtures are synthetic — a real sales report carries customer names and PNRs.
 Each case mirrors something the August 2026 data actually did.
 """
 from datetime import date
+from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
@@ -344,3 +345,58 @@ def test_a_second_desk_for_the_same_place_is_reported_as_ambiguous():
     _m, _s, _uc, _up, amb = cr.suggest_mapping(
         ["Uttara"], ["DAC-06 Uttara", "DAC-17 Uttara USBA-Office"])
     assert amb["Uttara"] == ["DAC-17 Uttara USBA-Office"]
+
+
+# --------------------------------------------------------------------------
+# finding the local sales data
+# --------------------------------------------------------------------------
+def test_no_warehouse_is_reported_as_absent_not_guessed(tmp_path):
+    assert cr.find_sales_warehouse(extra_roots=[tmp_path / "nothing"],
+                                   search_defaults=False) is None
+
+
+def test_a_gold_file_is_found(tmp_path):
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    (gold / "sales_bi.parquet").write_bytes(b"")     # presence is what is probed
+    src = cr.find_sales_warehouse(extra_roots=[tmp_path],
+                                  search_defaults=False)
+    assert src is not None
+    assert src.kind == "gold"
+    assert src.path.name == "sales_bi.parquet"
+
+
+def test_a_partitioned_curated_set_is_found_when_there_is_no_gold(tmp_path):
+    part = tmp_path / "curated" / "sales" / "year=2026"
+    part.mkdir(parents=True)
+    (part / "part-0.parquet").write_bytes(b"")
+    src = cr.find_sales_warehouse(extra_roots=[tmp_path],
+                                  search_defaults=False)
+    assert src is not None
+    assert src.kind == "curated"
+
+
+def test_an_empty_curated_folder_is_not_a_warehouse(tmp_path):
+    (tmp_path / "curated" / "sales").mkdir(parents=True)
+    assert cr.find_sales_warehouse(extra_roots=[tmp_path],
+                                  search_defaults=False) is None
+
+
+@pytest.mark.parametrize("month, year, expected", [
+    (8, 2026, True),
+    (5, 2025, True),
+    (4, 2025, False),      # before coverage starts
+    (1, 2027, False),      # after it ends
+])
+def test_a_source_knows_whether_it_covers_the_month(month, year, expected):
+    src = cr.WarehouseSource(path=Path("x"), kind="gold",
+                             first_day=date(2025, 5, 1),
+                             last_day=date(2026, 8, 31), rows=10)
+    assert src.covers(month, year) is expected
+
+
+def test_coverage_is_assumed_when_it_could_not_be_read():
+    """An unreadable file is still found; the month check must not block on it."""
+    src = cr.WarehouseSource(path=Path("x"), kind="gold")
+    assert src.covers(1, 1999) is True
+    assert "coverage unknown" in src.label

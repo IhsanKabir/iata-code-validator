@@ -158,6 +158,7 @@ class MasterResult:
     unreported_n: int = 0          # missing though a sheet WAS filed that day
     unreported_amount: float = 0.0
     unfiled_n: int = 0             # missing because no sheet exists for the day
+    gap_source: str = ""           # what the gap sheet was compared against
     no_report_sites: tuple = ()
     window: str = ""
 
@@ -556,7 +557,8 @@ def _pay_cells(ws, r, agg, start_col=14):
 
 def build_master(paths, out_path: Path, *, month: int, year: int,
                  base_currency: str = "BDT", progress_cb=None,
-                 stop_flag=None, sales_report=None) -> MasterResult:
+                 stop_flag=None, sales_report=None,
+                 use_warehouse: bool = False) -> MasterResult:
     """Read every counter workbook and write ONE master sheet.
 
     `progress_cb(done, total, name)` is called per workbook so a UI can show
@@ -890,14 +892,33 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
 
-    recon = None
-    if sales_report:
+    recon, gap_source = None, ""
+    if sales_report or use_warehouse:
         # a second sheet in the SAME workbook: the unreported check only means
         # anything read next to what was reported
         from . import counter_reconcile as cr
-        sales = cr.read_sales_report(sales_report, progress_cb=(
-            (lambda n: progress_cb(0, 0, f"sales report: {n:,} rows"))
-            if progress_cb else None))
+        note = ((lambda n: progress_cb(0, 0, f"sales data: {n:,} rows"))
+                if progress_cb else None)
+        if sales_report:
+            sales = cr.read_sales_report(sales_report, progress_cb=note)
+            gap_source = Path(sales_report).name
+        else:
+            # the whole month straight from the local warehouse -- no exporting,
+            # merging or normalising by hand
+            src = cr.find_sales_warehouse()
+            if src is None:
+                raise ValueError(
+                    "No sales warehouse found on this machine, so the gap sheet "
+                    "cannot be built. Untick the box, or point ANALYSIS_HOME at "
+                    "the data root.")
+            if not src.covers(month, year):
+                raise ValueError(
+                    f"The local sales data covers {src.first_day:%d %b %Y} to "
+                    f"{src.last_day:%d %b %Y}, which does not include "
+                    f"{date(year, month, 1):%B %Y}.")
+            sales = cr.read_sales_from_warehouse(src, month=month, year=year,
+                                                 progress_cb=note)
+            gap_source = src.label
         mapping, _scores, _uc, _up, ambiguous = cr.suggest_mapping(
             sorted(ctr), sales.points_of_sale)
         filed_days = {m["counter"]: m["days"] for m in metas}
@@ -923,6 +944,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         unreported_n=len(recon.omitted) if recon else 0,
         unreported_amount=recon.omitted_amount if recon else 0.0,
         unfiled_n=len(recon.unfiled) if recon else 0,
+        gap_source=gap_source,
         no_report_sites=tuple(p for p, _ in recon.unmapped_pos) if recon else (),
         window=(f"{recon.first_day:%d %b} to {recon.last_day:%d %b %Y}"
                 if recon and recon.first_day else ""),
@@ -1026,15 +1048,15 @@ def build_master_path(out_dir, month: int, year: int) -> Path:
 
 
 def build_from_inputs(selection, out_path, *, month: int, year: int,
-                      progress_cb=None, stop_flag=None,
-                      sales_report=None) -> MasterResult:
+                      progress_cb=None, stop_flag=None, sales_report=None,
+                      use_warehouse: bool = False) -> MasterResult:
     """Build from a folder, a file, or any mix of the two."""
     paths = resolve_counter_inputs(selection)
     if not paths:
         raise ValueError(f"No .xlsx counter workbooks found in {selection}")
     return build_master(paths, out_path, month=month, year=year,
                         progress_cb=progress_cb, stop_flag=stop_flag,
-                        sales_report=sales_report)
+                        sales_report=sales_report, use_warehouse=use_warehouse)
 
 
 # kept as the folder-shaped name the first callers used

@@ -313,6 +313,8 @@ class App(WhatsAppMixin, HealthMixin):
         self.ctr_month = tk.StringVar(value=f"{_today.month:02d}")
         self.ctr_year = tk.IntVar(value=_today.year)
         self.ctr_sales_path = tk.StringVar(value="")
+        self.ctr_use_warehouse = tk.BooleanVar(value=False)
+        self._ctr_warehouse = None       # set once the local sales data is probed
         self._ctr_stop_flag = threading.Event()
         self._ctr_worker: threading.Thread | None = None
         self._ctr_period_worker: threading.Thread | None = None
@@ -4297,6 +4299,7 @@ class App(WhatsAppMixin, HealthMixin):
                 self._ctr_log("Barely reporting: " + ", ".join(quiet))
             if info.get("window"):
                 sites = info.get("no_report_sites") or []
+                self._ctr_log(f"Compared against: {info.get('gap_source', '')}")
                 self._ctr_log(
                     f"Unreported check ({info['window']}): "
                     f"{info.get('unreported_n', 0):,} sale(s) worth "
@@ -6216,28 +6219,40 @@ class App(WhatsAppMixin, HealthMixin):
         self.ctr_period_label.pack(side="left", padx=(10, 0))
 
         sales = self._section(
-            parent, "Sales report  ·  unreported-sales check (optional)",
+            parent, "Unreported-sales gap sheet",
             help_text=(
-                "Add the airline sales report and the output gains a second sheet "
-                "showing what the system recorded but the counters never wrote "
-                "down — by counter, by sale agent, and PNR by PNR.\n\n"
-                "Only the days the sales report actually covers are judged, so a "
-                "one-week export does not report three weeks of imaginary gaps. A "
-                "sale the counter logged on a different day is reported as "
-                "date-shifted, not as missing.\n\n"
+                "Adds a second sheet showing what the system recorded but the "
+                "counters never wrote down — by counter, by sale agent, and PNR "
+                "by PNR.\n\n"
+                "It reads the merged sales data already on this machine, so "
+                "nothing has to be exported or normalised by hand. If no sales "
+                "data is found the box is disabled and only the master sheet is "
+                "produced.\n\n"
+                "A sale the counter logged on a different day is reported as "
+                "date-shifted, not as missing, and a sale on a day the counter "
+                "filed no sheet at all is counted separately from one it left "
+                "off a sheet it did file.\n\n"
                 "Overseas counters are compared on COUNTS only: they write their "
-                "sheets in local currency while the sales report is in base "
+                "sheets in local currency while the sales data is in base "
                 "currency, so the amounts are not the same measure."
             ),
         )
+        self.ctr_gap_check = ttk.Checkbutton(
+            sales, text="Compare against the sales data on this machine",
+            variable=self.ctr_use_warehouse, command=self._ctr_gap_toggled)
+        self.ctr_gap_check.grid(row=0, column=0, columnspan=3, sticky="w",
+                                pady=(2, 0))
+        self.ctr_sales_label = ttk.Label(
+            sales, text="Looking for the sales data…", style="Hint.TLabel")
+        self.ctr_sales_label.grid(row=1, column=0, columnspan=3, sticky="w",
+                                  padx=(20, 0))
+        # an explicit export still works, for a machine without the warehouse
         sales_entry = ttk.Entry(sales, textvariable=self.ctr_sales_path)
         sales_btn = ttk.Button(sales, text="Browse…",
                                command=self._ctr_pick_sales)
-        self._form_row(sales, 0, "Sales report:", sales_entry, suffix=sales_btn)
-        self.ctr_sales_label = ttk.Label(
-            sales, text="Leave empty to skip the unreported check.",
-            style="Hint.TLabel")
-        self.ctr_sales_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
+        self._form_row(sales, 2, "or a sales report file:", sales_entry,
+                       suffix=sales_btn)
+        self._ctr_find_warehouse()
 
         out_body = self._section(parent, "Output")
         out_entry = ttk.Entry(out_body, textvariable=self.ctr_output_dir)
@@ -6333,8 +6348,44 @@ class App(WhatsAppMixin, HealthMixin):
         if not f:
             return
         self.ctr_sales_path.set(f)
+        self.ctr_use_warehouse.set(False)      # the file wins over the warehouse
         self.ctr_sales_label.configure(
-            text="Will be compared against what the counters reported.")
+            text=f"Using {Path(f).name} instead of the local sales data.")
+
+    def _ctr_find_warehouse(self) -> None:
+        """Look for the merged sales data and set the checkbox accordingly.
+
+        Detection is a metadata read, so it is fast enough to do inline; the
+        month's rows are only pulled when the report is actually built.
+        """
+        from . import counter_reconcile
+
+        try:
+            src = counter_reconcile.find_sales_warehouse()
+        except Exception as exc:  # noqa: BLE001
+            src = None
+            log.debug("sales warehouse probe failed: %s", exc)
+        self._ctr_warehouse = src
+        if src is None:
+            self.ctr_use_warehouse.set(False)
+            self.ctr_gap_check.state(["disabled"])
+            self.ctr_sales_label.configure(
+                text="No sales data found on this machine — only the master "
+                     "sheet will be built. Pick an exported sales report below "
+                     "to compare anyway.")
+            return
+        self.ctr_gap_check.state(["!disabled"])
+        self.ctr_use_warehouse.set(True)
+        self.ctr_sales_label.configure(text=f"Found {src.path}  ·  {src.label}")
+
+    def _ctr_gap_toggled(self) -> None:
+        if not self.ctr_use_warehouse.get():
+            self.ctr_sales_label.configure(
+                text="Gap sheet off — only the master sheet will be built.")
+        elif self._ctr_warehouse is not None:
+            src = self._ctr_warehouse
+            self.ctr_sales_label.configure(
+                text=f"Found {src.path}  ·  {src.label}")
 
     def _ctr_detect_period(self) -> None:
         """Read the month out of the workbooks, off the UI thread (~9s)."""
@@ -6408,18 +6459,23 @@ class App(WhatsAppMixin, HealthMixin):
         self.btn_ctr_run.configure(state="disabled")
         self.btn_ctr_stop.configure(state="normal")
         self.ctr_progress_bar.configure(value=0, maximum=len(found))
-        self._ctr_log(f"Reading {len(found)} counter workbook(s) for "
-                      f"{month:02d}/{year}…")
+        gap = ("the local sales data" if self.ctr_use_warehouse.get()
+               else (Path(self.ctr_sales_path.get()).name
+                     if self.ctr_sales_path.get().strip() else ""))
+        self._ctr_log(
+            f"Reading {len(found)} counter workbook(s) for {month:02d}/{year}"
+            + (f", then comparing against {gap}…" if gap else " (no gap sheet)…"))
         self._ctr_worker = threading.Thread(
             target=self._ctr_worker_run,
             args=(found, month, year,
                   Path(self.ctr_output_dir.get().strip() or str(Path.home())),
-                  self.ctr_sales_path.get().strip() or None),
+                  self.ctr_sales_path.get().strip() or None,
+                  bool(self.ctr_use_warehouse.get())),
             daemon=True)
         self._ctr_worker.start()
 
     def _ctr_worker_run(self, paths, month: int, year: int, out_dir: Path,
-                        sales_report=None) -> None:
+                        sales_report=None, use_warehouse: bool = False) -> None:
         from . import counter_master
 
         def progress(done, total, name):
@@ -6433,7 +6489,7 @@ class App(WhatsAppMixin, HealthMixin):
                 paths, counter_master.build_master_path(out_dir, month, year),
                 month=month, year=year, progress_cb=progress,
                 stop_flag=lambda: self._ctr_stop_flag.is_set(),
-                sales_report=sales_report)
+                sales_report=sales_report, use_warehouse=use_warehouse)
         except Exception as exc:  # noqa: BLE001
             log.exception("Counter Activity master build failed")
             self._post(MSG_CTR_ERROR, f"{type(exc).__name__}: {exc}")
@@ -6450,6 +6506,7 @@ class App(WhatsAppMixin, HealthMixin):
             "unreported_amount": result.unreported_amount,
             "no_report_sites": list(result.no_report_sites),
             "window": result.window,
+            "gap_source": result.gap_source,
         })
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:

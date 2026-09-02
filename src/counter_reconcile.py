@@ -95,6 +95,46 @@ def _num(v) -> float:
         return 0.0
 
 
+def _fold_groups(groups, data: SalesData) -> None:
+    """Turn raw transaction lines into one sales line per PNR / day / block.
+
+    Shared by the file reader and the warehouse reader so a gap sheet built from
+    the local warehouse classifies money exactly as one built from an exported
+    workbook -- the two must never disagree about what a Penalty means.
+    """
+    for (pos, day, loc), lines in groups.items():
+        has_refund = any(t in REFUND_LINES or h in REFUND_LINES
+                         for t, h, *_ in lines)
+        has_reissue = any(t in REISSUE_LINES or h in REISSUE_LINES
+                          for t, h, *_ in lines)
+        buckets: dict[str, float] = defaultdict(float)
+        agent = customer = ""
+        for txn, head, amt, ag, cust in lines:
+            agent = agent or ag
+            customer = customer or cust
+            if txn in REFUND_LINES or head in REFUND_LINES:
+                # signed throughout, absolute only at the end: a refund is
+                # negative and a penalty on top of it is positive, so a -8,000
+                # refund with a 1,000 penalty is 7,000 actually returned
+                buckets["REFUND"] += amt
+            elif txn in REISSUE_LINES or head in REISSUE_LINES:
+                buckets["REISSUE"] += amt
+            elif txn == "penalty":
+                # a penalty belongs to whatever the PNR was doing that day
+                buckets["REFUND" if has_refund else
+                        ("REISSUE" if has_reissue else "ISSUE")] += amt
+            else:
+                buckets["ISSUE"] += amt
+        for block, amount in buckets.items():
+            if round(amount, 2) == 0:
+                continue
+            data.lines.append(SalesLine(day=day, locator=loc, pos=pos,
+                                        block=block, amount=abs(amount),
+                                        agent=agent, customer=customer))
+    days = data.days
+    data.first_day, data.last_day = (min(days), max(days)) if days else (None, None)
+
+
 def read_sales_report(path, *, sheet_name=None, progress_cb=None) -> SalesData:
     """Stream the sales report into per-PNR-per-day lines.
 
@@ -154,36 +194,7 @@ def read_sales_report(path, *, sheet_name=None, progress_cb=None) -> SalesData:
     finally:
         wb.close()
 
-    for (pos, day, loc), lines in groups.items():
-        has_refund = any(t in REFUND_LINES or h in REFUND_LINES for t, h, *_ in lines)
-        has_reissue = any(t in REISSUE_LINES or h in REISSUE_LINES
-                          for t, h, *_ in lines)
-        buckets: dict[str, float] = defaultdict(float)
-        agent = customer = ""
-        for txn, head, amt, ag, cust in lines:
-            agent = agent or ag
-            customer = customer or cust
-            if txn in REFUND_LINES or head in REFUND_LINES:
-                # signed throughout, absolute only at the end: a refund is
-                # negative and a penalty on top of it is positive, so a -8,000
-                # refund with a 1,000 penalty is 7,000 actually returned
-                buckets["REFUND"] += amt
-            elif txn in REISSUE_LINES or head in REISSUE_LINES:
-                buckets["REISSUE"] += amt
-            elif txn == "penalty":
-                # a penalty belongs to whatever the PNR was doing that day
-                buckets["REFUND" if has_refund else
-                        ("REISSUE" if has_reissue else "ISSUE")] += amt
-            else:
-                buckets["ISSUE"] += amt
-        for block, amount in buckets.items():
-            if round(amount, 2) == 0:
-                continue
-            data.lines.append(SalesLine(day=day, locator=loc, pos=pos, block=block,
-                                        amount=abs(amount), agent=agent,
-                                        customer=customer))
-    days = data.days
-    data.first_day, data.last_day = (min(days), max(days)) if days else (None, None)
+    _fold_groups(groups, data)
     return data
 
 
@@ -574,12 +585,14 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         omitted, unfiled = v.get("unrep_amt", 0), v.get("unfiled_amt", 0)
         share = (omitted + unfiled) / sys_amt if (ok and sys_amt) else None
         filed_n = len(filed_days.get(c, ())) if filed_days else None
-        if c in res.currency_suspect:
+        # A counter that barely filed at all is that, first: judging its currency
+        # or its omissions off two or three sheets says nothing useful.
+        if filed_n is not None and filed_n <= 3:
+            verdict, tone = "FILED NOTHING", BAD
+        elif c in res.currency_suspect:
             verdict, tone = "CURRENCY MISMATCH", WARN
         elif not ok:
             verdict, tone = "COUNTS ONLY", WARN
-        elif v.get("unfiled_n", 0) and not v.get("rep_n", 0):
-            verdict, tone = "FILED NOTHING", BAD
         elif v.get("unrep_n", 0) == 0 and v.get("unfiled_n", 0):
             # nothing omitted from the sheets it DID file -- the gap is the days
             # it never filed at all, which is a different conversation
@@ -707,3 +720,153 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
     ws.freeze_panes = "A9"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
+
+
+# --------------------------------------------------------------------------
+# the local sales warehouse
+# --------------------------------------------------------------------------
+@dataclass
+class WarehouseSource:
+    """Where the merged sales data lives on this machine."""
+    path: Path
+    kind: str                  # "gold" | "curated"
+    first_day: date | None = None
+    last_day: date | None = None
+    rows: int = 0
+
+    @property
+    def label(self) -> str:
+        span = (f"{self.first_day:%d %b %Y} to {self.last_day:%d %b %Y}"
+                if self.first_day else "coverage unknown")
+        return f"{self.path.name} — {self.rows:,} rows, {span}"
+
+    def covers(self, month: int, year: int) -> bool:
+        if not self.first_day:
+            return True
+        return (self.first_day <= date(year, month, 28)
+                and self.last_day >= date(year, month, 1))
+
+
+def _duckdb():
+    try:
+        import duckdb
+    except ImportError:
+        return None
+    return duckdb
+
+
+def _candidate_roots():
+    """Where the analytics data root might be, best guess first."""
+    seen, out = set(), []
+
+    def add(p):
+        if not p:
+            return
+        p = Path(p).expanduser()
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    # the shared analytics library already resolves this (env var, settings.json
+    # beside the exe, the frozen directory) -- reuse it rather than guess
+    try:
+        from reporting.config import load_config
+        add(load_config(validate=False).data_root)
+    except Exception:                       # noqa: BLE001 - library may be absent
+        pass
+    import os
+    add(os.environ.get("ANALYSIS_HOME"))
+    for drive in ("E:", "D:", "C:", "F:"):
+        add(f"{drive}/Analysis")
+        add(f"{drive}/Documents/Analysis")
+    add(Path.home() / "Documents" / "Analysis")
+    return out
+
+
+def find_sales_warehouse(extra_roots=(), *,
+                         search_defaults: bool = True) -> WarehouseSource | None:
+    """The merged sales data on this machine, or None.
+
+    Prefers the single gold file; falls back to the partitioned curated set.
+    Coverage is read from the data so the caller can say whether the month it is
+    about to build is actually in there.
+
+    `search_defaults=False` limits the search to `extra_roots`, so a caller can
+    ask about one specific location without the usual drive probing answering
+    for somewhere else.
+    """
+    duckdb = _duckdb()
+    roots = list(extra_roots) + (_candidate_roots() if search_defaults else [])
+    for root in roots:
+        root = Path(root)
+        gold = root / "gold" / "sales_bi.parquet"
+        curated = root / "curated" / "sales"
+        if gold.is_file():
+            src = WarehouseSource(path=gold, kind="gold")
+        elif curated.is_dir() and any(curated.rglob("*.parquet")):
+            src = WarehouseSource(path=curated, kind="curated")
+        else:
+            continue
+        if duckdb is not None:
+            try:
+                target = (src.path.as_posix() if src.kind == "gold"
+                          else src.path.as_posix() + "/**/*.parquet")
+                lo, hi, n = duckdb.connect().execute(
+                    f'select min("Pure Date"), max("Pure Date"), count(*) '
+                    f"from read_parquet('{target}')").fetchone()
+                src.first_day, src.last_day, src.rows = lo, hi, int(n or 0)
+            except Exception:               # noqa: BLE001 - unreadable is still found
+                pass
+        return src
+    return None
+
+
+def read_sales_from_warehouse(source: WarehouseSource, *, month: int, year: int,
+                              progress_cb=None) -> SalesData:
+    """One month out of the local warehouse, shaped exactly like a file read.
+
+    Scoped to the month by the query rather than in Python: the gold file holds
+    ~8 million rows and only the month being reported is wanted.
+    """
+    duckdb = _duckdb()
+    if duckdb is None:
+        raise ValueError("duckdb is not available in this build, so the local "
+                         "sales warehouse cannot be read.")
+    target = (source.path.as_posix() if source.kind == "gold"
+              else source.path.as_posix() + "/**/*.parquet")
+    if progress_cb is not None:
+        progress_cb(0)
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")   # nothing to draw to in a GUI
+    rows = con.execute(f"""
+        select "Pure Date", "Transaction", "Record Locator", "Point of sales",
+               "Balance (base currency)", "Heading", "Sale agent", "Customer"
+        from read_parquet('{target}')
+        where year("Pure Date") = {int(year)} and month("Pure Date") = {int(month)}
+          and "Record Locator" is not null
+    """).fetchall()
+    if progress_cb is not None:
+        progress_cb(len(rows))
+
+    groups: dict[tuple, list] = defaultdict(list)
+    data = SalesData()
+    for day, txn, loc, pos, amt, head, agent, cust in rows:
+        data.rows_read += 1
+        loc = str(loc or "").strip().upper()
+        if not LOCATOR_RE.match(loc):
+            continue
+        day = _as_date(day)
+        if day is None:
+            continue
+        pos = str(pos or "").strip()
+        data.points_of_sale[pos] += 1
+        t = str(txn or "").strip().lower()
+        h = str(head or "").strip().lower()
+        if t in VOID_LINES:
+            data.voided += 1
+            continue
+        groups[(pos, day, loc)].append((t, h, _num(amt),
+                                        str(agent or "").strip(),
+                                        str(cust or "").strip()))
+    _fold_groups(groups, data)
+    return data
