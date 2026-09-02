@@ -447,3 +447,117 @@ def test_an_ambiguous_row_does_not_guess_which_number_is_the_sale(tmp_path):
     assert ok is False
     assert pays == {}
     assert why == "no amount"
+
+
+# --------------------------------------------------------------------------
+# the sales-person leaderboards
+# --------------------------------------------------------------------------
+def _leaderboard_rows(ws, title):
+    """(header, data rows, the not-ranked note) for one leaderboard."""
+    start = next(k for k in range(1, ws.max_row + 1)
+                 if isinstance(ws.cell(k, 1).value, str)
+                 and title in str(ws.cell(k, 1).value))
+    header = [ws.cell(start + 1, c).value for c in range(1, 11)]
+    rows, note = [], ""
+    k = start + 2
+    while ws.cell(k, 1).value is not None:
+        v = ws.cell(k, 1).value
+        if isinstance(v, str) and "not ranked" in v:
+            note = v
+            break
+        rows.append([ws.cell(k, c).value for c in range(1, 11)])
+        k += 1
+    return header, rows, note
+
+
+def test_the_leaderboards_rank_by_value_and_show_a_per_day_column(tmp_path):
+    folder = tmp_path / "c"
+    folder.mkdir()
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("01 AUG")
+    ws.append(["Counter Daily Activities of 01 Aug 2026"])
+    ws.append(HEADERS)
+    # one big seller on a single day, one steady seller across two
+    ws.append(["TEST SALES", "Ticket Issue", 2, "BIG EARNER", "USBA-90001",
+               "0A1111", None, "01700000001", None, 500000, 500000, None, None,
+               None])
+    ws.append([None, None, None, "STEADY", "USBA-90002", "0A2222",
+               None, "01700000002", None, 100000, 100000, None, None, None])
+    ws.append([None, "Ticket Reissue", 1, "STEADY", "USBA-90002", "0A3333",
+               None, "01700000003", None, 70000, 70000, None, None, None])
+    ws2 = wb.create_sheet("02 AUG")
+    ws2.append(["Counter Daily Activities of 02 Aug 2026"])
+    ws2.append(HEADERS)
+    ws2.append([None, "Ticket Issue", 1, "STEADY", "USBA-90002", "0A4444",
+                None, "01700000004", None, 100000, 100000, None, None, None])
+    wb.save(folder / "alpha counter aug 26.xlsx")
+
+    out = tmp_path / "m.xlsx"
+    cm.build_from_inputs(folder, out, month=8, year=2026)
+    book = load_workbook(out)
+    ws = book["Master"]
+
+    header, rows, _note = _leaderboard_rows(ws, "BY VALUE ISSUED")
+    assert header[4] == "Tickets issued"
+    assert header[8] == "Value per active day"
+    assert [r[1] for r in rows] == ["Big Earner", "Steady"]     # by value
+    assert rows[0][5] == pytest.approx(500_000)
+    assert rows[0][8] == pytest.approx(500_000)                 # one active day
+    assert rows[1][8] == pytest.approx(100_000)                 # 200k over 2 days
+    assert rows[1][9] == pytest.approx(0.4)                     # share of top
+
+    header, rows, _note = _leaderboard_rows(ws, "BY VALUE REISSUED")
+    assert header[4] == "Reissues"
+    assert [r[1] for r in rows] == ["Steady"]                   # only reissuer
+    assert rows[0][5] == pytest.approx(70_000)
+    book.close()
+
+
+def test_a_local_currency_counter_is_named_rather_than_ranked(tmp_path):
+    """Ranking a CNY sheet against BDT ones would put it wherever the exchange
+    rate happens to land it."""
+    folder = tmp_path / "c"
+    folder.mkdir()
+    for name, cur, amount in (("alpha", "BDT", 100000), ("can", "CNY", 5000)):
+        wb = Workbook()
+        wb.remove(wb.active)
+        ws = wb.create_sheet("01 AUG")
+        ws.append(["Counter Daily Activities of 01 Aug 2026"])
+        ws.append([h.replace("(BDT)", f"({cur})") for h in HEADERS])
+        ws.append(["X", "Ticket Issue", 1, "SELLER " + name.upper(),
+                   "USBA-9000" + ("1" if cur == "BDT" else "2"), "0A111" + name[0],
+                   None, "01700000001", None, amount, amount, None, None, None])
+        wb.save(folder / f"{name} counter aug 26.xlsx")
+
+    out = tmp_path / "m.xlsx"
+    cm.build_from_inputs(folder, out, month=8, year=2026)
+    book = load_workbook(out)
+    _h, rows, note = _leaderboard_rows(book["Master"], "BY VALUE ISSUED")
+    assert [r[3] for r in rows] == ["Alpha"]        # only the BDT counter ranks
+    assert "another currency" in note
+    assert "CAN" in note          # a three-letter station keeps its capitals
+    book.close()
+
+
+def test_the_nameless_bucket_never_appears_in_a_leaderboard(tmp_path):
+    folder = tmp_path / "c"
+    folder.mkdir()
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("01 AUG")
+    ws.append(["Counter Daily Activities of 01 Aug 2026"])
+    ws.append(HEADERS)
+    ws.append(["X", "Ticket Issue", 1, "REAL PERSON", "USBA-90001", "0A1111",
+               None, "01700000001", None, 1000, 1000, None, None, None])
+    ws.append([None, None, None, None, None, "0A2222",
+               None, "01700000002", None, 999000, 999000, None, None, None])
+    wb.save(folder / "alpha counter aug 26.xlsx")
+
+    out = tmp_path / "m.xlsx"
+    cm.build_from_inputs(folder, out, month=8, year=2026)
+    book = load_workbook(out)
+    _h, rows, _n = _leaderboard_rows(book["Master"], "BY VALUE ISSUED")
+    # the 999,000 belongs to nobody, so it must not top the leaderboard
+    assert [r[1] for r in rows] == ["Real Person"]
+    book.close()

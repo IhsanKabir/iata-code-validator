@@ -939,6 +939,68 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.auto_filter.ref = f"A{emp_hdr}:U{emp_last}"
     r += 1
 
+    # ---- who sold the most ------------------------------------------------
+    r = _band(ws, r, "BEST SALES PEOPLE",
+              "ranked across the estate by value; the per-active-day column is "
+              "there because footfall and attendance differ")
+
+    def _leaderboard(row, block, title, unit, top=15):
+        # local-currency sheets cannot be ranked against BDT ones, so they are
+        # named underneath rather than mixed into the order
+        pool = [a for k, a in emp.items()
+                if k and a.currency == base_currency and a.val[block] > 0]
+        other = sorted({a.counter for k, a in emp.items()
+                        if k and a.currency != base_currency and a.val[block] > 0})
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=21)
+        _cell(ws, row, 1, f"   {title}", bold=True, size=10, color=NAVY,
+              fill=LIGHT)
+        row += 1
+        row = _headers(ws, row, [
+            "#", "Employee", "Employee ID", "Counter", unit, "Value",
+            "Avg ticket", "Days active", "Value per active day", "Share of top",
+            "", "", "", "", "", "", "", "", "", "", ""])
+        best = max((a.val[block] for a in pool), default=0)
+        for pos, a in enumerate(sorted(pool, key=lambda x: -x.val[block])[:top],
+                                start=1):
+            days = len(a.days) or 1
+            _cell(ws, row, 1, pos, bold=pos <= 3, size=10, border=True,
+                  align="center", fill=GOOD if pos == 1 else None)
+            _cell(ws, row, 2, a.name, bold=pos <= 3, size=10, border=True)
+            _cell(ws, row, 3, a.key, size=8, color=GREY, border=True)
+            _cell(ws, row, 4, a.counter, size=9, border=True)
+            _cell(ws, row, 5, a.n[block], size=9, border=True, align="center")
+            _cell(ws, row, 6, a.val[block], fmt=MONEY, bold=True, size=10,
+                  border=True, align="right")
+            _cell(ws, row, 7, a.val[block] / a.n[block] if a.n[block] else None,
+                  fmt=MONEY, size=9, border=True, align="right")   # avg each
+            _cell(ws, row, 8, len(a.days) or None, size=9, border=True,
+                  align="center")
+            _cell(ws, row, 9, a.val[block] / days, fmt=MONEY, size=9,
+                  border=True, align="right")
+            _cell(ws, row, 10, a.val[block] / best if best else None, fmt=PCT,
+                  size=9, border=True, align="center")
+            for j in range(11, 22):
+                _cell(ws, row, j, None, border=True)
+            row += 1
+        if other:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                           end_column=21)
+            _cell(ws, row, 1,
+                  "   not ranked — these counters write their sheets in another "
+                  "currency: " + ", ".join(other),
+                  size=8, color=GREY, fill=PAPER)
+            row += 1
+        if pool:
+            first_data = row - len(pool[:top]) - (1 if other else 0)
+            ws.conditional_formatting.add(
+                f"F{first_data}:F{row - 1 - (1 if other else 0)}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color=BAND, showValue=True))
+        return row + 1
+
+    r = _leaderboard(r, "ISSUE", "BY VALUE ISSUED", "Tickets issued")
+    r = _leaderboard(r, "REISSUE", "BY VALUE REISSUED", "Reissues")
+
     # ---- payment channels as the counters record them --------------------
     r = _band(ws, r, "PAYMENT CHANNELS AS RECORDED",
               "each counter's own labels — the overseas desks have no bKash, and "
