@@ -687,3 +687,32 @@ def cm_dummy_source():
     src.first_day = date(2026, 8, 1)
     src.last_day = date(2026, 8, 31)
     return src
+
+
+def test_the_headcount_is_the_same_everywhere_it_is_stated(tmp_path):
+    """The result object drives the app's own message; the sheet drives what a
+    reader sees. They said 70 and 69 for a while, because only one of them
+    excluded the bucket for rows with no employee ID."""
+    folder = tmp_path / "c"
+    folder.mkdir()
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("01 AUG")
+    ws.append(["Counter Daily Activities of 01 Aug 2026"])
+    ws.append(HEADERS)
+    ws.append(["X", "Ticket Issue", 1, "REAL PERSON", "USBA-90001", "0A1111",
+               None, "01700000001", None, 1000, 1000, None, None, None])
+    ws.append([None, None, None, None, None, "0A2222",       # no employee id
+               None, "01700000002", None, 2000, 2000, None, None, None])
+    wb.save(folder / "alpha counter aug 26.xlsx")
+
+    out = tmp_path / "m.xlsx"
+    res = cm.build_from_inputs(folder, out, month=8, year=2026)
+    book = load_workbook(out)
+    sheet = book["Master"]
+    assert res.employees == 1                      # not 2
+    assert sheet.cell(6, 4).value == res.employees
+    assert f"{res.employees} employees" in str(sheet.cell(2, 1).value)
+    # and the nameless row's money is still counted
+    assert res.net == pytest.approx(3000)
+    book.close()

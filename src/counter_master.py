@@ -859,7 +859,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.row_dimensions[1].height = 34
     ws.merge_cells(f"A2:{LAST}2")
     _cell(ws, 2, 1,
-          f"  {len(metas)} counters · {len(emp)} employees · "
+          f"  {len(metas)} counters · {sum(1 for k in emp if k)} employees · "
           f"{len(all_sales):,} transactions parsed · "
           f"reporting coverage {reported/max(expected,1):.0%}"
           f"   —   money totals cover {base_currency} counters only; "
@@ -1339,7 +1339,10 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     out_path = Path(out_path)
     wb.save(out_path)
     return MasterResult(
-        path=out_path, counters=len(metas), employees=len(emp),
+        path=out_path, counters=len(metas),
+        # the nameless bucket holds real money but is not a person; the sheet's
+        # own headline already excludes it, and the two must agree
+        employees=sum(1 for k in emp if k),
         rows=len(all_sales), coverage=reported / max(expected, 1),
         net=tot_issue + tot_reissue - tot_refund,
         unallocated_pct=pay_tot.get("Unallocated", 0) / grand_pay,

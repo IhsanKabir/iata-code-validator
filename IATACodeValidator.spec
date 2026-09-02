@@ -31,6 +31,13 @@ hiddenimports = [
     # would normally pick this up via `from . import _build_config`, but
     # the import is wrapped in try/except, so we list it explicitly.
     "src._build_config",
+    # Counter Activity: the GUI reaches these with a deferred `from . import`
+    # inside its handlers, and they reach each other the same way. The spec
+    # already has to name src._build_config for this reason, so these are
+    # listed rather than assumed -- a missed one loses the whole tab silently.
+    "src.counter_master",
+    "src.counter_reconcile",
+    "src.counter_blocks",
     # Lazy-imported only when the user opens the time-series view on the
     # OEP tab; PyInstaller's static analyzer can't see the deferred import.
     "matplotlib",
