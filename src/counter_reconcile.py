@@ -285,6 +285,9 @@ def suggest_mapping(counter_names, points_of_sale):
 # --------------------------------------------------------------------------
 # the comparison
 # --------------------------------------------------------------------------
+# below this many sales a month, a point of sale is unlikely to be a staffed desk
+LOW_VOLUME = 5
+
 MATCHED, UNREPORTED, DATE_SHIFTED, NOT_IN_SYSTEM, BLOCK_MISMATCH = (
     "MATCHED", "UNREPORTED", "DATE-SHIFTED", "NOT IN SYSTEM", "BLOCK MISMATCH")
 
@@ -330,10 +333,14 @@ class ReconResult:
 
     @property
     def unreported_amount(self) -> float:
-        """Only where the two sides are in the same currency."""
-        skip = set(self.non_comparable)
-        return sum(f.system_amount for f in self.of(UNREPORTED)
-                   if f.counter not in skip)
+        """Every counter counts here, whatever currency its sheet is in.
+
+        A MISSING sale has no counter-side figure to be incomparable with -- its
+        value is the system's own, always in base currency. Excluding the
+        local-currency counters hid 8,992,113, most of it one counter that filed
+        nothing at all.
+        """
+        return sum(f.system_amount for f in self.of(UNREPORTED))
 
     def comparable(self, counter: str) -> bool:
         return counter not in set(self.non_comparable)
@@ -360,8 +367,11 @@ class ReconResult:
 
     @property
     def omitted_amount(self) -> float:
-        skip = set(self.non_comparable)
-        return sum(f.system_amount for f in self.omitted if f.counter not in skip)
+        return sum(f.system_amount for f in self.omitted)
+
+    @property
+    def unfiled_amount(self) -> float:
+        return sum(f.system_amount for f in self.unfiled)
 
 
 def reconcile(sales: SalesData, counter_rows, mapping, *,
@@ -571,8 +581,9 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
           f"  The sales report covers {window} — ONLY those days are judged. "
           f"{res.sales_rows:,} rows read. A sale the counter logged on another "
           f"day counts as date-shifted, not as missing. OMITTED means the counter filed a sheet that day and the sale is not on it; NO SHEET means no sheet exists for that day at all."
-          + (f"   ·   Amounts are NOT compared for "
-             f"{', '.join(res.non_comparable)} — they report in local currency."
+          + (f"   ·   For {', '.join(res.non_comparable)} the amount the "
+             f"COUNTER wrote is in local currency and is not compared; what is "
+             f"MISSING is the system's own figure and is counted in full."
              if res.non_comparable else ""),
           size=9, color=GREY, fill=PAPER, align="left")
     ws.row_dimensions[2].height = 17
@@ -620,7 +631,9 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         ok = res.comparable(c)
         sys_amt = v.get("sys_amt", 0)
         omitted, unfiled = v.get("unrep_amt", 0), v.get("unfiled_amt", 0)
-        share = (omitted + unfiled) / sys_amt if (ok and sys_amt) else None
+        # both sides of this ratio are system figures, so the currency caveat
+        # does not apply to it either
+        share = (omitted + unfiled) / sys_amt if sys_amt else None
         filed_n = len(filed_days.get(c, ())) if filed_days else None
         # A counter that barely filed at all is that, first: judging its currency
         # or its omissions off two or three sheets says nothing useful.
@@ -631,7 +644,7 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         elif c in res.currency_suspect:
             verdict, tone = "CURRENCY MISMATCH", WARN
         elif not ok:
-            verdict, tone = "COUNTS ONLY", WARN
+            verdict, tone = "LOCAL CURRENCY", WARN
         elif v.get("unrep_n", 0) == 0 and v.get("unfiled_n", 0):
             # nothing omitted from the sheets it DID file -- the gap is the days
             # it never filed at all, which is a different conversation
@@ -656,11 +669,11 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
               border=True, align="right")
         _cell(ws, r, 8, v.get("unrep_n", 0) or None, bold=True, size=10,
               border=True, align="center")
-        _cell(ws, r, 9, (omitted if ok else None) or None, fmt=MONEY, bold=True,
+        _cell(ws, r, 9, omitted or None, fmt=MONEY, bold=True,
               size=10, border=True, align="right")
         _cell(ws, r, 10, v.get("unfiled_n", 0) or None, size=9, border=True,
               align="center")
-        _cell(ws, r, 11, (unfiled if ok else None) or None, fmt=MONEY, size=9,
+        _cell(ws, r, 11, unfiled or None, fmt=MONEY, size=9,
               border=True, align="right")
         _cell(ws, r, 12, share, fmt=PCT, size=9, border=True, align="center")
         _cell(ws, r, 13, v.get("shift_n", 0) or None, size=9, border=True,
@@ -677,6 +690,11 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
             note.append(f"sheet reads {res.currency_suspect[c]:.0f}x smaller")
         if c in res.ambiguous:
             note.append("also: " + ", ".join(res.ambiguous[c])[:40])
+        if v.get("not_submitted") and v.get("sys_n", 0) < LOW_VOLUME:
+            # a location with a handful of sales a month is probably not a
+            # staffed desk; chasing it like the airport would waste the list
+            note.append(f"only {v['sys_n']} sale(s) all month — "
+                        f"may not be a staffed counter")
         _cell(ws, r, 18, "; ".join(note), size=8, color="C00000", border=True)
         for j in range(19, 21):
             _cell(ws, r, j, None, border=True)

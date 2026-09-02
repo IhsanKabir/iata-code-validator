@@ -215,16 +215,18 @@ def test_a_block_logged_as_the_wrong_type_is_its_own_category(tmp_path):
     assert res.of(cr.UNREPORTED) == []
 
 
-def test_local_currency_counters_are_compared_on_counts_not_money(tmp_path):
-    """A CNY sheet against a BDT export is not a shortfall, it is two measures."""
+def test_a_local_currency_sheet_is_not_compared_but_its_gaps_still_count(tmp_path):
+    """A CNY sheet against a BDT export is two measures, so what the COUNTER
+    wrote is not compared. What is MISSING has no counter-side figure at all --
+    it is the system's own, in base currency -- so it counts in full."""
     data = _data(tmp_path, [
         _line(16, "Ticket payment", "0A1111", "INT Guangzhou (China)", 556266)])
     res = cr.reconcile(data, [], {"CAN": "INT Guangzhou (China)"},
                        currency_by_counter={"CAN": "CNY"})
     assert res.non_comparable == ["CAN"]
-    assert len(res.of(cr.UNREPORTED)) == 1        # the COUNT still counts
-    assert res.unreported_amount == 0             # the money does not
     assert res.comparable("CAN") is False
+    assert len(res.of(cr.UNREPORTED)) == 1
+    assert res.unreported_amount == pytest.approx(556266)
 
 
 def test_unreported_sales_are_attributed_to_the_system_agent(tmp_path):
@@ -515,3 +517,34 @@ def test_unsubmitted_sales_are_still_attributed_to_the_system_agent(tmp_path):
               agent="R KRISHNO")])
     res = cr.reconcile(data, [], MAP)
     assert res.per_agent["R KRISHNO"] == {"n": 1, "amt": 5000}
+
+
+def test_missing_value_is_counted_even_for_a_local_currency_counter(tmp_path):
+    """A MISSING sale has no counter-side figure to be incomparable with.
+    Excluding those counters hid 8,992,113, most of it one that filed nothing."""
+    lines, rows = [], []
+    for i in range(1, 5):                      # four matched pairs at 30x
+        loc = f"0A11{i:02d}"
+        lines.append(_line(16, "Ticket payment", loc, "INT Doha (Qatar)", 30000))
+        rows.append(("DOH", 16, "ISSUE", loc, 1000, "BDT"))
+    # and one the counter never wrote down at all
+    lines.append(_line(16, "Ticket payment", "0A9999", "INT Doha (Qatar)", 500000))
+    data = _data(tmp_path, lines)
+    res = cr.reconcile(data, _rows(*rows), {"DOH": "INT Doha (Qatar)"},
+                       filed_days={"DOH": {16}})
+
+    assert "DOH" in res.currency_suspect          # its own sheet is not comparable
+    assert res.comparable("DOH") is False
+    # ...but what is MISSING is the system's figure, and it counts in full
+    assert res.omitted_amount == pytest.approx(500_000)
+    assert res.unreported_amount == pytest.approx(500_000)
+
+
+def test_a_point_of_sale_that_barely_trades_is_flagged_not_chased(tmp_path):
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "INT Riyadh City (Saudi Arabia)",
+              68174)])
+    res = cr.reconcile(data, [], MAP)
+    v = res.per_counter["INT Riyadh City (Saudi Arabia)"]
+    assert v["not_submitted"] == 1
+    assert v["sys_n"] < cr.LOW_VOLUME       # the sheet notes this on the row
