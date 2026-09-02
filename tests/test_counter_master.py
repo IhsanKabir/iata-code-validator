@@ -360,3 +360,90 @@ def test_days_in_month_is_respected_for_coverage(tmp_path):
     aug = cm.build_from_folder(folder, tmp_path / "g.xlsx", month=8, year=2026)
     assert feb.coverage > aug.coverage
     assert date(2026, 2, 1)      # sanity: the month is real
+
+
+# --------------------------------------------------------------------------
+# accuracy: a sale must never be dropped because a field was left blank
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("raw, expected", [
+    ("35,548 INR", 35548.0),      # an overseas counter labels its own currency
+    ("BDT 1234", 1234.0),
+    ("1234 TK", 1234.0),
+    ("RM 560", 560.0),
+    ("560 MYR", 560.0),
+    ("1,234.50", 1234.5),
+    ("DH696NM88H", None),         # a ticket reference is not 696
+    ("DHM9OJZXHL", None),
+    ("APPR CODE:370063", None),
+    ("B- 01789864543", None),
+])
+def test_amounts_wearing_a_currency_label(raw, expected):
+    assert cm._money(raw) == expected
+
+
+def test_a_sale_row_with_no_employee_id_is_kept_and_named(tmp_path):
+    """Staff often write a colleague's name and leave the ID blank. Anchoring on
+    the ID dropped 115,314 from one day, against that sheet's own printed total.
+    """
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("01 AUG")
+    ws.append(["Counter Daily Activities of 01 Aug 2026"])
+    ws.append(HEADERS)
+    ws.append(["TEST SALES", "Ticket Issue", 2, "ALEX ROY", "USBA-90001",
+               "0A1111", None, "01700000001", None, 10000, 10000, None, None,
+               None])
+    # same person, ID left blank
+    ws.append([None, None, None, "ALEX ROY", None, "0A2222",
+               None, "01700000002", None, 9404, 9404, None, None, None])
+    # someone whose ID never appears anywhere
+    ws.append([None, None, None, "PAT SINGH", None, "0A3333",
+               None, "01700000003", None, 105910, 105910, None, None, None])
+    wb.save(tmp_path / "alpha counter aug 26.xlsx")
+
+    rows, issues, _meta = cm.parse_workbook(
+        tmp_path / "alpha counter aug 26.xlsx", 8)
+    assert len(rows) == 3
+    assert sum(r.amount for r in rows) == pytest.approx(125_314)
+    by_pnr = {r.pnr: r for r in rows}
+    # the blank ID is recovered from the row that does state it
+    assert by_pnr["0A2222"].emp_id == "USBA-90001"
+    # the unknown one keeps its money and is reported, not dropped
+    assert by_pnr["0A3333"].emp_id == ""
+    assert by_pnr["0A3333"].amount == 105910
+    assert any(i.kind == "no_employee_id" for i in issues)
+
+
+def test_an_amount_further_from_its_header_than_the_span_is_still_found(tmp_path):
+    """One refund row sat three columns right of its own header."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("01 AUG")
+    ws.append(["Counter Daily Activities of 01 Aug 2026"])
+    ws.append(HEADERS)
+    row = [None] * 14
+    row[1] = "Ticket Refund"
+    row[3] = "ALEX ROY"
+    row[4] = "USBA-90001"
+    row[5] = "0A1111"
+    row[8] = "8801865431745"        # a mobile, which must not be read as money
+    row[12] = 4698.0                # the only real amount, 3 columns adrift
+    ws.append(row)
+    wb.save(tmp_path / "alpha counter aug 26.xlsx")
+
+    rows, _issues, _meta = cm.parse_workbook(
+        tmp_path / "alpha counter aug 26.xlsx", 8)
+    assert len(rows) == 1
+    assert rows[0].block == "REFUND"
+    assert rows[0].amount == pytest.approx(4698)
+
+
+def test_an_ambiguous_row_does_not_guess_which_number_is_the_sale(tmp_path):
+    """Two candidate amounts and no header match: report nothing rather than
+    pick one. A wrong amount is worse than a missing one."""
+    headers = ["Sales Amount (BDT)", "Cash", "Bkash"]
+    cmap = {cm._hkey(h): j for j, h in enumerate(headers) if h}
+    pays, ok, why = cm._split_payments([None, None, None], cmap, 0, [], "X")
+    assert ok is False
+    assert pays == {}
+    assert why == "no amount"

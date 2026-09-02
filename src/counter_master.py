@@ -35,6 +35,14 @@ EMP_ID = re.compile(r"^USBA[-\s]?\d{4,6}$", re.I)
 PNR_RE = re.compile(r"^[0-9][0-9A-Z]{5}$")
 MOBILE_RE = re.compile(r"^\+?0?\d{10,14}$")
 MASKED_RE = re.compile(r"[*xX]{2,}")
+# an amount, optionally wearing a currency label on either side
+_AMOUNT_RE = re.compile(
+    r"(?:(?P<cur1>[A-Za-z৳$€]{1,4})\s*)?"
+    r"(?P<num>-?\d+(?:\.\d+)?)"
+    r"(?:\s*(?P<cur2>[A-Za-z৳$€]{1,4}))?")
+_CURRENCY_TOKEN = re.compile(
+    r"bdt|tk|taka|inr|rs|rp|myr|rm|sgd|cny|rmb|usd|aed|qar|omr|sar|thb|npr"
+    r"|৳|\$|€", re.I)
 DAY_IN_TITLE = re.compile(r"(\d{1,2})\s*(?:st|nd|rd|th)?\s*[/\- ]?\s*"
                           r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)", re.I)
 DAY_IN_NAME = re.compile(r"(\d{1,2})")
@@ -117,10 +125,16 @@ def _money(v):
         return None
     if MOBILE_RE.match(s.replace(" ", "").replace("-", "")):
         return None
-    t = s.replace(",", "").replace("BDT", "").replace("TK", "").strip()
-    if not re.fullmatch(r"-?\d+(\.\d+)?", t):
+    # "35,548 INR" is a real amount an overseas counter writes; stripping only
+    # BDT and TK threw the whole value away. A currency token either side is
+    # allowed, but nothing else -- "DH696NM88H" must not read as 696.
+    m = _AMOUNT_RE.fullmatch(s.replace(",", "").strip())
+    if not m:
         return None
-    f = float(t)
+    for token in (m.group("cur1"), m.group("cur2")):
+        if token and not _CURRENCY_TOKEN.fullmatch(token):
+            return None
+    f = float(m.group("num"))
     return f if f else None
 
 
@@ -172,6 +186,38 @@ class MasterResult:
 # --------------------------------------------------------------------------
 # parsing
 # --------------------------------------------------------------------------
+_NAME_RE = re.compile(r"[A-Za-z][A-Za-z .\-]{3,}$")
+_NOT_A_NAME = ("counter", "sales", "ticket", "walk", "total", "action",
+               "employee", "remark", "query", "phone", "office")
+
+
+def _staff_name(row, idx) -> str:
+    """The employee name on a sale row, whether or not an ID sits beside it."""
+    span = range(max(0, idx - 3), idx) if idx is not None else range(min(6, len(row)))
+    for j in span:
+        cand = row[j]
+        if (cand and not EMP_ID.match(cand) and _NAME_RE.fullmatch(cand)
+                and cand.lower() not in BLOCKS
+                and not any(w in cand.lower() for w in _NOT_A_NAME)):
+            return cand.upper()
+    return ""
+
+
+def _name_index(sheets) -> dict:
+    """NAME -> employee id, from every row in the workbook that states both."""
+    out: dict[str, str] = {}
+    for _ordinal, _title, grid in sheets:
+        for raw in grid:
+            row = [_n(c) for c in raw]
+            idx = next((j for j, c in enumerate(row) if EMP_ID.match(c)), None)
+            if idx is None:
+                continue
+            name = _staff_name(row, idx)
+            if name:
+                out.setdefault(name, row[idx].upper().replace(" ", "-"))
+    return out
+
+
 def _is_sales_header(keys: list[str]) -> bool:
     return "action" in keys and any(k.startswith("employee id") for k in keys)
 
@@ -292,6 +338,10 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
     populated = 0
     total_sheets = 0
 
+    # Read the whole workbook first. Staff often write a colleague's NAME and
+    # leave the Employee ID blank, and the ID for that name may only appear on a
+    # later sheet -- so the name/ID pairs have to be known before parsing.
+    sheets = []
     for ordinal, ws in enumerate(wb.worksheets, start=0):
         # max_row is unreliable in read_only mode, so the cap is applied while
         # iterating rather than trusted up front
@@ -300,18 +350,23 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
             grid.append(list(row))
             if len(grid) >= MAX_SHEET_ROWS:
                 break
+        sheets.append((ordinal, ws.title, grid))
+    wb.close()
+    name_to_id = _name_index(sheets)
+
+    for ordinal, title, grid in sheets:
         total_sheets += 1
         if not any(any(_n(v) for v in r if v is not None) for r in grid):
             continue
         populated += 1
-        day, src = _resolve_day(ws.title, grid, ordinal, month)
+        day, src = _resolve_day(title, grid, ordinal, month)
         activity.append(counter_blocks.parse_activity(grid, counter, day, EMP_ID))
         day_sources[src] += 1
         if day:
             days_seen.add(day)
         if src == "title(stale-month)":
             issues.append(Issue(counter, "stale_month",
-                                f"{ws.title}: title names another month"))
+                                f"{title}: title names another month"))
 
         i = 0
         while i < len(grid):
@@ -344,18 +399,14 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
                     if lc in BLOCKS:
                         block = BLOCKS[lc]
                 idx = next((j for j, c in enumerate(row) if EMP_ID.match(c)), None)
-                if block and idx is not None:
-                    eid = row[idx].upper().replace(" ", "-")
-                    name = ""
-                    for j in range(max(0, idx - 3), idx):
-                        cand = row[j]
-                        if (cand and not EMP_ID.match(cand)
-                                and re.fullmatch(r"[A-Za-z][A-Za-z .\-]{3,}", cand)
-                                and cand.lower() not in BLOCKS
-                                and "counter" not in cand.lower()
-                                and "sales" not in cand.lower()):
-                            name = cand.upper()
-                    pnr = next((c.upper() for c in row[idx:]
+                if block:
+                    eid = row[idx].upper().replace(" ", "-") if idx is not None else ""
+                    name = _staff_name(row, idx)
+                    if not eid and name:
+                        # the ID was left blank; the same name carries one
+                        # elsewhere in this workbook often enough to recover it
+                        eid = name_to_id.get(name, "")
+                    pnr = next((c.upper() for c in row[idx or 0:]
                                 if PNR_RE.match(c.upper()) and not c.isdigit()), "")
                     amount, amount_col = None, None
                     if amt_j is not None:
@@ -366,7 +417,26 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
                             if v is not None and AMOUNT_MIN <= abs(v) <= AMOUNT_MAX:
                                 amount, amount_col = v, j
                                 break
+                    if amount is None:
+                        # Drift can exceed the search span -- one refund row sat
+                        # three columns right of its header. When the row holds
+                        # exactly ONE money-shaped value there is nothing it
+                        # could be confused with, so take it.
+                        cands = [(j, _money(c)) for j, c in enumerate(raw)]
+                        cands = [(j, v) for j, v in cands
+                                 if v is not None and AMOUNT_MIN <= abs(v) <= AMOUNT_MAX]
+                        if len(cands) == 1:
+                            amount_col, amount = cands[0][0], cands[0][1]
                     amount = abs(amount) if amount else 0.0
+                    # A row with no employee ID is still a sale that happened.
+                    # Requiring the ID silently dropped 115,314 from one day of
+                    # one counter, against the total that sheet printed itself.
+                    if not eid and not (pnr and amount):
+                        i += 1
+                        continue
+                    if not eid:
+                        issues.append(Issue(counter, "no_employee_id",
+                                            f"day {day} {pnr}"))
                     pays, ok, why = _split_payments(
                         raw, cmap, amount, issues, counter,
                         amount_col=amount_col, header_col=amt_j)
@@ -381,7 +451,6 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
                     sales.append(SaleRow(counter, day, block, eid, name, pnr,
                                          amount, currency, pays, ok, why))
                 i += 1
-    wb.close()
 
     if len(currencies) > 1:
         issues.append(Issue(counter, "currency_drift",
@@ -482,6 +551,12 @@ def aggregate(sales, metas):
     for eid, a in emp.items():
         if names[eid]:
             a.name = names[eid].most_common(1)[0][0].title()
+        if not eid:
+            # rows whose employee ID the staff left blank; the sales are real
+            # and stay counted, but this is not a person and is not headcount
+            a.name = "(employee not written)"
+            a.key = ""
+
         a.counter = emp_counters[eid].most_common(1)[0][0]
         a.currency = cur_by_counter.get(a.counter, "BDT")
         a.multi = len(emp_counters[eid]) > 1
@@ -655,7 +730,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     r = _band(ws, r, "AT A GLANCE")
     r = _kpi_strip(ws, r, [
         ("Counters reporting", len(metas), "0", None),
-        ("Employees", len(emp), "0", None),
+        ("Employees", sum(1 for k in emp if k), "0", None),
         ("Tickets issued", tot_n, "#,##0", None),
         (f"Issue value ({base_currency})", tot_issue, MONEY, None),
         ("Reissue collected", tot_reissue, MONEY, None),
@@ -741,7 +816,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         _cell(ws, r, 3, f"{nd} / {days_in_month}", size=9, border=True,
               align="center")
         _cell(ws, r, 4, cov, fmt=PCT, size=9, border=True, align="center")
-        _cell(ws, r, 5, sum(1 for e in emp.values() if e.counter == a.counter),
+        _cell(ws, r, 5, sum(1 for k, e in emp.items()
+                            if k and e.counter == a.counter),
               size=9, border=True, align="center")
         _cell(ws, r, 6, a.n["ISSUE"] or None, size=9, border=True, align="center")
         _cell(ws, r, 7, a.val["ISSUE"] or None, fmt=MONEY, size=10, border=True,
@@ -794,7 +870,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
 
     ranked: dict[str, int] = {}
     for cname in {e.counter for e in emp.values()}:
-        peers = sorted((e for e in emp.values() if e.counter == cname),
+        peers = sorted((e for k, e in emp.items() if k and e.counter == cname),
                        key=lambda x: -x.net)
         for pos, e in enumerate(peers, start=1):
             ranked[e.key] = pos
@@ -819,7 +895,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         top = ranked.get(a.key) == 1
         _cell(ws, r, 1, a.name, bold=top, size=10, border=True,
               fill=GOOD if top else None)
-        _cell(ws, r, 2, a.key, size=9, border=True, color=GREY)
+        _cell(ws, r, 2, a.key or "not written", size=9, border=True,
+              color=GREY if a.key else "C00000")
         _cell(ws, r, 3, a.counter, size=9, border=True)
         _cell(ws, r, 4, a.currency, size=8, border=True, align="center")
         _cell(ws, r, 5, len(a.days) or None, size=9, border=True, align="center")
