@@ -553,17 +553,17 @@ def test_a_point_of_sale_that_barely_trades_is_flagged_not_chased(tmp_path):
 # --------------------------------------------------------------------------
 # the exchange rate is derived, never assumed
 # --------------------------------------------------------------------------
-def _paired(tmp_path, pos, counter, pairs, rate, extra=()):
+def _paired(tmp_path, pos, counter, pairs, rate, declared="LOC", extra=()):
     """`pairs` sales appearing on both sides, the counter side divided by rate."""
     lines, rows = [], []
     for i in range(pairs):
         loc = f"0A{i:04d}"
         amount = 10000 + i * 100
         lines.append(_line(16, "Ticket payment", loc, pos, amount))
-        rows.append((counter, 16, "ISSUE", loc, amount / rate, "LOC"))
-    for loc, sys_amt, rep_amt in extra:
+        rows.append((counter, 16, "ISSUE", loc, amount / rate, declared))
+    for loc, sys_amt, rep_amt, cur in extra:
         lines.append(_line(16, "Ticket payment", loc, pos, sys_amt))
-        rows.append((counter, 16, "ISSUE", loc, rep_amt, "LOC"))
+        rows.append((counter, 16, "ISSUE", loc, rep_amt, cur))
     return _data(tmp_path, lines), _rows(*rows)
 
 
@@ -571,48 +571,67 @@ def test_a_rate_is_derived_from_sales_that_appear_on_both_sides(tmp_path):
     """The system holds the base-currency figure and the counter holds its own,
     so their ratio IS the rate that counter used. Nothing external is assumed."""
     data, rows = _paired(tmp_path, "INT Kuala Lumpur (Malaysia)", "KUL",
-                         pairs=20, rate=30.30)
+                         pairs=20, rate=30.30, declared="MYR")
     res = cr.reconcile(data, rows, {"KUL": "INT Kuala Lumpur (Malaysia)"},
                        currency_by_counter={"KUL": "MYR"},
                        filed_days={"KUL": {16}})
-    info = res.rate_for("KUL")
+    info = res.rate_for("KUL", "MYR")
     assert info is not None
     assert info["rate"] == pytest.approx(30.30, rel=0.01)
     assert info["pairs"] == 20
     assert info["mixed"] is False
+    # and it converts
+    value, used = res.convert("KUL", "MYR", 1000)
+    assert value == pytest.approx(30300, rel=0.01)
+    assert used is info
 
 
 def test_too_few_matched_sales_means_no_rate(tmp_path):
-    """DOH matched only four sales all month; four is not a rate."""
-    data, rows = _paired(tmp_path, "INT Doha (Qatar)", "DOH", pairs=4, rate=34.0)
+    """Two sales agreeing could be coincidence; there is no rate in that."""
+    data, rows = _paired(tmp_path, "INT Doha (Qatar)", "DOH", pairs=2,
+                         rate=34.0, declared="QAR")
     res = cr.reconcile(data, rows, {"DOH": "INT Doha (Qatar)"},
-                       currency_by_counter={"DOH": "BDT"},
+                       currency_by_counter={"DOH": "QAR"},
                        filed_days={"DOH": {16}})
-    assert res.currency_rates["DOH"]["pairs"] == 4
-    assert res.rate_for("DOH") is None          # below MIN_RATE_PAIRS
-    assert cr.MIN_RATE_PAIRS > 4
+    assert res.rate_for("DOH", "QAR") is None
+    assert res.convert("DOH", "QAR", 1000) == (1000, None)   # left as written
 
 
-def test_a_sheet_written_in_two_currencies_gets_no_single_rate(tmp_path):
-    """SIN writes some rows in SGD and some already in BDT, so its pairs sit at
-    both 97 and 1.00. One rate there would be fiction."""
-    mixed = [(f"0B{i:04d}", 10000, 10000) for i in range(10)]   # already base
-    data, rows = _paired(tmp_path, "INT Singapore (SIN)", "SIN",
-                         pairs=10, rate=97.0, extra=mixed)
+def test_each_declared_currency_gets_its_own_rate(tmp_path):
+    """One counter writes some sheets in SGD and some in BDT. Pooling them made
+    its ratios look irreconcilable; keyed by what each ROW declares, both are
+    exact."""
+    already_base = [(f"0B{i:04d}", 10000, 10000, "BDT") for i in range(5)]
+    data, rows = _paired(tmp_path, "INT Singapore (SIN)", "SIN", pairs=10,
+                         rate=97.0, declared="SGD", extra=already_base)
     res = cr.reconcile(data, rows, {"SIN": "INT Singapore (SIN)"},
                        currency_by_counter={"SIN": "SGD"},
                        filed_days={"SIN": {16}})
-    info = res.currency_rates["SIN"]
-    assert info["pairs"] == 20
-    assert info["mixed"] is True                # the pairs disagree
-    assert res.rate_for("SIN") is None
+    sgd = res.rate_for("SIN", "SGD")
+    bdt = res.rate_for("SIN", "BDT")
+    assert sgd["rate"] == pytest.approx(97.0, rel=0.01)
+    assert bdt["rate"] == pytest.approx(1.0, rel=0.01)
+    assert sgd["mixed"] is False and bdt["mixed"] is False
 
 
-def test_a_base_currency_counter_needs_no_rate(tmp_path):
-    data, rows = _paired(tmp_path, "DAC-07 Baridhara", "Baridhara",
-                         pairs=20, rate=1.0)
+def test_rows_that_disagree_within_one_declared_currency_give_no_rate(tmp_path):
+    """If rows claiming the same currency do not agree, they are not one
+    currency and no single rate can stand for them."""
+    noise = [(f"0C{i:04d}", 10000, 10000, "SGD") for i in range(10)]
+    data, rows = _paired(tmp_path, "INT Singapore (SIN)", "SIN", pairs=10,
+                         rate=97.0, declared="SGD", extra=noise)
+    res = cr.reconcile(data, rows, {"SIN": "INT Singapore (SIN)"},
+                       currency_by_counter={"SIN": "SGD"},
+                       filed_days={"SIN": {16}})
+    assert res.currency_rates[("SIN", "SGD")]["mixed"] is True
+    assert res.rate_for("SIN", "SGD") is None
+
+
+def test_a_base_currency_counter_needs_no_conversion(tmp_path):
+    data, rows = _paired(tmp_path, "DAC-07 Baridhara", "Baridhara", pairs=20,
+                         rate=1.0, declared="BDT")
     res = cr.reconcile(data, rows, MAP, currency_by_counter={"Baridhara": "BDT"},
                        filed_days={"Baridhara": {16}})
     assert res.comparable("Baridhara") is True
-    assert res.currency_rates["Baridhara"]["rate"] == pytest.approx(1.0)
+    assert res.currency_rates[("Baridhara", "BDT")]["rate"] == pytest.approx(1.0)
     assert "Baridhara" not in res.currency_suspect

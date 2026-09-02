@@ -561,3 +561,60 @@ def test_the_nameless_bucket_never_appears_in_a_leaderboard(tmp_path):
     # the 999,000 belongs to nobody, so it must not top the leaderboard
     assert [r[1] for r in rows] == ["Real Person"]
     book.close()
+
+
+def test_conversion_is_applied_once_and_only_once(tmp_path):
+    """The rows are restated before aggregating, so the leaderboard must NOT
+    multiply again. Doing so turned one agent's 1,986,546 into 60,634,814."""
+    class _Recon:
+        currency_suspect = {"KUL": 30.0}
+        currency_rates = {("KUL", "MYR"): {"rate": 30.0, "pairs": 20,
+                                           "spread": 0.0, "mixed": False,
+                                           "currency": "MYR"}}
+
+        def rate_for(self, counter, currency=None):
+            return self.currency_rates.get((counter, currency))
+
+    rows = [cm.SaleRow("KUL", 1, "ISSUE", "USBA-90001", "A", "0A1111",
+                       1000.0, "MYR", {"Cash": 1000.0})]
+    applied = cm._to_base(rows, _Recon(), "BDT")
+    assert rows[0].amount == pytest.approx(30_000)
+    assert rows[0].payments["Cash"] == pytest.approx(30_000)
+    assert rows[0].currency == "BDT"
+    assert rows[0].converted_rate == 30.0
+    assert ("KUL", "MYR") in applied
+
+    # running it again must be a no-op: the row is already in base currency
+    cm._to_base(rows, _Recon(), "BDT")
+    assert rows[0].amount == pytest.approx(30_000)
+
+
+def test_a_row_with_no_amount_is_still_restated(tmp_path):
+    """It has nothing to convert, but it belongs to a restated counter. Leaving
+    it behind made a counter look like it was still keeping INR."""
+    class _Recon:
+        def rate_for(self, counter, currency=None):
+            return ({"rate": 1.3, "pairs": 20, "spread": 0.0, "mixed": False,
+                     "currency": "INR"} if currency == "INR" else None)
+
+    rows = [cm.SaleRow("MAA", 1, "ISSUE", "USBA-90001", "A", "0A1111",
+                       0.0, "INR"),
+            cm.SaleRow("MAA", 1, "ISSUE", "USBA-90001", "A", "0A2222",
+                       100.0, "INR")]
+    cm._to_base(rows, _Recon(), "BDT")
+    assert [r.currency for r in rows] == ["BDT", "BDT"]
+    assert rows[0].amount == 0
+    assert rows[1].amount == pytest.approx(130)
+
+
+def test_no_rate_leaves_the_row_exactly_as_written(tmp_path):
+    class _Recon:
+        def rate_for(self, counter, currency=None):
+            return None
+
+    rows = [cm.SaleRow("SIN", 1, "ISSUE", "USBA-90001", "A", "0A1111",
+                       500.0, "SGD")]
+    applied = cm._to_base(rows, _Recon(), "BDT")
+    assert rows[0].amount == 500.0
+    assert rows[0].currency == "SGD"          # untouched, and so not rankable
+    assert applied == {}

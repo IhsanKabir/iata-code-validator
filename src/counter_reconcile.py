@@ -289,7 +289,9 @@ def suggest_mapping(counter_names, points_of_sale):
 LOW_VOLUME = 5
 
 # matched pairs needed before the ratio between them is trusted as a rate
-MIN_RATE_PAIRS = 8
+MIN_RATE_PAIRS = 3
+# how far the pairs may spread before they are not one currency after all
+RATE_SPREAD = 0.05
 
 MATCHED, UNREPORTED, DATE_SHIFTED, NOT_IN_SYSTEM, BLOCK_MISMATCH = (
     "MATCHED", "UNREPORTED", "DATE-SHIFTED", "NOT IN SYSTEM", "BLOCK MISMATCH")
@@ -349,7 +351,7 @@ class ReconResult:
     def comparable(self, counter: str) -> bool:
         return counter not in set(self.non_comparable)
 
-    def rate_for(self, counter: str):
+    def rate_for(self, counter: str, currency: str = None):
         """The counter's own exchange rate, only when the data supports one.
 
         Derived from sales that appear on BOTH sides: the system records the
@@ -358,10 +360,22 @@ class ReconResult:
         refused when there are too few pairs to be sure, or when the pairs
         disagree -- a sheet written in two currencies has no single rate.
         """
-        info = self.currency_rates.get(counter)
+        if currency is not None:
+            info = self.currency_rates.get((counter, currency))
+        else:                       # any rate this counter has, best evidenced
+            cand = [v for (c, _cur), v in self.currency_rates.items()
+                    if c == counter and not v["mixed"]]
+            info = max(cand, key=lambda v: v["pairs"]) if cand else None
         if not info or info["pairs"] < MIN_RATE_PAIRS or info["mixed"]:
             return None
         return info
+
+    def convert(self, counter: str, currency: str, amount: float):
+        """(amount in base currency, the rate used) or (amount, None)."""
+        info = self.rate_for(counter, currency)
+        if info is None or not amount:
+            return amount, None
+        return amount * info["rate"], info
 
     @property
     def omitted(self) -> list:
@@ -429,7 +443,8 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
         slot = rep.get(key)
         if slot is None:
             slot = rep[key] = {"amount": 0.0, "n": 0, "counter": r.counter,
-                               "day": r.day, "block": r.block}
+                               "day": r.day, "block": r.block,
+                               "currency": r.currency}
         slot["amount"] += r.amount
         slot["n"] += 1
     by_day: dict[tuple, list] = defaultdict(list)
@@ -479,7 +494,11 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
             c["rep_n"] += 1
             c["rep_amt"] += slot["amount"]
             if slot["amount"] > 0:
-                ratios[counter].append(ln.amount / slot["amount"])
+                # keyed by the currency the ROW declares, not by the counter.
+                # SIN writes some sheets in SGD and some in BDT; pooling them
+                # made its ratios look irreconcilable when each group is exact.
+                ratios[(counter, slot["currency"])].append(
+                    ln.amount / slot["amount"])
             if abs(slot["amount"] - ln.amount) > max(1.0, ln.amount * 0.02):
                 res.findings.append(Finding(
                     MATCHED, counter, ln.pos, ln.day, ln.locator, ln.block,
@@ -552,18 +571,19 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
     # A counter whose matched sales are consistently a different SIZE is keeping
     # its sheet in another currency, whatever its column header claims. Trusting
     # the label reported a 58x "shortfall" for a desk that simply writes AED.
-    for cnt, rs in ratios.items():
-        if len(rs) < 3:
+    for (cnt, cur), rs in ratios.items():
+        if len(rs) < MIN_RATE_PAIRS:
             continue
         rs = sorted(rs)
         median = rs[len(rs) // 2]
-        # The SPREAD decides whether one rate can stand for the whole sheet.
-        # SIN writes some rows in SGD and some already in BDT, so its pairs sit
-        # at both 97 and 1.00 -- a single rate there would be fiction.
+        # Consistency, not volume, is what makes a ratio a rate: these counters
+        # bill at a fixed internal rate, so a real one is tight to a fraction
+        # of a percent. A loose spread means the rows are not one currency.
         lo, hi = rs[len(rs) // 10], rs[9 * len(rs) // 10]
         spread = (hi - lo) / median if median else 99
-        res.currency_rates[cnt] = {"rate": median, "pairs": len(rs),
-                                   "spread": spread, "mixed": spread > 0.1}
+        res.currency_rates[(cnt, cur)] = {
+            "rate": median, "pairs": len(rs), "spread": spread,
+            "mixed": spread > RATE_SPREAD, "currency": cur}
         if median > 2 or median < 0.5:
             res.currency_suspect[cnt] = median
             if cnt not in res.non_comparable:

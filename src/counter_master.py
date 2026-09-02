@@ -154,6 +154,7 @@ class SaleRow:
     payments: dict = field(default_factory=dict)
     allocated: bool = False
     pay_status: str = "ok"     # ok | not written | mismatch | no amount
+    converted_rate: float | None = None   # set when restated in base currency
 
 
 @dataclass
@@ -499,7 +500,9 @@ class Agg:
     key: str = ""
     name: str = ""
     counter: str = ""
-    currency: str = "BDT"
+    currency: str = "BDT"          # what the figures are IN, after conversion
+    source_currency: str = "BDT"   # what the counter actually wrote
+    rate: float | None = None      # the rate applied, when one was
     days: set = field(default_factory=set)
     n: Counter = field(default_factory=Counter)
     val: Counter = field(default_factory=Counter)
@@ -518,6 +521,34 @@ class Agg:
     def cash_share(self) -> float:
         tot = sum(self.pay.values())
         return self.pay.get("Cash", 0) / tot if tot else 0.0
+
+
+def _to_base(sales, recon, base_currency: str) -> dict:
+    """Restate each row in base currency, in place. Returns the rates applied.
+
+    A row carries the currency its own sheet declared, so the rate is looked up
+    per (counter, currency) -- one counter writes some sheets in SGD and some in
+    BDT, and each needs its own. A row with no rate is left exactly as written
+    and its counter is reported as unconverted rather than quietly mixed in.
+    """
+    applied: dict = {}
+    if recon is None:
+        return applied
+    for row in sales:
+        info = recon.rate_for(row.counter, row.currency)
+        if info is None or abs(info["rate"] - 1.0) < 1e-9:
+            continue
+        # A row whose amount the staff never wrote still belongs to the restated
+        # counter. Skipping it left MAA with 62 rows marked INR and 29 BDT, and
+        # the aggregate then took INR as the counter's currency and refused to
+        # rank anyone there.
+        if row.amount:
+            row.amount *= info["rate"]
+            row.payments = {k: v * info["rate"] for k, v in row.payments.items()}
+            row.converted_rate = info["rate"]
+        applied[(row.counter, info["currency"])] = info
+        row.currency = base_currency
+    return applied
 
 
 def aggregate(sales, metas):
@@ -551,6 +582,18 @@ def aggregate(sales, metas):
             names[s.emp_id][s.emp_name] += 1
         emp_counters[s.emp_id][s.counter] += 1
 
+    for bucket in (emp, ctr):
+        for key, a in bucket.items():
+            rows_for = [s for s in sales
+                        if (s.emp_id if bucket is emp else s.counter) == key]
+            if rows_for:
+                a.currency = Counter(s.currency for s in rows_for).most_common(
+                    1)[0][0]
+                rate = next((s.converted_rate for s in rows_for
+                             if s.converted_rate), None)
+                a.rate = rate
+            a.source_currency = cur_by_counter.get(a.counter, a.currency)
+
     for eid, a in emp.items():
         if names[eid]:
             a.name = names[eid].most_common(1)[0][0].title()
@@ -561,7 +604,9 @@ def aggregate(sales, metas):
             a.key = ""
 
         a.counter = emp_counters[eid].most_common(1)[0][0]
-        a.currency = cur_by_counter.get(a.counter, "BDT")
+        # NOT a.currency: that is what the figures are IN after conversion, and
+        # the header's label is only what the counter wrote them in
+        a.source_currency = cur_by_counter.get(a.counter, a.currency)
         a.multi = len(emp_counters[eid]) > 1
     return emp, ctr
 
@@ -684,27 +729,12 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     if not metas:
         raise ValueError("No counter workbooks were read.")
 
-    emp, ctr = aggregate(all_sales, metas)
     meta_by = {m["counter"]: m for m in metas}
     issues_by = defaultdict(Counter)
     for it in all_issues:
         issues_by[it.counter][it.kind] += 1
 
-    dom = [c for c in ctr.values() if c.currency == base_currency]
-    foreign = [c for c in ctr.values() if c.currency != base_currency]
-    days_in_month = 31 if month in (1, 3, 5, 7, 8, 10, 12) else (
-        30 if month != 2 else 28)
-
-    tot_issue = sum(c.val["ISSUE"] for c in dom)
-    tot_reissue = sum(c.val["REISSUE"] for c in dom)
-    tot_refund = sum(c.val["REFUND"] for c in dom)
-    tot_n = sum(c.n["ISSUE"] for c in dom)
-    pay_tot = Counter()
-    for c in dom:
-        pay_tot.update(c.pay)
-    grand_pay = sum(pay_tot.values()) or 1
-    reported = sum(len(m["days"]) for m in metas)
-    expected = len(metas) * days_in_month
+    emp, ctr = aggregate(all_sales, metas)
 
     recon, gap_source = None, ""
     # Stop was only checked while reading workbooks, so pressing it during the
@@ -753,6 +783,30 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
                 progress_cb=(lambda d, n, code: progress_cb(
                     d, n, f"Zenith lookup {d}/{n} · {code}"))
                 if progress_cb else None)
+
+    # With the rates in hand, restate every counter in base currency so one
+    # table can hold them all. Nothing external is assumed: each rate came from
+    # that counter's own sales appearing on both sides.
+    converted = _to_base(all_sales, recon, base_currency)
+    if converted:
+        emp, ctr = aggregate(all_sales, metas)   # restate the whole sheet
+
+    dom = [c for c in ctr.values() if c.currency == base_currency]
+    foreign = [c for c in ctr.values() if c.currency != base_currency]
+    days_in_month = 31 if month in (1, 3, 5, 7, 8, 10, 12) else (
+        30 if month != 2 else 28)
+
+    tot_issue = sum(c.val["ISSUE"] for c in dom)
+    tot_reissue = sum(c.val["REISSUE"] for c in dom)
+    tot_refund = sum(c.val["REFUND"] for c in dom)
+    tot_n = sum(c.n["ISSUE"] for c in dom)
+    pay_tot = Counter()
+    for c in dom:
+        pay_tot.update(c.pay)
+    grand_pay = sum(pay_tot.values()) or 1
+    reported = sum(len(m["days"]) for m in metas)
+    expected = len(metas) * days_in_month
+
 
     wb = Workbook()
     ws = wb.active
@@ -860,10 +914,19 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             flags.append("currency drift")
         if ik.get("stale_month"):
             flags.append(f"stale dates x{ik['stale_month']}")
-        if a.currency != base_currency:
-            flags.append(f"local {a.currency}")
+        if a.rate:
+            flags.append(f"converted x{a.rate:,.2f}")
+            if _mislabelled:
+                # the column header claims base currency, the numbers do not
+                flags.append(f"header says {base_currency} but is not")
+        elif a.currency != base_currency:
+            flags.append(f"{a.currency} — no rate, NOT converted")
         _cell(ws, r, 1, a.counter, bold=True, size=10, border=True)
-        _cell(ws, r, 2, a.currency, size=9, border=True, align="center")
+        _mislabelled = bool(a.rate) and a.source_currency == base_currency
+        _cell(ws, r, 2,
+              (a.source_currency + " → BDT") if (a.rate and not _mislabelled)
+              else ("? → BDT" if _mislabelled else a.source_currency),
+              size=8, border=True, align="center")
         _cell(ws, r, 3, f"{nd} / {days_in_month}", size=9, border=True,
               align="center")
         _cell(ws, r, 4, cov, fmt=PCT, size=9, border=True, align="center")
@@ -992,19 +1055,16 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
               "ranked across the estate by value; overseas sheets are converted "
               "at the rate their OWN matched sales imply, never an assumed one")
 
-    def _rate_for(counter):
-        """The counter's own rate, from sales that appear on BOTH sides."""
-        return recon.rate_for(counter) if recon is not None else None
-
     def _in_base(a, block):
-        """(value in base currency, the rate used or None, ranked?)."""
-        if a.currency == base_currency and a.counter not in (
-                recon.currency_suspect if recon else {}):
-            return a.val[block], None, True
-        info = _rate_for(a.counter)
-        if info is None:
-            return a.val[block], None, False
-        return a.val[block] * info["rate"], info, True
+        """(value, the rate that was applied or None, is it rankable?).
+
+        The rows were already restated in base currency before aggregating, so
+        NOTHING is multiplied here -- doing it again turned one agent's
+        1,986,546 into 60,634,814. This only reports which rate got them there,
+        and refuses to rank a counter that could not be converted at all.
+        """
+        info = converted.get((a.counter, a.source_currency))
+        return a.val[block], info, a.currency == base_currency
 
     def _leaderboard(row, block, title, unit, top=15):
         pool, other = [], []
