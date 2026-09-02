@@ -737,13 +737,14 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     emp, ctr = aggregate(all_sales, metas)
 
     recon, gap_source = None, ""
+    cr = sales = mapping = ambiguous = filed_days = None
     # Stop was only checked while reading workbooks, so pressing it during the
     # sales pass did nothing for the ~11s that takes. The master sheet is already
     # built at this point, so skipping the gap sheet still leaves a usable file.
     if (sales_report or use_warehouse) and not (stop_flag is not None and stop_flag()):
         # a second sheet in the SAME workbook: the unreported check only means
         # anything read next to what was reported
-        from . import counter_reconcile as cr
+        from . import counter_reconcile as cr  # noqa: F811 - bound above
         note = ((lambda n: progress_cb(0, 0, f"sales data: {n:,} rows"))
                 if progress_cb else None)
         if sales_report:
@@ -787,9 +788,31 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     # With the rates in hand, restate every counter in base currency so one
     # table can hold them all. Nothing external is assumed: each rate came from
     # that counter's own sales appearing on both sides.
+    duplicates = 0
+    if recon is not None and recon.duplicate_rows:
+        # a row the counter wrote twice is not a second sale
+        drop = {id(x) for x in recon.duplicate_rows}
+        duplicates = len(drop)
+        all_sales = [r for r in all_sales if id(r) not in drop]
+
     converted = _to_base(all_sales, recon, base_currency)
-    if converted:
+    if converted or duplicates:
         emp, ctr = aggregate(all_sales, metas)   # restate the whole sheet
+    if recon is not None and (converted or duplicates):
+        # Run the comparison again on the restated rows, so the gap sheet is in
+        # the same currency as everything else. Without this it reported KUL as
+        # having declared 77,127 while the master sheet said 2,424,810.
+        rates, suspect = recon.currency_rates, recon.currency_suspect
+        dupes = {c: v.get("dupe_n", 0) for c, v in recon.per_counter.items()
+                 if v.get("dupe_n")}
+        recon = cr.reconcile(
+            sales, all_sales, mapping, base_currency=base_currency,
+            currency_by_counter={m["counter"]: base_currency for m in metas},
+            filed_days=filed_days, ambiguous=ambiguous)
+        recon.currency_rates, recon.currency_suspect = rates, suspect
+        for c, n in dupes.items():          # the second pass no longer sees them
+            recon.per_counter.setdefault(c, {})["dupe_n"] = n
+        recon.duplicate_rows = [None] * duplicates
 
     dom = [c for c in ctr.values() if c.currency == base_currency]
     foreign = [c for c in ctr.values() if c.currency != base_currency]
@@ -1233,7 +1256,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     r = _headers(ws, r, [
         "Counter", "File", "Day sheets", "Populated", "Cov%", "Rows",
         "No amount", "No PNR", "Payment mismatch", "Stale dates",
-        "Currency drift", "Day source", "", "", "", "", "", "", "", "", "Verdict"])
+        "Currency drift", "Day source", "Duplicated rows removed",
+        "", "", "", "", "", "", "", "Verdict"])
     dq_first = r
     for m in sorted(metas, key=lambda x: len(x["days"])):
         c = m["counter"]
@@ -1262,7 +1286,12 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         _cell(ws, r, 12, ", ".join(f"{k}:{v}" for k, v in
                                    sorted(m["day_sources"].items())), size=8,
               border=True)
-        for j in range(13, 21):
+        # the counter's own printed total still includes these; ours does not
+        _dupes = ((recon.per_counter.get(c, {}) or {}).get("dupe_n", 0)
+                  if recon is not None else 0)
+        _cell(ws, r, 13, _dupes or None, size=9, border=True, align="center",
+              fill=WARN if _dupes else None)
+        for j in range(14, 21):
             _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
               align="center")

@@ -635,3 +635,48 @@ def test_a_base_currency_counter_needs_no_conversion(tmp_path):
     assert res.comparable("Baridhara") is True
     assert res.currency_rates[("Baridhara", "BDT")]["rate"] == pytest.approx(1.0)
     assert "Baridhara" not in res.currency_suspect
+
+
+# --------------------------------------------------------------------------
+# a row written twice is not a second sale
+# --------------------------------------------------------------------------
+def test_several_rows_for_one_pnr_are_summed_when_that_matches(tmp_path):
+    """One booking per passenger is the normal case, and summing is right."""
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-07 Baridhara", 30000)])
+    rows = _rows(("Baridhara", 16, "ISSUE", "0A1111", 10000, "BDT"),
+                 ("Baridhara", 16, "ISSUE", "0A1111", 10000, "BDT"),
+                 ("Baridhara", 16, "ISSUE", "0A1111", 10000, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {16}})
+    assert res.duplicate_rows == []
+    assert res.per_counter["Baridhara"]["rep_amt"] == pytest.approx(30000)
+    assert res.clean_matches == 1
+
+
+def test_a_row_written_twice_is_detected_and_not_counted_twice(tmp_path):
+    """When the SUM misses the system but a SINGLE row hits it exactly, the row
+    was typed twice. 39 such rows inflated reported totals by 375,932."""
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-07 Baridhara", 31168)])
+    rows = _rows(("Baridhara", 16, "ISSUE", "0A1111", 31168, "BDT"),
+                 ("Baridhara", 16, "ISSUE", "0A1111", 31168, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {16}})
+    assert len(res.duplicate_rows) == 1
+    assert res.per_counter["Baridhara"]["dupe_n"] == 1
+    assert res.per_counter["Baridhara"]["rep_amt"] == pytest.approx(31168)
+    # and it is a clean match, not an amount mismatch
+    assert res.clean_matches == 1
+    assert [f for f in res.of(cr.MATCHED) if f.note] == []
+
+
+def test_rows_that_neither_sum_nor_match_singly_are_left_alone(tmp_path):
+    """Two rows that are simply wrong must not be silently pruned to fit."""
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "DAC-07 Baridhara", 50000)])
+    rows = _rows(("Baridhara", 16, "ISSUE", "0A1111", 10000, "BDT"),
+                 ("Baridhara", 16, "ISSUE", "0A1111", 15000, "BDT"))
+    res = cr.reconcile(data, rows, MAP, filed_days={"Baridhara": {16}})
+    assert res.duplicate_rows == []
+    assert res.per_counter["Baridhara"]["rep_amt"] == pytest.approx(25000)
+    flagged = [f for f in res.of(cr.MATCHED) if f.note]
+    assert len(flagged) == 1              # reported as an amount mismatch

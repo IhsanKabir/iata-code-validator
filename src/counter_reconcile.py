@@ -327,6 +327,7 @@ class ReconResult:
     non_comparable: list = field(default_factory=list)
     currency_suspect: dict = field(default_factory=dict)
     currency_rates: dict = field(default_factory=dict)
+    duplicate_rows: list = field(default_factory=list)
     ambiguous: dict = field(default_factory=dict)
     clean_matches: int = 0
     mapping: dict = field(default_factory=dict)
@@ -444,9 +445,10 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
         if slot is None:
             slot = rep[key] = {"amount": 0.0, "n": 0, "counter": r.counter,
                                "day": r.day, "block": r.block,
-                               "currency": r.currency}
+                               "currency": r.currency, "rows": []}
         slot["amount"] += r.amount
         slot["n"] += 1
+        slot["rows"].append(r)
     by_day: dict[tuple, list] = defaultdict(list)
     by_pnr: dict[tuple, list] = defaultdict(list)
     for key in rep:
@@ -492,21 +494,37 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
         if slot is not None:
             matched.add(key)
             c["rep_n"] += 1
-            c["rep_amt"] += slot["amount"]
-            if slot["amount"] > 0:
+            reported = slot["amount"]
+            tol = max(1.0, ln.amount * 0.02)
+            if len(slot["rows"]) > 1 and abs(reported - ln.amount) > tol:
+                # Several counter rows for one PNR are usually one booking per
+                # passenger, and summing them is right. But when the SUM misses
+                # the system while a SINGLE row hits it exactly, the row was
+                # written twice -- 39 such rows inflated reported totals by
+                # 375,932, against only 4 genuine multi-passenger groups.
+                single = next((x for x in slot["rows"]
+                               if abs(x.amount - ln.amount) <= tol), None)
+                if single is not None:
+                    reported = single.amount
+                    c["dupe_n"] += len(slot["rows"]) - 1
+                    res.duplicate_rows.extend(
+                        x for x in slot["rows"] if x is not single)
+            slot["amount"] = reported
+            c["rep_amt"] += reported
+            if reported > 0:
                 # keyed by the currency the ROW declares, not by the counter.
                 # SIN writes some sheets in SGD and some in BDT; pooling them
                 # made its ratios look irreconcilable when each group is exact.
                 ratios[(counter, slot["currency"])].append(
-                    ln.amount / slot["amount"])
-            if abs(slot["amount"] - ln.amount) > max(1.0, ln.amount * 0.02):
+                    ln.amount / reported)
+            if abs(reported - ln.amount) > tol:
                 res.findings.append(Finding(
                     MATCHED, counter, ln.pos, ln.day, ln.locator, ln.block,
-                    ln.amount, slot["amount"], ln.agent, ln.customer,
+                    ln.amount, reported, ln.agent, ln.customer,
                     note=("amount differs" if slot["n"] == 1
                           else f"amount differs ({slot['n']} rows summed)")))
                 c["mismatch_n"] += 1
-                c["mismatch_gap"] += ln.amount - slot["amount"]
+                c["mismatch_gap"] += ln.amount - reported
             else:
                 c["clean_n"] += 1
             continue
@@ -735,6 +753,8 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
             note.append(f"sheet reads {res.currency_suspect[c]:.0f}x smaller")
         if c in res.ambiguous:
             note.append("also: " + ", ".join(res.ambiguous[c])[:40])
+        if v.get("dupe_n"):
+            note.append(f"{v['dupe_n']} duplicated row(s) removed")
         if v.get("not_submitted") and v.get("sys_n", 0) < LOW_VOLUME:
             # a location with a handful of sales a month is probably not a
             # staffed desk; chasing it like the airport would waste the list
