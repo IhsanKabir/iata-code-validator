@@ -323,6 +323,7 @@ class App(WhatsAppMixin, HealthMixin):
         self.ctr_sales_path = tk.StringVar(value="")
         self.ctr_use_warehouse = tk.BooleanVar(value=False)
         self.ctr_lookup_pnrs = tk.BooleanVar(value=False)
+        self.ctr_overclaim = tk.BooleanVar(value=False)
         self._ctr_warehouse = None       # set once the local sales data is probed
         self._ctr_stop_flag = threading.Event()
         self._ctr_worker: threading.Thread | None = None
@@ -4350,6 +4351,19 @@ class App(WhatsAppMixin, HealthMixin):
                        " from the sales report alone"))
                 for verdict, n, amt in (info.get("checked_counts") or [])[:5]:
                     self._ctr_log(f"    {verdict}: {n:,} · {amt:,.0f}")
+            if info.get("overclaim_n"):
+                who = info.get("overclaim_counters") or []
+                # a floor, not a finished figure, while rows remain unanswered
+                self._ctr_log(
+                    f"Overclaim: {info['overclaim_n']:,} row(s) worth "
+                    f"{info.get('overclaim_amount', 0):,.0f} the system does "
+                    f"not owe, across {len(who)} counter(s): "
+                    + ", ".join(who[:6]) + (" …" if len(who) > 6 else ""))
+                if info.get("overclaim_unchecked"):
+                    self._ctr_log(
+                        f"    {info['overclaim_unchecked']:,} row(s) are still "
+                        f"unanswered, so that total is a floor — tick the "
+                        f"Zenith box to settle them")
             self._ctr_log(f"File: {info.get('path', '')}")
             self.ctr_progress_label.configure(text=f"Done{note}.")
             messagebox.showinfo(
@@ -6336,6 +6350,11 @@ class App(WhatsAppMixin, HealthMixin):
                  "ones, and settle the ones the counters wrote "
                  "(needs sign-in, slower)",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            sales, variable=self.ctr_overclaim,
+            text="Add an Overclaim sheet — what the counters wrote down that "
+                 "the system does not owe them",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
         ttk.Label(
             sales, style="Hint.TLabel",
             text="Adds the booking's status, route and customer to the "
@@ -6617,13 +6636,14 @@ class App(WhatsAppMixin, HealthMixin):
                   Path(self.ctr_output_dir.get().strip() or str(Path.home())),
                   self.ctr_sales_path.get().strip() or None,
                   bool(self.ctr_use_warehouse.get()),
-                  self._zenith_session if self.ctr_lookup_pnrs.get() else None),
+                  self._zenith_session if self.ctr_lookup_pnrs.get() else None,
+                  bool(self.ctr_overclaim.get())),
             daemon=True)
         self._ctr_worker.start()
 
     def _ctr_worker_run(self, paths, month: int, year: int, out_dir: Path,
                         sales_report=None, use_warehouse: bool = False,
-                        zenith_session=None) -> None:
+                        zenith_session=None, overclaim: bool = False) -> None:
         from . import counter_master
 
         def progress(done, total, name):
@@ -6638,7 +6658,7 @@ class App(WhatsAppMixin, HealthMixin):
                 month=month, year=year, progress_cb=progress,
                 stop_flag=lambda: self._ctr_stop_flag.is_set(),
                 sales_report=sales_report, use_warehouse=use_warehouse,
-                zenith_session=zenith_session)
+                zenith_session=zenith_session, overclaim=overclaim)
         except Exception as exc:  # noqa: BLE001
             log.exception("Counter Activity master build failed")
             self._post(MSG_CTR_ERROR, f"{type(exc).__name__}: {exc}")
@@ -6663,6 +6683,10 @@ class App(WhatsAppMixin, HealthMixin):
             "checked_resolved": result.checked_resolved,
             "checked_lookups": result.checked_lookups,
             "checked_counts": list(result.checked_counts),
+            "overclaim_n": result.overclaim_n,
+            "overclaim_amount": result.overclaim_amount,
+            "overclaim_unchecked": result.overclaim_unchecked,
+            "overclaim_counters": list(result.overclaim_counters),
         })
 
     # ------------------------------------------------------------------

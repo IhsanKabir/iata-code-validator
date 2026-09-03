@@ -312,6 +312,7 @@ class Finding:
     note: str = ""
     day_filed: bool = True     # did the counter file a sheet for this day at all?
     submitted: bool = True     # did this counter submit a workbook at all?
+    wrote_by: str = ""         # the staff who wrote the row, when it was written
 
     @property
     def gap(self) -> float:
@@ -608,9 +609,14 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
                             slot["day"])
         except ValueError:
             wrote_on = None
+        # Name whoever wrote it. A row the system has no sale for is a claim,
+        # and a claim belongs to a person, not to a building.
+        wrote_by = ", ".join(sorted(
+            {(r.emp_name or r.emp_id or "").strip()
+             for r in slot.get("rows", ()) if (r.emp_name or r.emp_id)}))
         res.findings.append(Finding(
             NOT_IN_SYSTEM, cnt, key[0], wrote_on, key[2], key[3],
-            0.0, slot["amount"],
+            0.0, slot["amount"], wrote_by=wrote_by,
             note=("may be issued in the adjacent month" if edge else "")))
 
     # A counter whose matched sales are consistently a different SIZE is keeping

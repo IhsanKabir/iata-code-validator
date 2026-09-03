@@ -24,15 +24,21 @@ OTHER_DAY = "SYSTEM HAS ANOTHER DAY"
 WROTE_IT_TWICE = "WRITTEN MORE TIMES THAN IT EXISTS"
 NO_SUCH_PNR = "NO SUCH PNR"
 VOIDED = "VOIDED OR CANCELLED"
-MISSING_FROM_SALES = "REAL — MISSING FROM THE SALES REPORT"
+NO_SALE_RECORDED = "IN ZENITH, NO SALE RECORDED"
 UNCHECKED = "NOT CHECKED"
 LOOKUP_FAILED = "COULD NOT BE CHECKED"
 
 # a Zenith status that means the booking did not stand
 _DEAD = ("cancel", "void", "refund", "deleted")
 
-ORDER = (SOLD_ELSEWHERE, MISSING_FROM_SALES, NO_SUCH_PNR, VOIDED,
-         WROTE_IT_TWICE, OTHER_DAY, LOOKUP_FAILED, UNCHECKED)
+ORDER = (SOLD_ELSEWHERE, WROTE_IT_TWICE, NO_SUCH_PNR, VOIDED,
+         NO_SALE_RECORDED, OTHER_DAY, LOOKUP_FAILED, UNCHECKED)
+
+# Claiming value the counter is not owed. A sale on the wrong DATE is not in
+# here: the money is real and the system has it, only the day is wrong. Nor is
+# anything unchecked -- an unanswered row is not evidence of anything.
+OVERCLAIM = (SOLD_ELSEWHERE, WROTE_IT_TWICE, NO_SUCH_PNR, VOIDED,
+             NO_SALE_RECORDED)
 
 
 @dataclass
@@ -52,6 +58,12 @@ class PNRCheck:
     zenith_status: str = ""
     zenith_amount: str = ""
     customer: str = ""
+    wrote_by: str = ""            # the staff who wrote the row
+
+    @property
+    def is_overclaim(self) -> bool:
+        """Value claimed that the counter is not owed."""
+        return self.verdict in OVERCLAIM
 
     @property
     def resolved(self) -> bool:
@@ -74,6 +86,21 @@ class VerifyResult:
 
     def amount(self, verdict) -> float:
         return sum(c.reported_amount for c in self.of(verdict))
+
+    @property
+    def overclaims(self) -> list:
+        return [c for c in self.checks if c.is_overclaim]
+
+    @property
+    def overclaimed(self) -> float:
+        return sum(c.reported_amount for c in self.overclaims)
+
+    @property
+    def still_unchecked(self) -> int:
+        """Rows no answer was reached for -- the overclaim total is a FLOOR
+        until these are settled, and saying so is the difference between a
+        number and an accusation."""
+        return sum(1 for c in self.checks if not c.resolved)
 
 
 def _index_by_locator(sales) -> dict:
@@ -99,6 +126,7 @@ def _from_the_sales_report(f, hits, mapped_pos, pos_to_counter,
             return PNRCheck(
                 counter=f.counter, locator=f.locator, block=f.block, day=f.day,
                 reported_amount=f.reported_amount, verdict=WROTE_IT_TWICE,
+                wrote_by=getattr(f, 'wrote_by', ''),
                 pos=mapped_pos, sys_counter=f.counter, sys_day=days[0],
                 sys_amount=same[0].amount,
                 detail=(f"the system has this PNR {len(hits)} time(s) and every "
@@ -106,7 +134,7 @@ def _from_the_sales_report(f, hits, mapped_pos, pos_to_counter,
         return PNRCheck(
             counter=f.counter, locator=f.locator, block=f.block, day=f.day,
             reported_amount=f.reported_amount, verdict=OTHER_DAY,
-            pos=mapped_pos, sys_counter=f.counter, sys_day=days[0],
+            wrote_by=getattr(f, "wrote_by", ""), pos=mapped_pos, sys_counter=f.counter, sys_day=days[0],
             sys_amount=same[0].amount,
             detail=f"same counter, system dates it {shown}")
     other = hits[0]
@@ -114,7 +142,7 @@ def _from_the_sales_report(f, hits, mapped_pos, pos_to_counter,
     return PNRCheck(
         counter=f.counter, locator=f.locator, block=f.block, day=f.day,
         reported_amount=f.reported_amount, verdict=SOLD_ELSEWHERE,
-        pos=other.pos, sys_counter=who, sys_day=other.day,
+        wrote_by=getattr(f, "wrote_by", ""), pos=other.pos, sys_counter=who, sys_day=other.day,
         sys_amount=other.amount,
         detail=(f"the system has it at {other.pos}"
                 + (f" ({who})" if who and who != f.counter else "")
@@ -167,6 +195,7 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
         check = PNRCheck(
             counter=f.counter, locator=f.locator, block=f.block, day=f.day,
             reported_amount=f.reported_amount, verdict=UNCHECKED,
+            wrote_by=getattr(f, "wrote_by", ""),
             detail="not in this month's sales at all")
         out.checks.append(check)
         if code:
@@ -208,9 +237,9 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
         status = str(getattr(d, "pnr_status", "") or "")
         amount = str(getattr(d, "total_amount", "") or "")
         customer = str(getattr(d, "customer_name", "") or "")
-        # "the sales report is the one missing it" is the strongest claim here:
-        # it says the counter was right and the export is short. It must rest
-        # on a booking we actually read, not on a reply we could not recognise.
+        # Every verdict from here is an accusation -- that the counter counted
+        # something it was not owed. It must rest on a booking actually read,
+        # never on a reply we could not recognise.
         if not any((status, amount, customer,
                     str(getattr(d, "pnr_code", "") or ""),
                     str(getattr(d, "dossier_id", "") or ""))):
@@ -228,10 +257,13 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
                 c.detail = (f"Zenith says {status} — the counter counted a "
                             f"sale that did not stand")
             else:
-                c.verdict = MISSING_FROM_SALES
-                c.detail = (f"Zenith has it as {status or 'a live booking'}"
+                # Zenith holds the BOOKING; the month holds no SALE against it.
+                # The counter counted a booking as money taken.
+                c.verdict = NO_SALE_RECORDED
+                c.detail = (f"Zenith has the booking as "
+                            f"{status or 'live'}"
                             + (f" for {amount}" if amount else "")
-                            + " — the sales report is the one missing it")
+                            + ", but the month records no sale against it")
     return out
 
 
@@ -252,7 +284,7 @@ _TONE = {
     SOLD_ELSEWHERE: "C00000",
     WROTE_IT_TWICE: "C00000",
     NO_SUCH_PNR: "C00000",
-    MISSING_FROM_SALES: "1F6F3C",
+    NO_SALE_RECORDED: "C00000",
     VOIDED: "BF8F00",
     OTHER_DAY: "BF8F00",
     LOOKUP_FAILED: "808080",
@@ -273,9 +305,9 @@ _MEANS = {
     VOIDED:
         "the booking was cancelled, voided or refunded, so it should not be "
         "counted as a sale",
-    MISSING_FROM_SALES:
-        "the counter was right: Zenith has the booking and the sales report "
-        "does not",
+    NO_SALE_RECORDED:
+        "Zenith has the booking but no sale was ever recorded against it — a "
+        "booking counted as money taken",
     LOOKUP_FAILED: "the lookup could not complete, so nothing is concluded",
     UNCHECKED: "not in this month's sales; tick the Zenith box to check it",
 }
@@ -373,6 +405,170 @@ def write_pnr_check(ws, vres: VerifyResult, *, month: int, year: int,
         r += 1
     if vres.checks:
         ws.auto_filter.ref = f"A{hdr}:N{r - 1}"
+    ws.freeze_panes = f"A{hdr + 1}"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+
+
+# --------------------------------------------------------------------------
+# the overclaim sheet
+# --------------------------------------------------------------------------
+def overclaim_by(vres: VerifyResult, key) -> dict:
+    """Group the overclaims by whatever `key(check)` returns."""
+    out: dict = {}
+    for c in vres.overclaims:
+        k = key(c) or "(not written)"
+        slot = out.setdefault(k, {"n": 0, "amount": 0.0, "reasons": {}})
+        slot["n"] += 1
+        slot["amount"] += c.reported_amount
+        slot["reasons"][c.verdict] = slot["reasons"].get(c.verdict, 0) + 1
+    return out
+
+
+def _reasons(slot) -> str:
+    return " · ".join(f"{v.lower()} x{n}" for v, n in
+                      sorted(slot["reasons"].items(), key=lambda kv: -kv[1]))
+
+
+def write_overclaim(ws, vres: VerifyResult, recon=None, *, month: int,
+                    year: int, base_currency: str = "BDT",
+                    limit: int = 600) -> None:
+    """Value the counters wrote down that the system does not owe them.
+
+    Deliberately narrow. A sale on the wrong DATE is not here -- the money is
+    real and the system has it, only the day is wrong. Nor is anything the
+    check could not answer: an unanswered row is not evidence of anything, and
+    the heading says how many are still outstanding so the total reads as the
+    floor it is rather than as a finished accusation.
+    """
+    from .counter_master import (BAD, COLS, GREY, LAST, MONEY, NAVY, PAPER,
+                                 PCT, _band, _cell, _headers, _kpi_strip)
+
+    for col, width in COLS:
+        ws.column_dimensions[col].width = width
+    ws.sheet_view.showGridLines = False
+
+    claims = vres.overclaims
+    total = vres.overclaimed
+    reported = 0.0
+    if recon is not None:
+        reported = sum(v.get("rep_amt", 0) for v in recon.per_counter.values())
+
+    ws.merge_cells(f"A1:{LAST}1")
+    _cell(ws, 1, 1,
+          "  OVERCLAIM  ·  value written down that the system does not owe",
+          bold=True, size=16, color="FFFFFF", fill=NAVY, align="left")
+    ws.row_dimensions[1].height = 34
+    ws.merge_cells(f"A2:{LAST}2")
+    _cell(ws, 2, 1,
+          f"  {len(claims):,} row(s) worth {total:,.0f} {base_currency}"
+          + (f" — {total / reported:.2%} of everything the counters reported"
+             if reported else "")
+          + ".  A sale on the wrong DATE is NOT counted here: that money is "
+            "real and the system has it, only the day is wrong."
+          + (f"  {vres.still_unchecked:,} row(s) are still unanswered, so this "
+             f"total is a floor rather than a finished figure — tick the "
+             f"Zenith box and run again to settle them."
+             if vres.still_unchecked else
+             "  Every unmatched row was answered.")
+          + "  The PNR Check sheet shows the working behind each row.",
+          size=9, color=GREY, fill=PAPER, align="left")
+    ws.row_dimensions[2].height = 17
+
+    r = 4
+    r = _band(ws, r, "AT A GLANCE")
+    r = _kpi_strip(ws, r, [
+        ("Overclaimed rows", len(claims), "#,##0", "C00000"),
+        (f"Overclaimed value ({base_currency})", total, MONEY, "C00000"),
+        ("Share of reported", (total / reported) if reported else None, PCT,
+         "C00000"),
+        ("Counters involved", len({c.counter for c in claims}), "0", None),
+        ("Staff involved",
+         len({c.wrote_by for c in claims if c.wrote_by}), "0", None),
+        ("Still unanswered", vres.still_unchecked, "#,##0", "BF8F00"),
+        ("Wrong date (not counted)", len(vres.of(OTHER_DAY)), "#,##0", None),
+    ])
+    r += 1
+
+    r = _band(ws, r, "BY COUNTER", "largest claim first")
+    r = _headers(ws, r, ["Counter", "Overclaimed #", "Overclaimed value",
+                         "Reported value", "Share of what it reported",
+                         "Why"] + [""] * 15)
+    per_counter = overclaim_by(vres, lambda c: c.counter)
+    for name, slot in sorted(per_counter.items(),
+                             key=lambda kv: -kv[1]["amount"]):
+        rep_amt = ((recon.per_counter.get(name, {}) or {}).get("rep_amt", 0)
+                   if recon is not None else 0)
+        _cell(ws, r, 1, name, bold=True, size=10, border=True)
+        _cell(ws, r, 2, slot["n"], bold=True, size=10, border=True,
+              align="center")
+        _cell(ws, r, 3, slot["amount"], fmt=MONEY, bold=True, size=10,
+              border=True, align="right", color="C00000")
+        _cell(ws, r, 4, rep_amt or None, fmt=MONEY, size=9, border=True,
+              align="right")
+        _cell(ws, r, 5, (slot["amount"] / rep_amt) if rep_amt else None,
+              fmt=PCT, size=9, border=True, align="center")
+        ws.merge_cells(start_row=r, start_column=6, end_row=r, end_column=21)
+        _cell(ws, r, 6, _reasons(slot), size=8, color=GREY, border=True)
+        r += 1
+    r += 1
+
+    r = _band(ws, r, "BY THE PERSON WHO WROTE IT",
+              "a claim belongs to a person, not to a building")
+    r = _headers(ws, r, ["Staff", "Counter(s)", "Overclaimed #",
+                         "Overclaimed value", "Why"] + [""] * 16)
+    per_staff = overclaim_by(vres, lambda c: c.wrote_by)
+    where: dict = {}
+    for c in claims:
+        where.setdefault(c.wrote_by or "(not written)", set()).add(c.counter)
+    for name, slot in sorted(per_staff.items(), key=lambda kv: -kv[1]["amount"]):
+        _cell(ws, r, 1, name, bold=True, size=10, border=True,
+              color=GREY if name == "(not written)" else None)
+        _cell(ws, r, 2, ", ".join(sorted(where.get(name, ())))[:40], size=8,
+              border=True)
+        _cell(ws, r, 3, slot["n"], bold=True, size=10, border=True,
+              align="center")
+        _cell(ws, r, 4, slot["amount"], fmt=MONEY, bold=True, size=10,
+              border=True, align="right", color="C00000")
+        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=21)
+        _cell(ws, r, 5, _reasons(slot), size=8, color=GREY, border=True)
+        r += 1
+    r += 1
+
+    r = _band(ws, r, "EVERY OVERCLAIMED ROW", f"largest first, top {limit}")
+    hdr = r
+    r = _headers(ws, r, ["Counter", "Written by", "Written on", "PNR", "Type",
+                         "Claimed value", "Why it is not owed",
+                         "What the check found", "System has it at",
+                         "System counter", "System date"] + [""] * 10)
+    for c in sorted(claims, key=lambda c: -c.reported_amount)[:limit]:
+        _cell(ws, r, 1, c.counter, bold=True, size=9, border=True)
+        _cell(ws, r, 2, c.wrote_by or "(not written)", size=9, border=True,
+              color=GREY if not c.wrote_by else None)
+        _cell(ws, r, 3, f"{c.day:%d %b}" if c.day else "", size=9, border=True,
+              align="center")
+        _cell(ws, r, 4, c.locator, bold=True, size=10, border=True)
+        _cell(ws, r, 5, c.block.title(), size=9, border=True, align="center")
+        _cell(ws, r, 6, c.reported_amount or None, fmt=MONEY, bold=True,
+              size=10, border=True, align="right", color="C00000")
+        _cell(ws, r, 7, c.verdict, bold=True, size=9, border=True,
+              align="center", color="FFFFFF", fill=BAD)
+        _cell(ws, r, 8, c.detail, size=8, color=GREY, border=True)
+        _cell(ws, r, 9, c.pos or None, size=8, border=True)
+        _cell(ws, r, 10, c.sys_counter or None, size=8, border=True)
+        _cell(ws, r, 11, f"{c.sys_day:%d %b}" if c.sys_day else None, size=8,
+              border=True, align="center")
+        for j in range(12, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    if claims:
+        ws.auto_filter.ref = f"A{hdr}:K{r - 1}"
+    else:
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=21)
+        _cell(ws, r, 1,
+              "  Nothing was overclaimed among the rows that could be checked.",
+              size=10, color=GREY, fill=PAPER)
+        r += 1
     ws.freeze_panes = f"A{hdr + 1}"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"

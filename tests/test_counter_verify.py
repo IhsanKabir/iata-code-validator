@@ -95,7 +95,9 @@ def test_without_a_session_the_rest_are_unchecked_not_guessed():
     assert out.resolved == 0
 
 
-def test_zenith_settles_what_the_sales_report_cannot():
+def test_a_booking_with_no_sale_against_it_is_named_as_that():
+    """Zenith holding the booking does not make it money taken. The counter
+    counted a booking; the month records no sale for it."""
     class _Details:
         pnr_status = "Issued"
         total_amount = "12,000 BDT"
@@ -112,9 +114,10 @@ def test_zenith_settles_what_the_sales_report_cannot():
     out = cv.verify_unmatched(res, _Sales([]), session=object(), lookup=lookup)
     (check,) = out.checks
     assert calls == ["0A6666"]
-    assert check.verdict == cv.MISSING_FROM_SALES
+    assert check.verdict == cv.NO_SALE_RECORDED
     assert check.zenith_status == "Issued"
-    assert "sales report is the one missing it" in check.detail
+    assert "records no sale against it" in check.detail
+    assert check.is_overclaim
 
 
 @pytest.mark.parametrize("status", ["Cancelled", "Voided", "Refunded"])
@@ -173,7 +176,7 @@ def test_one_lookup_per_pnr_however_many_rows_wrote_it():
     out = cv.verify_unmatched(res, _Sales([]), session=object(), lookup=lookup)
     assert calls == ["0AAAAA"]             # one call, both rows settled
     assert out.looked_up == 1
-    assert all(c.verdict == cv.MISSING_FROM_SALES for c in out.checks)
+    assert all(c.verdict == cv.NO_SALE_RECORDED for c in out.checks)
 
 
 def test_the_lookup_budget_is_respected_and_reported():
@@ -262,3 +265,122 @@ def test_an_unrecognisable_reply_never_becomes_the_counter_was_right():
         check = out.checks[0]
         assert check.verdict == cv.LOOKUP_FAILED, reply
         assert not check.resolved
+
+
+# --- the overclaim sheet ---------------------------------------------------
+
+def _wrote_by(counter, locator, amount, who, day=date(2026, 8, 5)):
+    f = _wrote(counter, locator, amount, day)
+    f.wrote_by = who
+    return f
+
+
+def test_a_sale_on_the_wrong_date_is_never_called_an_overclaim():
+    """The money is real and the system has it. Only the day is wrong, and
+    counting that as a claim would accuse a counter of taking money it did
+    take."""
+    sales = _Sales([_Line("DAC-09 Uttara", "0A2222", date(2026, 8, 9), 4000)])
+    res = _res([_wrote("Uttara", "0A2222", 4000)], {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.OTHER_DAY
+    assert not out.checks[0].is_overclaim
+    assert out.overclaims == []
+    assert out.overclaimed == 0
+
+
+def test_nothing_unanswered_is_ever_counted_as_an_overclaim():
+    """An unanswered row is not evidence of anything."""
+    res = _res([_wrote("Uttara", "0AZZZZ", 9000)], {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, _Sales([]))
+    assert out.checks[0].verdict == cv.UNCHECKED
+    assert out.overclaimed == 0
+    assert out.still_unchecked == 1
+
+    def boom(_s, _c):
+        raise TimeoutError
+
+    res = _res([_wrote("Uttara", "0AZZZZ", 9000)], {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, _Sales([]), session=object(), lookup=boom)
+    assert out.checks[0].verdict == cv.LOOKUP_FAILED
+    assert out.overclaimed == 0
+
+
+def test_claiming_another_counters_sale_is_an_overclaim():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote_by("Uttara", "0A1111", 5000, "ALEX ROY")],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    out = cv.verify_unmatched(res, sales)
+    assert out.overclaimed == 5000
+    assert out.overclaims[0].wrote_by == "ALEX ROY"
+
+
+def test_the_totals_agree_with_the_rows_they_are_built_from():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7)),
+                    _Line("DAC-09 Uttara", "0A2222", date(2026, 8, 9))])
+    res = _res([_wrote_by("Uttara", "0A1111", 5000, "ALEX ROY"),
+                _wrote_by("Uttara", "0A2222", 4000, "SAM LEE"),
+                _wrote_by("Uttara", "0AZZZZ", 3000, "ALEX ROY")],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    out = cv.verify_unmatched(res, sales)
+
+    by_counter = cv.overclaim_by(out, lambda c: c.counter)
+    by_staff = cv.overclaim_by(out, lambda c: c.wrote_by)
+    assert sum(s["amount"] for s in by_counter.values()) == out.overclaimed
+    assert sum(s["amount"] for s in by_staff.values()) == out.overclaimed
+    assert sum(s["n"] for s in by_staff.values()) == len(out.overclaims)
+    # the wrong-date row is in neither
+    assert out.overclaimed == 5000
+
+
+def test_a_row_with_no_name_on_it_is_kept_not_dropped():
+    """The money was still claimed. Dropping it because nobody signed the row
+    would quietly shrink the total."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    out = cv.verify_unmatched(res, sales)
+    by_staff = cv.overclaim_by(out, lambda c: c.wrote_by)
+    assert list(by_staff) == ["(not written)"]
+    assert by_staff["(not written)"]["amount"] == 5000
+
+
+def test_the_overclaim_sheet_names_the_counter_the_person_and_the_reason():
+    from openpyxl import Workbook
+
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote_by("Uttara", "0A1111", 5000, "ALEX ROY")],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    out = cv.verify_unmatched(res, sales)
+
+    wb = Workbook()
+    cv.write_overclaim(wb.active, out, None, month=8, year=2026)
+    text = " | ".join(str(c.value) for row in wb.active.iter_rows()
+                      for c in row if c.value)
+    assert "OVERCLAIM" in text
+    assert "Uttara" in text and "ALEX ROY" in text and "0A1111" in text
+    assert cv.SOLD_ELSEWHERE in text
+    assert "wrong DATE is NOT counted here" in text
+
+
+def test_the_sheet_calls_the_total_a_floor_while_rows_are_unanswered():
+    """Otherwise a partial check reads as a finished accusation."""
+    from openpyxl import Workbook
+
+    res = _res([_wrote("Uttara", "0AZZZZ", 3000)], {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, _Sales([]))
+    wb = Workbook()
+    cv.write_overclaim(wb.active, out, None, month=8, year=2026)
+    text = " ".join(str(c.value) for row in wb.active.iter_rows()
+                    for c in row if c.value)
+    assert "floor" in text
+    assert "still unanswered" in text
+
+
+def test_an_empty_overclaim_sheet_says_so_rather_than_looking_broken():
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    cv.write_overclaim(wb.active, cv.VerifyResult(), None, month=8, year=2026)
+    text = " ".join(str(c.value) for row in wb.active.iter_rows()
+                    for c in row if c.value)
+    assert "Nothing was overclaimed" in text

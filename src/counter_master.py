@@ -189,6 +189,10 @@ class MasterResult:
     checked_resolved: int = 0      # ...of which the check explained
     checked_lookups: int = 0       # live Zenith calls the check actually made
     checked_counts: tuple = ()     # (verdict, rows, value) worst first
+    overclaim_n: int = 0           # rows claiming value the system does not owe
+    overclaim_amount: float = 0.0
+    overclaim_unchecked: int = 0   # ...with this many rows still unanswered
+    overclaim_counters: tuple = ()
 
 
 # --------------------------------------------------------------------------
@@ -722,7 +726,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
                  base_currency: str = "BDT", progress_cb=None,
                  stop_flag=None, sales_report=None,
                  use_warehouse: bool = False, zenith_session=None,
-                 max_lookups: int = 300, mapping_file=None) -> MasterResult:
+                 max_lookups: int = 300, mapping_file=None,
+                 overclaim: bool = False) -> MasterResult:
     """Read every counter workbook and write ONE master sheet.
 
     `progress_cb(done, total, name)` is called per workbook so a UI can show
@@ -1377,6 +1382,10 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             counter_verify.write_pnr_check(
                 wb.create_sheet("PNR Check"), verified, month=month, year=year,
                 base_currency=base_currency)
+            if overclaim:
+                counter_verify.write_overclaim(
+                    wb.create_sheet("Overclaim"), verified, recon,
+                    month=month, year=year, base_currency=base_currency)
     out_path = Path(out_path)
     wb.save(out_path)
     return MasterResult(
@@ -1407,6 +1416,11 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         checked_lookups=verified.looked_up if verified else 0,
         checked_counts=tuple(counter_verify.summarise(verified))
         if verified else (),
+        overclaim_n=len(verified.overclaims) if verified else 0,
+        overclaim_amount=verified.overclaimed if verified else 0.0,
+        overclaim_unchecked=verified.still_unchecked if verified else 0,
+        overclaim_counters=tuple(sorted(
+            {c.counter for c in verified.overclaims})) if verified else (),
     )
 
 
@@ -1509,7 +1523,8 @@ def build_master_path(out_dir, month: int, year: int) -> Path:
 def build_from_inputs(selection, out_path, *, month: int, year: int,
                       progress_cb=None, stop_flag=None, sales_report=None,
                       use_warehouse: bool = False, zenith_session=None,
-                      mapping_file=None) -> MasterResult:
+                      mapping_file=None,
+                      overclaim: bool = False) -> MasterResult:
     """Build from a folder, a file, or any mix of the two."""
     paths = resolve_counter_inputs(selection)
     if not paths:
@@ -1517,7 +1532,8 @@ def build_from_inputs(selection, out_path, *, month: int, year: int,
     return build_master(paths, out_path, month=month, year=year,
                         progress_cb=progress_cb, stop_flag=stop_flag,
                         sales_report=sales_report, use_warehouse=use_warehouse,
-                        zenith_session=zenith_session, mapping_file=mapping_file)
+                        zenith_session=zenith_session,
+                        mapping_file=mapping_file, overclaim=overclaim)
 
 
 # kept as the folder-shaped name the first callers used
