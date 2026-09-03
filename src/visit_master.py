@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -48,8 +48,9 @@ ZONE_CODE_RE = re.compile(r"^\d{1,2}[A-Za-z]?$")
 
 # words that say what KIND of business an agency is, not which one it is
 _AGENCY_SUFFIX = re.compile(
-    r"\b(limited|ltd|international|intl|travels?|tours?|agency|agencies|"
-    r"services?|enterprise|air|aviation|holidays?|co|company)\b", re.I)
+    r"\b(limited|ltd|ltdd|pvt|private|international|intl|travels?|tours?|"
+    r"touring|agency|agencies|services?|enterprise|air|aviation|holidays?|"
+    r"co|company|corporation|and|the|iata)\b", re.I)
 
 
 def identity(name: str) -> str:
@@ -57,9 +58,13 @@ def identity(name: str) -> str:
 
     'AB Travel' and 'AB Travels', 'ALIF TRAVELS' and 'Alif Travels' are one
     agency written twice; counting them separately overstated the estate by
-    nearly a hundred.
+    nearly a hundred. The same key has to reach the sales system, where the
+    SAME agency is filed as 'Carnival Air Ticketing Ltd. (IATA)' against the
+    rep's 'CARNIVAL AIR TICKETING LTD.', so the words that say what KIND of
+    business it is are dropped and '&' is read as 'and'.
     """
-    text = _AGENCY_SUFFIX.sub(" ", _n(name))
+    text = _n(name).replace("&", " and ")
+    text = _AGENCY_SUFFIX.sub(" ", text)
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
@@ -546,12 +551,17 @@ class VisitResult:
     zone_blank: int = 0
     duplicates: int = 0
     disputed: int = 0
+    matched: int = 0
+    lift: float | None = None
+    control_change: float | None = None
+    visited_change: float | None = None
     stopped: bool = False
     window: str = ""
 
 
 def build_master(selection, out_path, *, month: int, year: int,
-                 progress_cb=None, stop_flag=None) -> VisitResult:
+                 progress_cb=None, stop_flag=None,
+                 use_warehouse: bool = False) -> VisitResult:
     """Read every visit report and write ONE master sheet."""
     from .counter_master import (BAD, BAND, COLS, GOOD, GREY, LAST, MONEY,
                                  NAVY, PAPER, PCT, WARN, _band, _cell,
@@ -799,6 +809,25 @@ def build_master(selection, out_path, *, month: int, year: int,
     ws.freeze_panes = "A9"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
+
+    impact = None
+    if use_warehouse and not (stop_flag is not None and stop_flag()):
+        # a second sheet: the visits only mean something next to what the
+        # agencies actually bought
+        from . import counter_reconcile as cr
+        src = cr.find_sales_warehouse()
+        if src is None:
+            raise ValueError(
+                "No sales data found on this machine, so visit impact cannot "
+                "be measured. Untick the box, or point ANALYSIS_HOME at the "
+                "data root.")
+        rows = read_sales_for_impact(
+            src, month=month, year=year,
+            progress_cb=(lambda n: progress_cb(0, 0, f"sales data: {n:,} rows"))
+            if progress_cb else None)
+        impact = measure_impact(data, rows, month=month, year=year)
+        write_impact(wb.create_sheet("Impact"), impact, month=month, year=year)
+
     out_path = Path(out_path)
     wb.save(out_path)
     return VisitResult(
@@ -807,8 +836,412 @@ def build_master(selection, out_path, *, month: int, year: int,
         figure_rate=with_figure / len(data.visits), productivity=total_prod,
         zone_blank=zone_blank, window=window, duplicates=data.duplicates,
         disputed=sum(1 for a in agencies.values() if a["disputed"]),
+        matched=impact.matched if impact else 0,
+        lift=impact.lift if impact else None,
+        control_change=impact.control_change if impact else None,
+        visited_change=impact.visited_change if impact else None,
         stopped=bool(stop_flag is not None and stop_flag()))
 
 
 def build_master_path(out_dir, month: int, year: int) -> Path:
     return Path(out_dir) / f"Agency_Visits_{date(year, month, 1):%b%Y}.xlsx"
+
+
+# --------------------------------------------------------------------------
+# did the visits change anything?
+# --------------------------------------------------------------------------
+EARLY_DAY = 10           # a visit by this day precedes most of the window
+GROWTH_BAND = 0.05       # inside this, call it flat rather than a move
+
+
+@dataclass
+class AgencyImpact:
+    key: str
+    name: str
+    rep: str
+    visits: int
+    first_visit: date | None
+    before: float = 0.0
+    after: float = 0.0
+    matched: bool = False
+
+    @property
+    def change(self):
+        if not self.matched or not self.before:
+            return None
+        return (self.after - self.before) / self.before
+
+    @property
+    def verdict(self) -> str:
+        if not self.matched:
+            return "no sales found"
+        if not self.before and self.after:
+            return "started buying"
+        if self.before and not self.after:
+            return "stopped buying"
+        c = self.change
+        if c is None:
+            return "no sales either side"
+        return ("grew" if c > GROWTH_BAND
+                else "fell" if c < -GROWTH_BAND else "flat")
+
+
+@dataclass
+class ImpactResult:
+    """Visited against never-visited, over the same days.
+
+    The comparison is the whole point. Visited agencies fell 5.9% over August,
+    which reads as a failure until you see that agencies nobody visited fell
+    8.0% over exactly the same days.
+    """
+    agencies: list = field(default_factory=list)
+    visited_before: float = 0.0
+    visited_after: float = 0.0
+    control_before: float = 0.0
+    control_after: float = 0.0
+    control_agencies: int = 0
+    early_before: float = 0.0
+    early_after: float = 0.0
+    late_before: float = 0.0
+    late_after: float = 0.0
+    unvisited_top: list = field(default_factory=list)
+    window: str = ""
+
+    @staticmethod
+    def _rate(before, after):
+        return (after - before) / before if before else None
+
+    @property
+    def visited_change(self):
+        return self._rate(self.visited_before, self.visited_after)
+
+    @property
+    def control_change(self):
+        return self._rate(self.control_before, self.control_after)
+
+    @property
+    def lift(self):
+        """Percentage points the visited agencies beat the control by."""
+        v, c = self.visited_change, self.control_change
+        return None if v is None or c is None else v - c
+
+    @property
+    def early_lift(self):
+        v = self._rate(self.early_before, self.early_after)
+        c = self.control_change
+        return None if v is None or c is None else v - c
+
+    @property
+    def late_lift(self):
+        v = self._rate(self.late_before, self.late_after)
+        c = self.control_change
+        return None if v is None or c is None else v - c
+
+    @property
+    def matched(self) -> int:
+        return sum(1 for a in self.agencies if a.matched)
+
+
+def measure_impact(data: VisitData, sales_rows, *, month: int, year: int,
+                   window_days: int = 28) -> ImpactResult:
+    """Compare what visited agencies bought before and after, against everyone.
+
+    `sales_rows` is (customer, day, amount). Both sides are measured over the
+    SAME two windows -- the days before the month, and the days from its start
+    -- because a per-agency window would leave nothing to compare against.
+    """
+    start = date(year, month, 1)
+    pre_from = start - timedelta(days=window_days)
+    post_to = start + timedelta(days=window_days - 1)
+
+    totals: dict = defaultdict(lambda: [0.0, 0.0])
+    display: dict = {}
+    for customer, day, amount in sales_rows:
+        key = identity(customer)
+        if not key or day is None:
+            continue
+        amt = float(amount or 0)
+        if pre_from <= day < start:
+            totals[key][0] += amt
+        elif start <= day <= post_to:
+            totals[key][1] += amt
+        display.setdefault(key, customer)
+
+    first: dict = {}
+    visits_of: Counter = Counter()
+    rep_of: dict = {}
+    name_of: dict = {}
+    for v in data.visits:
+        key = identity(v.agency)
+        if not key:
+            continue
+        visits_of[key] += 1
+        name_of.setdefault(key, v.agency.strip())
+        rep_of.setdefault(key, v.rep)
+        if v.day and (key not in first or v.day < first[key]):
+            first[key] = v.day
+
+    res = ImpactResult(window=f"{pre_from:%d %b} – {start - timedelta(days=1):%d %b} "
+                              f"vs {start:%d %b} – {post_to:%d %b %Y}")
+    for key, n in visits_of.items():
+        before, after = totals.get(key, (0.0, 0.0))
+        a = AgencyImpact(key=key, name=name_of[key], rep=rep_of[key], visits=n,
+                         first_visit=first.get(key), before=before, after=after,
+                         matched=key in totals)
+        res.agencies.append(a)
+        if not a.matched:
+            continue
+        res.visited_before += before
+        res.visited_after += after
+        if a.first_visit and a.first_visit.day <= EARLY_DAY:
+            res.early_before += before
+            res.early_after += after
+        elif a.first_visit:
+            res.late_before += before
+            res.late_after += after
+
+    for key, (before, after) in totals.items():
+        if key in visits_of:
+            continue
+        res.control_before += before
+        res.control_after += after
+        res.control_agencies += 1
+    res.unvisited_top = sorted(
+        ((display[k], v[1]) for k, v in totals.items() if k not in visits_of),
+        key=lambda kv: -kv[1])[:40]
+    return res
+
+
+def read_sales_for_impact(source, *, month: int, year: int, window_days: int = 28,
+                          progress_cb=None):
+    """Ticket sales either side of the reporting month, from the local data."""
+    from . import counter_reconcile as cr
+    duckdb = cr._duckdb()
+    if duckdb is None:
+        raise ValueError("duckdb is not available in this build, so visit "
+                         "impact cannot be measured.")
+    start = date(year, month, 1)
+    lo = start - timedelta(days=window_days)
+    hi = start + timedelta(days=window_days - 1)
+    target = (source.path.as_posix() if source.kind == "gold"
+              else source.path.as_posix() + "/**/*.parquet").replace("'", "''")
+    if progress_cb is not None:
+        progress_cb(0)
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    rows = con.execute(f"""
+        select "Customer", "Pure Date", "Balance (base currency)"
+        from read_parquet('{target}')
+        where "Transaction" = 'Ticket payment' and "Customer" is not null
+          and "Pure Date" between DATE '{lo}' and DATE '{hi}'
+    """).fetchall()
+    if progress_cb is not None:
+        progress_cb(len(rows))
+    return rows
+
+
+def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
+    """Render the impact comparison, with the control always beside the number."""
+    from openpyxl.formatting.rule import DataBarRule
+
+    from .counter_master import (BAD, BAND, COLS, GOOD, GREY, LAST, MONEY,
+                                 NAVY, PAPER, PCT, WARN, _band, _cell,
+                                 _headers, _kpi_strip)
+
+    for col, width in COLS:
+        ws.column_dimensions[col].width = width
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells(f"A1:{LAST}1")
+    _cell(ws, 1, 1, "  DID THE VISITS CHANGE ANYTHING?", bold=True, size=16,
+          color="FFFFFF", fill=NAVY, align="left")
+    ws.row_dimensions[1].height = 34
+    ws.merge_cells(f"A2:{LAST}2")
+    _cell(ws, 2, 1,
+          f"  {res.window}.   Visited agencies are compared with the "
+          f"{res.control_agencies:,} agencies nobody visited, over exactly the "
+          f"same days — on its own a fall of "
+          f"{abs(res.visited_change or 0):.1%} reads as a failure, and it is "
+          f"only meaningful next to what happened everywhere else.   This is "
+          f"NOT a controlled trial: reps choose whom to visit, so some of the "
+          f"difference is who was chosen rather than the visit itself.",
+          size=9, color=GREY, fill=PAPER, align="left")
+    ws.row_dimensions[2].height = 17
+
+    lift = res.lift or 0
+    r = 4
+    r = _band(ws, r, "THE ANSWER")
+    r = _kpi_strip(ws, r, [
+        ("Agencies visited", len(res.agencies), "#,##0", None),
+        ("Found in the sales data", res.matched, "#,##0", None),
+        ("Visited: before", res.visited_before, MONEY, None),
+        ("Visited: after", res.visited_after, MONEY, None),
+        ("Visited change", res.visited_change, PCT,
+         "1F6F3C" if (res.visited_change or 0) >= 0 else "C00000"),
+        ("Everyone else changed", res.control_change, PCT, None),
+        ("LIFT (percentage points)", lift, "+0.0;-0.0",
+         "1F6F3C" if lift > 0 else "C00000"),
+    ])
+    r = _kpi_strip(ws, r, [
+        (f"Visited by the {EARLY_DAY}th: lift", res.early_lift or 0, "+0.0;-0.0",
+         "1F6F3C" if (res.early_lift or 0) > 0 else "C00000"),
+        ("Visited later: lift", res.late_lift or 0, "+0.0;-0.0",
+         "1F6F3C" if (res.late_lift or 0) > 0 else "C00000"),
+        ("Grew", sum(1 for a in res.agencies if a.verdict == "grew"), "#,##0",
+         "1F6F3C"),
+        ("Fell", sum(1 for a in res.agencies if a.verdict == "fell"), "#,##0",
+         "C00000"),
+        ("Started buying",
+         sum(1 for a in res.agencies if a.verdict == "started buying"), "#,##0",
+         None),
+        ("Stopped buying",
+         sum(1 for a in res.agencies if a.verdict == "stopped buying"), "#,##0",
+         None),
+        ("No sales found at all",
+         sum(1 for a in res.agencies if not a.matched), "#,##0", "C00000"),
+    ])
+    r += 1
+
+    # ---- per rep ---------------------------------------------------------
+    r = _band(ws, r, "BY SALES REP",
+              "lift is this rep's change minus what happened to agencies "
+              "nobody visited, so a negative month can still be a good one")
+    r = _headers(ws, r, [
+        "Sales rep", "Agencies visited", "Found in sales", "Before", "After",
+        "Change", "Lift vs everyone else", "Grew", "Fell", "Started", "Stopped",
+        "No sales found", "", "", "", "", "", "", "", "", "Verdict"])
+    per: dict = defaultdict(lambda: Counter())
+    for a in res.agencies:
+        c = per[a.rep]
+        c["n"] += 1
+        c[a.verdict] += 1
+        if a.matched:
+            c["matched"] += 1
+            c["before"] += a.before
+            c["after"] += a.after
+    control = res.control_change or 0
+    first = r
+    for rep, c in sorted(per.items(),
+                         key=lambda kv: -(kv[1]["after"] - kv[1]["before"])):
+        change = ((c["after"] - c["before"]) / c["before"]
+                  if c["before"] else None)
+        rep_lift = None if change is None else change - control
+        if rep_lift is None:
+            verdict, tone = "NOTHING TO MEASURE", None
+        elif rep_lift > 0.05:
+            verdict, tone = "BEAT THE MARKET", GOOD
+        elif rep_lift < -0.05:
+            verdict, tone = "BEHIND THE MARKET", BAD
+        else:
+            verdict, tone = "WITH THE MARKET", WARN
+        _cell(ws, r, 1, rep, bold=True, size=10, border=True)
+        _cell(ws, r, 2, c["n"], size=9, border=True, align="center")
+        _cell(ws, r, 3, c["matched"] or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 4, c["before"] or None, fmt=MONEY, size=9, border=True,
+              align="right")
+        _cell(ws, r, 5, c["after"] or None, fmt=MONEY, size=9, border=True,
+              align="right")
+        _cell(ws, r, 6, change, fmt=PCT, size=9, border=True, align="center")
+        _cell(ws, r, 7, rep_lift, fmt="+0.0%;-0.0%", bold=True, size=10,
+              border=True, align="center")
+        _cell(ws, r, 8, c["grew"] or None, size=9, border=True, align="center")
+        _cell(ws, r, 9, c["fell"] or None, size=9, border=True, align="center")
+        _cell(ws, r, 10, c["started buying"] or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 11, c["stopped buying"] or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 12, c["no sales found"] or None, size=9, border=True,
+              align="center")
+        for j in range(13, 21):
+            _cell(ws, r, j, None, border=True)
+        _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
+              align="center")
+        r += 1
+    r += 1
+
+    # ---- the agencies that moved ----------------------------------------
+    for title, pick, colour in (
+            ("AGENCIES THAT GREW MOST AFTER A VISIT",
+             lambda xs: sorted((a for a in xs if a.matched),
+                               key=lambda a: -(a.after - a.before))[:25], GOOD),
+            ("AGENCIES THAT FELL MOST AFTER A VISIT",
+             lambda xs: sorted((a for a in xs if a.matched),
+                               key=lambda a: (a.after - a.before))[:25], BAD)):
+        r = _band(ws, r, title)
+        hdr = r
+        r = _headers(ws, r, ["Agency", "Rep", "First visit", "Visits", "Before",
+                             "After", "Change", "Movement", "", "", "", "", "",
+                             "", "", "", "", "", "", "", ""])
+        for a in pick(res.agencies):
+            _cell(ws, r, 1, a.name, bold=True, size=10, border=True)
+            _cell(ws, r, 2, a.rep, size=9, border=True)
+            _cell(ws, r, 3, f"{a.first_visit:%d %b}" if a.first_visit else "",
+                  size=9, border=True, align="center")
+            _cell(ws, r, 4, a.visits, size=9, border=True, align="center")
+            _cell(ws, r, 5, a.before or None, fmt=MONEY, size=9, border=True,
+                  align="right")
+            _cell(ws, r, 6, a.after or None, fmt=MONEY, size=9, border=True,
+                  align="right")
+            _cell(ws, r, 7, a.change, fmt=PCT, size=9, border=True,
+                  align="center")
+            _cell(ws, r, 8, a.after - a.before, fmt=MONEY, bold=True, size=10,
+                  border=True, align="right", fill=colour)
+            for j in range(9, 22):
+                _cell(ws, r, j, None, border=True)
+            r += 1
+        r += 1
+
+    # ---- the two blind spots --------------------------------------------
+    r = _band(ws, r, "VISITED, BUT NO SALES FOUND",
+              "either they bought nothing, or they buy under another name — "
+              "a consolidator's, most likely")
+    r = _headers(ws, r, ["Agency", "Rep", "Visits", "First visit", "", "", "",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "",
+                         ""])
+    for a in sorted((x for x in res.agencies if not x.matched),
+                    key=lambda x: -x.visits)[:30]:
+        _cell(ws, r, 1, a.name, bold=True, size=10, border=True)
+        _cell(ws, r, 2, a.rep, size=9, border=True)
+        _cell(ws, r, 3, a.visits, size=9, border=True, align="center")
+        _cell(ws, r, 4, f"{a.first_visit:%d %b}" if a.first_visit else "",
+              size=9, border=True, align="center")
+        for j in range(5, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    r += 1
+
+    r = _band(ws, r, "THE BIGGEST BUYERS NOBODY VISITED",
+              "the other half of the question: who is buying without being "
+              "called on")
+    hdr = r
+    r = _headers(ws, r, ["Customer", "Bought in the window", "", "", "", "",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "",
+                         "", ""])
+    for name, amount in res.unvisited_top:
+        _cell(ws, r, 1, name, bold=True, size=10, border=True)
+        _cell(ws, r, 2, amount, fmt=MONEY, size=10, border=True, align="right")
+        for j in range(3, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    if res.unvisited_top:
+        ws.conditional_formatting.add(
+            f"B{hdr + 1}:B{r - 1}",
+            DataBarRule(start_type="num", start_value=0, end_type="max",
+                        color=BAND, showValue=True))
+
+    r += 1
+    ws.merge_cells(f"A{r}:{LAST}{r}")
+    _cell(ws, r, 1,
+          "  How to read this: the lift is the visited agencies' change minus "
+          "the change at agencies nobody visited, over identical days. It is "
+          "not proof that visiting caused the difference — reps choose whom to "
+          "visit, and bigger or friendlier agencies may have held up anyway. "
+          "The one internal check available is timing: agencies visited early "
+          "in the month, where the visit precedes most of the measured period, "
+          "show a larger lift than those visited late.",
+          size=8, color=GREY, fill=PAPER, wrap=True)
+    ws.row_dimensions[r].height = 26
+    ws.freeze_panes = "A9"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"

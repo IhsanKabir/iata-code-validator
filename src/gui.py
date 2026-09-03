@@ -98,6 +98,7 @@ MSG_CTR_PROGRESS = "ctr_progress"      # payload: (done, total, msg)
 MSG_CTR_DONE = "ctr_done"              # payload: dict(path, counters, employees…)
 MSG_CTR_ERROR = "ctr_error"
 
+MSG_VIS_WAREHOUSE = "vis_warehouse"    # payload: WarehouseSource | None
 MSG_VIS_PROGRESS = "vis_progress"      # payload: (done, total, msg)
 MSG_VIS_DONE = "vis_done"              # payload: dict(path, reps, visits…)
 MSG_VIS_ERROR = "vis_error"
@@ -329,9 +330,11 @@ class App(WhatsAppMixin, HealthMixin):
         # ----- Agency Visits state -----
         self.vis_input = tk.StringVar(value="")
         self.vis_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.vis_use_warehouse = tk.BooleanVar(value=False)
         self.vis_month = tk.StringVar(value=f"{_today.month:02d}")
         self.vis_year = tk.IntVar(value=_today.year)
         self._vis_files: list[Path] = []
+        self._vis_warehouse = None
         self._vis_stop_flag = threading.Event()
         self._vis_worker: threading.Thread | None = None
         self._ctr_period_worker: threading.Thread | None = None
@@ -4355,6 +4358,8 @@ class App(WhatsAppMixin, HealthMixin):
                 + f"\n\n{info.get('path', '')}")
             self._ctr_reset_buttons()
         # ------ Agency Visits messages ------
+        elif kind == MSG_VIS_WAREHOUSE:
+            self._vis_apply_warehouse(payload)
         elif kind == MSG_VIS_PROGRESS:
             done, total, msg = payload  # type: ignore[misc]
             self.vis_progress_bar["maximum"] = max(1, total)
@@ -6657,6 +6662,33 @@ class App(WhatsAppMixin, HealthMixin):
         ttk.Spinbox(prow, from_=2020, to=2100, width=7,
                     textvariable=self.vis_year).pack(side="left")
 
+        impact = self._section(
+            parent, "Did the visits change anything?",
+            help_text=(
+                "Adds a second sheet comparing what the visited agencies "
+                "bought before and after, against the agencies nobody "
+                "visited, over exactly the same days.\n\n"
+                "The comparison is the whole point: in August the visited "
+                "agencies fell 5.8%, which reads as a failure until you see "
+                "that agencies nobody visited fell 8.1%.\n\n"
+                "It is not a controlled trial — reps choose whom to visit, so "
+                "part of any difference is who was chosen. The sheet says so, "
+                "and gives the one internal check available: agencies visited "
+                "early in the month show a larger lift than those visited "
+                "late."
+            ),
+        )
+        self.vis_impact_check = ttk.Checkbutton(
+            impact, text="Compare against the sales data on this machine",
+            variable=self.vis_use_warehouse, command=self._vis_impact_toggled)
+        self.vis_impact_check.grid(row=0, column=0, columnspan=3, sticky="w",
+                                   pady=(2, 0))
+        self.vis_impact_label = ttk.Label(
+            impact, text="Looking for the sales data…", style="Hint.TLabel")
+        self.vis_impact_label.grid(row=1, column=0, columnspan=3, sticky="w",
+                                   padx=(20, 0))
+        self._vis_find_warehouse()
+
         out_body = self._section(parent, "Output")
         out_entry = ttk.Entry(out_body, textvariable=self.vis_output_dir)
         out_btn = ttk.Button(out_body, text="Browse…",
@@ -6739,6 +6771,42 @@ class App(WhatsAppMixin, HealthMixin):
         self.vis_found_label.configure(
             text=f"{len(found)} report(s): {names}{more}")
 
+    def _vis_find_warehouse(self) -> None:
+        """Same probe the counter tab uses, and off the UI thread for the same
+        reason: it reads a ~300 MB file and touches several drive roots."""
+        def work():
+            from . import counter_reconcile
+            try:
+                src = counter_reconcile.find_sales_warehouse()
+            except Exception as exc:  # noqa: BLE001
+                src = None
+                log.debug("sales warehouse probe failed: %s", exc)
+            self._post(MSG_VIS_WAREHOUSE, src)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _vis_apply_warehouse(self, src) -> None:
+        self._vis_warehouse = src
+        if src is None:
+            self.vis_use_warehouse.set(False)
+            self.vis_impact_check.state(["disabled"])
+            self.vis_impact_label.configure(
+                text="No sales data found on this machine — only the visit "
+                     "summary will be built.")
+            return
+        self.vis_impact_check.state(["!disabled"])
+        self.vis_use_warehouse.set(True)
+        self.vis_impact_label.configure(text=f"Found {src.path}  ·  {src.label}")
+
+    def _vis_impact_toggled(self) -> None:
+        if not self.vis_use_warehouse.get():
+            self.vis_impact_label.configure(
+                text="Impact sheet off — only the visit summary will be built.")
+        elif getattr(self, "_vis_warehouse", None) is not None:
+            src = self._vis_warehouse
+            self.vis_impact_label.configure(
+                text=f"Found {src.path}  ·  {src.label}")
+
     def _vis_pick_output(self) -> None:
         d = filedialog.askdirectory(title="Choose output folder")
         if d:
@@ -6791,12 +6859,13 @@ class App(WhatsAppMixin, HealthMixin):
         self._vis_worker = threading.Thread(
             target=self._vis_worker_run,
             args=(found, month, year,
-                  Path(self.vis_output_dir.get().strip() or str(Path.home()))),
+                  Path(self.vis_output_dir.get().strip() or str(Path.home())),
+                  bool(self.vis_use_warehouse.get())),
             daemon=True)
         self._vis_worker.start()
 
-    def _vis_worker_run(self, paths, month: int, year: int,
-                        out_dir: Path) -> None:
+    def _vis_worker_run(self, paths, month: int, year: int, out_dir: Path,
+                        use_warehouse: bool = False) -> None:
         from . import visit_master
 
         def progress(done, total, name):
@@ -6807,7 +6876,8 @@ class App(WhatsAppMixin, HealthMixin):
             result = visit_master.build_master(
                 paths, visit_master.build_master_path(out_dir, month, year),
                 month=month, year=year, progress_cb=progress,
-                stop_flag=lambda: self._vis_stop_flag.is_set())
+                stop_flag=lambda: self._vis_stop_flag.is_set(),
+                use_warehouse=use_warehouse)
         except Exception as exc:  # noqa: BLE001
             log.exception("Agency Visits build failed")
             self._post(MSG_VIS_ERROR, f"{type(exc).__name__}: {exc}")
@@ -6819,6 +6889,9 @@ class App(WhatsAppMixin, HealthMixin):
             "days": result.days, "repeats": result.repeats,
             "figure_rate": result.figure_rate, "zone_blank": result.zone_blank,
             "window": result.window, "stopped": result.stopped,
+            "matched": result.matched, "lift": result.lift,
+            "visited_change": result.visited_change,
+            "control_change": result.control_change,
         })
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:

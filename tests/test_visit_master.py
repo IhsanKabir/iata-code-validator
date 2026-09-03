@@ -354,3 +354,118 @@ def test_two_reps_giving_one_agency_different_figures_is_reported(tmp_path):
     a = next(iter(agencies.values()))
     assert a["disputed"] is True
     assert a["figures"] == {1_000_000, 7_000_000}
+
+
+# --------------------------------------------------------------------------
+# did the visits change anything?
+# --------------------------------------------------------------------------
+def _sales(rows):
+    """(customer, day, amount) as the warehouse hands them over."""
+    return [(c, d, a) for c, d, a in rows]
+
+
+def test_the_lift_is_measured_against_agencies_nobody_visited(tmp_path):
+    """Visited agencies fell 5.8% in August, which reads as a failure until you
+    see that agencies nobody visited fell 8.1% over the same days."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = _sales([
+        # the visited agency: 100 -> 90, down a tenth
+        ("Alpha Travels", date(2026, 7, 20), 100.0),
+        ("Alpha Travels", date(2026, 8, 10), 90.0),
+        # everyone else: 100 -> 50, down by half
+        ("Other Agency", date(2026, 7, 20), 100.0),
+        ("Other Agency", date(2026, 8, 10), 50.0),
+    ])
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    assert res.visited_change == pytest.approx(-0.10)
+    assert res.control_change == pytest.approx(-0.50)
+    assert res.lift == pytest.approx(0.40)      # beat the market by 40 points
+
+
+def test_an_agency_with_no_sales_is_reported_not_counted_as_zero(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY",
+                          [ROW_A, ROW_B])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = _sales([("Alpha Travels", date(2026, 8, 10), 500.0)])
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    beta = [a for a in res.agencies if a.name == "Beta Tours"][0]
+    assert beta.matched is False
+    assert beta.verdict == "no sales found"
+    # and it does not drag the visited total down as if it had bought nothing
+    assert res.visited_after == pytest.approx(500.0)
+
+
+@pytest.mark.parametrize("before, after, verdict", [
+    (100.0, 200.0, "grew"),
+    (100.0, 50.0, "fell"),
+    (100.0, 101.0, "flat"),
+    (0.0, 100.0, "started buying"),
+    (100.0, 0.0, "stopped buying"),
+])
+def test_each_agency_gets_the_right_verdict(tmp_path, before, after, verdict):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = []
+    if before:
+        rows.append(("Alpha Travels", date(2026, 7, 20), before))
+    if after:
+        rows.append(("Alpha Travels", date(2026, 8, 10), after))
+    if not rows:                       # matched but silent both sides
+        rows = [("Alpha Travels", date(2026, 7, 20), 0.0)]
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    assert res.agencies[0].verdict == verdict
+
+
+def test_early_and_late_visits_are_measured_apart(tmp_path):
+    """A visit on the 25th cannot have caused sales on the 3rd, so the two are
+    reported separately -- it is the only internal control available."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [
+        ("03/08/2026", "Zone # 1", "ALEX ROY", [ROW_A]),
+        ("25/08/2026", "Zone # 1", "ALEX ROY", [ROW_B])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = _sales([
+        ("Alpha Travels", date(2026, 7, 20), 100.0),
+        ("Alpha Travels", date(2026, 8, 10), 200.0),
+        ("Beta Tours", date(2026, 7, 20), 100.0),
+        ("Beta Tours", date(2026, 8, 10), 100.0),
+        ("Other", date(2026, 7, 20), 100.0),
+        ("Other", date(2026, 8, 10), 100.0),
+    ])
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    assert res.early_before == pytest.approx(100.0)
+    assert res.early_after == pytest.approx(200.0)
+    assert res.late_before == pytest.approx(100.0)
+    assert res.late_after == pytest.approx(100.0)
+    assert res.early_lift > res.late_lift
+
+
+def test_the_biggest_buyer_nobody_visited_is_named(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = _sales([
+        ("Alpha Travels", date(2026, 8, 10), 100.0),
+        ("Takeoff Travels", date(2026, 8, 10), 900.0),
+    ])
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    assert res.unvisited_top[0][0] == "Takeoff Travels"
+    assert res.unvisited_top[0][1] == pytest.approx(900.0)
+
+
+def test_sales_outside_both_windows_are_ignored(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = _sales([
+        ("Alpha Travels", date(2026, 5, 1), 9999.0),     # long before
+        ("Alpha Travels", date(2026, 7, 20), 100.0),
+        ("Alpha Travels", date(2026, 8, 10), 100.0),
+    ])
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    assert res.visited_before == pytest.approx(100.0)
+    assert res.visited_after == pytest.approx(100.0)
