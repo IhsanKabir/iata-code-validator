@@ -537,3 +537,76 @@ def test_every_way_of_measuring_it_is_reported(tmp_path):
     assert lo <= res.trading_lift <= hi
     # an exact-match-only figure exists even when nothing was matched loosely
     assert res.exact_lift is not None
+
+
+# --- reading the month off the reports -------------------------------------
+
+def test_the_month_is_read_from_the_dates_the_reps_wrote(tmp_path):
+    """The counter tab has done this since it was asked to; this one defaulted
+    to today's month, and on 3 September read the August reports as
+    September."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"S1": [("12/08/2026", "Zone 7", "REP ONE", [ROW_A]),
+                       ("13/08/2026", "Zone 7", "REP ONE", [ROW_B])]})
+    month, year, votes, agree = vm.detect_period([p])
+    assert (month, year) == (8, 2026)
+    assert agree == 1.0
+
+
+def test_one_rep_writing_a_stale_date_does_not_decide_the_month(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    blocks = [(f"{d:02d}/08/2026", "Zone 7", "REP ONE", [ROW_A])
+              for d in range(1, 6)]
+    blocks.append(("28/07/2026", "Zone 7", "REP TWO", [ROW_B]))
+    _report(p, {"S1": blocks})
+    month, year, _votes, agree = vm.detect_period([p])
+    assert (month, year) == (8, 2026)
+    assert agree < 1.0
+
+
+def test_reports_with_no_readable_date_say_so_rather_than_guessing(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"S1": [("", "Zone 7", "REP ONE", [ROW_A])]})
+    month, year, votes, agree = vm.detect_period([p])
+    assert month is None and year is None and not votes
+
+
+def test_the_wrong_month_is_called_out_where_nobody_can_miss_it(tmp_path):
+    """Relabelling 2,519 August visits as September printed a window nobody
+    worked. The number was in a data-quality row; it belongs at the top."""
+    src = tmp_path / "visits.xlsx"
+    _report(src, {"S1": [(f"{d:02d}/08/2026", "Zone 7", "REP ONE",
+                          [["Agency %d" % d] + ROW_A[1:]])
+                         for d in range(1, 6)]})
+    out = tmp_path / "master.xlsx"
+    vm.build_master([src], out, month=9, year=2026)      # the wrong month
+    ws = load_workbook(out)["Visits"]
+    head = " ".join(str(c.value) for row in ws.iter_rows(min_row=1, max_row=3)
+                    for c in row if c.value)
+    assert "CHECK THE MONTH" in head
+    assert "Aug 2026" in head              # names the month the dates say
+    assert "100%" in head
+
+
+def test_the_right_month_carries_no_warning(tmp_path):
+    src = tmp_path / "visits.xlsx"
+    _report(src, {"S1": [(f"{d:02d}/08/2026", "Zone 7", "REP ONE",
+                          [["Agency %d" % d] + ROW_A[1:]])
+                         for d in range(1, 6)]})
+    out = tmp_path / "master.xlsx"
+    vm.build_master([src], out, month=8, year=2026)
+    ws = load_workbook(out)["Visits"]
+    head = " ".join(str(c.value) for row in ws.iter_rows(min_row=1, max_row=3)
+                    for c in row if c.value)
+    assert "CHECK THE MONTH" not in head
+
+
+def test_the_share_of_moved_dates_cannot_exceed_everything(tmp_path):
+    """Issues are logged before duplicates are dropped; dividing one by the
+    other reported 104% of the dates as wrong."""
+    src = tmp_path / "visits.xlsx"
+    block = ("12/08/2026", "Zone 7", "REP ONE", [ROW_A])
+    _report(src, {"S1": [block, block, block]})       # two are duplicates
+    data = vm.read_all([src], month=9, year=2026)
+    dated = [v for v in data.visits if v.day]
+    assert sum(1 for v in dated if v.date_moved) <= len(dated)

@@ -28,6 +28,11 @@ from openpyxl import load_workbook
 # --------------------------------------------------------------------------
 # a block header carries at least two of these, whatever else it carries
 HEADER_WORDS = ("name of agent", "contact person", "designation", "location")
+# Past this share of dates written outside the chosen month, the month is
+# wrong rather than the dates: a run given September against the August
+# reports moved 2,519 visits and printed a window nobody worked.
+WRONG_MONTH = 0.5
+
 SERIAL_RE = re.compile(r"^\d{1,3}$")
 # a single definite figure, optionally in lakh or crore. A RANGE is not a
 # figure: "3-5 lakh" is a conversation, not a number, and must not become 3.
@@ -213,6 +218,7 @@ class Visit:
     productivity: float | None = None      # None means nobody wrote it
     routes: str = ""
     remarks: str = ""
+    date_moved: bool = False   # the rep wrote another month; we moved the day
 
 
 @dataclass
@@ -329,9 +335,11 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                         rep or ws.title, "date_outside_month",
                         f"{agency}: written {day:%d %b %Y}"))
                     try:
-                        day = date(year, month, day.day)
+                        day, moved = date(year, month, day.day), True
                     except ValueError:
-                        day = None
+                        day, moved = None, False
+                else:
+                    moved = False
                 prod = parse_money(got.get("productivity"))
                 if prod is None:
                     data.issues.append(VisitIssue(rep or ws.title,
@@ -345,7 +353,7 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                     designation=got.get("designation", ""),
                     phone=got.get("phone", ""), location=got.get("location", ""),
                     productivity=prod, routes=got.get("routes", ""),
-                    remarks=got.get("remarks", "")))
+                    remarks=got.get("remarks", ""), date_moved=moved))
     finally:
         wb.close()
     return data
@@ -375,6 +383,58 @@ def resolve_visit_inputs(selection) -> list:
         for p in resolve_visit_inputs(item):
             seen.setdefault(p.resolve(), p)
     return sorted(seen.values(), key=lambda x: x.name.lower())
+
+
+
+def detect_period(selection, *, max_blocks: int = 4000):
+    """The month these visit reports are for, by majority vote of their dates.
+
+    The counter tab has read its month off the sheets since the day it was
+    asked to; this tab never did, and defaulted to today's. Run on the 3rd of
+    September against the August reports, that relabelled 2,519 August visits
+    as September and printed "01 Sep to 29 Sep 2026" across the top -- a window
+    that never existed.
+
+    A vote, not a first match: a rep who writes last month's date on one block
+    must not decide the month for everyone. Returns
+    (month, year, votes, agreement), or (None, None, ...) when the files carry
+    no readable date at all.
+    """
+    votes: Counter = Counter()
+    seen = 0
+    for path in resolve_visit_inputs(selection):
+        try:
+            wb = load_workbook(path, read_only=True, data_only=True)
+        except Exception:                      # noqa: BLE001 - unreadable file
+            continue                           # counted nowhere; the caller sees it
+        try:
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    cells = [_n(c) for c in row]
+                    keys = [_key(c) for c in cells]
+                    joined = " ".join(keys)
+                    if "date" not in joined:
+                        continue
+                    for j, k in enumerate(keys):
+                        if "date" not in k or j + 1 >= len(cells):
+                            continue
+                        raw = (row[j + 1] if row[j + 1] is not None
+                               else cells[j + 1])
+                        day = parse_visit_date(raw)
+                        if day is not None:
+                            votes[(day.month, day.year)] += 1
+                            seen += 1
+                        break
+                    if seen >= max_blocks:
+                        break
+                if seen >= max_blocks:
+                    break
+        finally:
+            wb.close()
+    if not votes:
+        return None, None, votes, 0.0
+    (month, year), hits = votes.most_common(1)[0]
+    return month, year, votes, hits / sum(votes.values())
 
 
 def read_all(selection, *, month=None, year=None, progress_cb=None,
@@ -597,11 +657,43 @@ def build_master(selection, out_path, *, month: int, year: int,
     repeats = sum(r.repeats for r in reps.values())
     zone_blank = sum(1 for v in data.visits if not v.zone)
 
+    # When nearly every written date belongs to another month, this is not a
+    # handful of stale templates -- it is the wrong month, and relabelling
+    # 2,519 August visits as September printed a window that never existed.
+    # Say so where nobody can miss it, and name the month the dates point to.
+    # Counted off the visits that survived, not the issues raised while
+    # parsing: those are logged before duplicates are dropped, and dividing one
+    # by the other reported 104% of the dates as wrong.
+    dated = [v for v in data.visits if v.day]
+    outside = sum(1 for v in dated if v.date_moved)
+    share = outside / len(dated) if dated else 0.0
+    really: tuple | None = None
+    if share >= WRONG_MONTH:
+        votes = Counter((i.detail or "")[-8:] for i in data.issues
+                        if i.kind == "date_outside_month")
+        really = votes.most_common(1)[0][0].strip() if votes else None
+
     ws.merge_cells(f"A1:{LAST}1")
     _cell(ws, 1, 1, f"  AGENCY VISITS — MASTER SUMMARY   ·   "
-                    f"{date(year, month, 1):%B %Y}",
-          bold=True, size=16, color="FFFFFF", fill=NAVY, align="left")
+                    f"{date(year, month, 1):%B %Y}"
+                    + (f"   ·   CHECK THE MONTH — {share:.0%} of the dates "
+                       f"written are not in it"
+                       + (f", most say {really}" if really else "")
+                       if really else ""),
+          bold=True, size=16, color="FFFFFF",
+          fill="C00000" if really else NAVY, align="left")
     ws.row_dimensions[1].height = 34
+    if really:
+        ws.merge_cells(f"A3:{LAST}3")
+        _cell(ws, 3, 1,
+              f"  These visits were read as {date(year, month, 1):%B %Y} "
+              f"because that is the month the run was given. The reps wrote "
+              f"another one on {share:.0%} of them, so every date below was "
+              f"moved into {date(year, month, 1):%B} and the window across the "
+              f"top is not a window anyone worked. Set the month to what the "
+              f"reports actually say and run it again.",
+              size=10, bold=True, color="C00000", fill=PAPER, wrap=True)
+        ws.row_dimensions[3].height = 30
     ws.merge_cells(f"A2:{LAST}2")
     _cell(ws, 2, 1,
           f"  {len(reps)} reps · {len(data.visits):,} visits · "

@@ -93,6 +93,7 @@ MSG_FCA_DONE = "fca_done"              # payload: dict(path, cases, flagged)
 MSG_FCA_ERROR = "fca_error"
 
 MSG_CTR_PERIOD = "ctr_period"          # payload: dict(month, year, agreement)
+MSG_VIS_PERIOD = "vis_period"          # payload: dict(month, year, agreement)
 MSG_CTR_WAREHOUSE = "ctr_warehouse"    # payload: WarehouseSource | None
 MSG_CTR_PROGRESS = "ctr_progress"      # payload: (done, total, msg)
 MSG_CTR_DONE = "ctr_done"              # payload: dict(path, counters, employees…)
@@ -339,6 +340,7 @@ class App(WhatsAppMixin, HealthMixin):
         self._vis_stop_flag = threading.Event()
         self._vis_worker: threading.Thread | None = None
         self._ctr_period_worker: threading.Thread | None = None
+        self._vis_period_worker: threading.Thread | None = None
 
         # ----- NATTA (Nepal) sub-tab state -----
         self.natta_output_dir = tk.StringVar(value=str(Path.home() / "Documents"))
@@ -4300,6 +4302,22 @@ class App(WhatsAppMixin, HealthMixin):
             else:
                 self.ctr_period_label.configure(
                     text="  the files do not name a month — set it here")
+        elif kind == MSG_VIS_PERIOD:
+            info = payload if isinstance(payload, dict) else {}
+            if info.get("error"):
+                self.vis_period_label.configure(
+                    text=f"  could not read the month: {info['error']}")
+            elif info.get("month"):
+                self.vis_month.set(f"{int(info['month']):02d}")
+                if info.get("year"):
+                    self.vis_year.set(int(info["year"]))
+                agree, dissent = info.get("agreement", 0), info.get("dissent", 0)
+                note = (f", {dissent} block(s) disagree" if dissent else "")
+                self.vis_period_label.configure(
+                    text=f"  read from the reports ({agree:.0%} agreement{note})")
+            else:
+                self.vis_period_label.configure(
+                    text="  the reports do not name a month — set it here")
         elif kind == MSG_CTR_PROGRESS:
             done, total, msg = payload  # type: ignore[misc]
             self.ctr_progress_bar["maximum"] = max(1, total)
@@ -6741,6 +6759,11 @@ class App(WhatsAppMixin, HealthMixin):
         ttk.Label(prow, text="   Year:").pack(side="left", padx=(8, 4))
         ttk.Spinbox(prow, from_=2020, to=2100, width=7,
                     textvariable=self.vis_year).pack(side="left")
+        # the counter tab has read its month off the sheets since it was asked
+        # to; this one defaulted to today's, and on 3 September that read the
+        # August reports as September
+        self.vis_period_label = ttk.Label(prow, text="", style="Hint.TLabel")
+        self.vis_period_label.pack(side="left", padx=(10, 0))
 
         impact = self._section(
             parent, "Did the visits change anything?",
@@ -6834,6 +6857,32 @@ class App(WhatsAppMixin, HealthMixin):
     def _vis_selection(self):
         return self._vis_files or self.vis_input.get()
 
+    def _vis_detect_period(self) -> None:
+        """Read the month out of the reports, off the UI thread."""
+        if (self._vis_period_worker is not None
+                and self._vis_period_worker.is_alive()):
+            return
+        sel = self._vis_selection()
+        if not sel:
+            return
+        self.vis_period_label.configure(text="  reading the month…")
+
+        def work():
+            from . import visit_master
+            try:
+                month, year, votes, agree = visit_master.detect_period(sel)
+            except Exception as exc:  # noqa: BLE001
+                self._post(MSG_VIS_PERIOD, {"error": str(exc)})
+                return
+            self._post(MSG_VIS_PERIOD, {
+                "month": month, "year": year, "agreement": agree,
+                "dissent": sum(v for k, v in votes.items()
+                               if (month, year) != k) if votes else 0,
+            })
+
+        self._vis_period_worker = threading.Thread(target=work, daemon=True)
+        self._vis_period_worker.start()
+
     def _vis_refresh_found(self) -> None:
         from . import visit_master
         sel = self._vis_selection()
@@ -6853,6 +6902,7 @@ class App(WhatsAppMixin, HealthMixin):
         more = f" … +{len(found) - 3} more" if len(found) > 3 else ""
         self.vis_found_label.configure(
             text=f"{len(found)} report(s): {names}{more}")
+        self._vis_detect_period()
 
     def _vis_find_warehouse(self) -> None:
         """Same probe the counter tab uses, and off the UI thread for the same
