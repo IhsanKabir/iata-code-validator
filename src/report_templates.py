@@ -52,9 +52,15 @@ def _title(ws, r, text, note=""):
 
 
 def _header(ws, r, columns):
-    """columns: (label, width, required?)"""
+    """columns: (label, width, required?)
+
+    A required column is marked by its SHADING, never by a mark added to the
+    heading. The report matches these headings against the ones it knows, and a
+    trailing ' *' was enough to send 'Contact No' down a looser match and land
+    every phone number in the contact-person column instead.
+    """
     for j, (label, width, needed) in enumerate(columns, start=1):
-        _cell(ws, r, j, label + (" *" if needed else ""), bold=True, size=9,
+        _cell(ws, r, j, label, bold=True, size=9,
               colour="FFFFFF" if not needed else "7F6000",
               fill=NAVY if not needed else REQUIRED, wrap=True,
               align="center", border=True)
@@ -63,10 +69,24 @@ def _header(ws, r, columns):
     return r + 1
 
 
-def _blank_rows(ws, r, columns, n):
-    for _ in range(n):
+def _blank_rows(ws, r, columns, n, *, prefill=None, serial=None):
+    """prefill: {column label: value} written into every blank row.
+
+    The Action column is prefilled rather than left empty. The report decides
+    whether a row is an issue, a reissue or a refund from the Action cell ON
+    THE ROW, not from the heading above it -- so a form that left the column
+    blank would have produced a sheet whose every sale was discarded.
+    """
+    prefill = prefill or {}
+    for i in range(1, n + 1):
         for j in range(1, len(columns) + 1):
-            _cell(ws, r, j, None, border=True,
+            label = columns[j - 1][0]
+            # The serial is written in too. A visit row with no number in the
+            # first column is not read as a visit at all, so a rep who filled
+            # the form and skipped the Sl. column would have filed nothing.
+            value = i if serial and label == serial else prefill.get(label)
+            _cell(ws, r, j, value, border=True,
+                  size=9, colour=GREY if value is not None else "000000",
                   fill=REQUIRED if columns[j - 1][2] else None)
         r += 1
     return r
@@ -122,12 +142,13 @@ def build_counter_template(out_path, *, day=None) -> Path:
     for action in ("Ticket Issue", "Ticket Reissue", "Ticket Refund"):
         r = _title(ws, r, action,
                    "put the agency in Remarks" if action == "Ticket Reissue"
-                   else "")
+                   else "Employee ID is written USBA-1234, "
+                        "PNR like 1AB2C3")
         cols = list(SALES_COLUMNS)
         if action == "Ticket Reissue":
             cols = cols[:7] + [("PNR Booked from", 18, True)] + cols[7:]
         r = _header(ws, r, cols)
-        r = _blank_rows(ws, r, cols, 8) + 1
+        r = _blank_rows(ws, r, cols, 8, prefill={"Action": action}) + 1
 
     r = _title(ws, r, "Walk-in / phone / WhatsApp enquiries",
                "'Received by' is new — without it no enquiry can be credited "
@@ -140,10 +161,23 @@ def build_counter_template(out_path, *, day=None) -> Path:
     r = _header(ws, r, TIME_COLUMNS)
     r = _blank_rows(ws, r, TIME_COLUMNS, 10) + 1
 
+    # KEEP the typed totals. They are the only independent check the report
+    # has: the parse is verified against them 29 times out of 29, and dropping
+    # the line to save the counter a sum would remove the one thing that proves
+    # the report read the sheet correctly.
+    r = _title(ws, r, "Day total", "keep filling these in — the report checks "
+                                   "itself against them")
+    for label in ("Previous Sales", "Total Sales", "Refund",
+                  "Net Sell After Refund"):
+        _cell(ws, r, 1, label + " :", bold=True, size=10, border=True)
+        _cell(ws, r, 2, None, border=True, fill=REQUIRED)
+        r += 1
+    r += 1
     ws.merge_cells(f"A{r}:P{r}")
     _cell(ws, r, 1,
-          "  Totals are not typed here any more: the report adds them from the "
-          "rows, so a typed total that disagrees is one more thing to chase.",
+          "  The report adds the rows up itself and compares them with these "
+          "totals. A difference is reported rather than hidden, which is how "
+          "two rows a colleague had typed twice were found.",
           size=8, colour=GREY, fill=PAPER, wrap=True)
     ws.freeze_panes = "A5"
     out_path = Path(out_path)
@@ -174,9 +208,9 @@ def build_visit_template(out_path, *, day=None) -> Path:
     ws.row_dimensions[1].height = 30
 
     r = 3
-    for label, hint in (("Date & Day *", f"{day:%d/%m/%Y}  (write the year)"),
-                        ("Zone *", "e.g. Zone 7"),
-                        ("Name *", "your full name, spelled the same each day")):
+    for label, hint in (("Date & Day", f"{day:%d/%m/%Y}  (write the year)"),
+                        ("Zone", "e.g. Zone 7"),
+                        ("Name", "your full name, spelled the same each day")):
         _cell(ws, r, 1, label, bold=True, size=10, fill=REQUIRED, border=True,
               colour="7F6000")
         _cell(ws, r, 2, None, border=True, fill=REQUIRED)
@@ -196,7 +230,7 @@ def build_visit_template(out_path, *, day=None) -> Path:
 
     r = _title(ws, r, "Daily Agency Sales Visit")
     r = _header(ws, r, VISIT_COLUMNS)
-    r = _blank_rows(ws, r, VISIT_COLUMNS, 12)
+    r = _blank_rows(ws, r, VISIT_COLUMNS, 12, serial="Sl.")
 
     r += 1
     ws.merge_cells(f"A{r}:I{r}")

@@ -799,3 +799,77 @@ def test_a_missing_known_counters_list_is_not_an_error(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     assert cr.load_known_counters(bad) == set()
+
+
+# --- the hand-confirmed counter list ----------------------------------------
+
+def test_a_damaged_confirmation_file_is_ignored_not_fatal(tmp_path):
+    """The list is typed by a person into a JSON file, so it will be damaged
+    eventually. A report must not fail because of it."""
+    for body in ("{{{ not json", '["DAC-01"]', '{"known_counters": null}',
+                 '{"known_counters": [1, 2]}', "", "null"):
+        p = tmp_path / "m.json"
+        p.write_text(body, encoding="utf-8")
+        assert isinstance(cr.load_known_counters(p), set)
+    assert cr.load_known_counters(tmp_path / "absent" / "m.json") == set()
+
+
+def test_a_confirmation_typed_with_stray_spacing_still_counts(tmp_path):
+    """A trailing space is the difference between confirming a counter and
+    silently confirming nothing."""
+    p = tmp_path / "m.json"
+    p.write_text('{"known_counters": ["  DAC-01 Airport (Dhaka)  ", "", " "]}',
+                 encoding="utf-8")
+    assert cr.load_known_counters(p) == {"DAC-01 Airport (Dhaka)"}
+
+
+def test_a_confirmation_survives_a_later_save_that_does_not_mention_it(tmp_path):
+    p = tmp_path / "m.json"
+    cr.save_mapping(p, {"Uttara": "DAC-09 Uttara"}, {}, known=["DAC-01 Airport"])
+    cr.save_mapping(p, {"Uttara": "DAC-09 Uttara"}, {})
+    assert cr.load_known_counters(p) == {"DAC-01 Airport"}
+    cr.save_mapping(p, {}, {}, known=["INT Riyadh City"])
+    assert cr.load_known_counters(p) == {"DAC-01 Airport", "INT Riyadh City"}
+
+
+def test_confirming_a_counter_changes_the_note_and_not_a_number(tmp_path):
+    """INT Riyadh City sold once all month because it is short staffed, not
+    because it is a kiosk. Saying so must not move any figure."""
+    p = tmp_path / "sales.xlsx"
+    _sales_report(p, [_line(16, "Ticket payment", "0A1111",
+                            "INT Riyadh City (Saudi Arabia)", 10000)])
+    sales = cr.read_sales_report(p)
+
+    plain = cr.reconcile(sales, [], {})
+    confirmed = cr.reconcile(sales, [], {},
+                             known_counters=["INT Riyadh City (Saudi Arabia)"])
+    assert ([(f.kind, f.system_amount, f.reported_amount)
+             for f in plain.findings]
+            == [(f.kind, f.system_amount, f.reported_amount)
+                for f in confirmed.findings])
+    assert plain.unreported_amount == confirmed.unreported_amount
+    assert confirmed.is_known("INT Riyadh City (Saudi Arabia)")
+    assert not plain.is_known("INT Riyadh City (Saudi Arabia)")
+
+
+def test_a_confirmation_matches_however_the_person_typed_it(tmp_path):
+    p = tmp_path / "sales.xlsx"
+    _sales_report(p, [_line(16, "Ticket payment", "0A1111",
+                            "INT Riyadh City (Saudi Arabia)", 10000)])
+    sales = cr.read_sales_report(p)
+    res = cr.reconcile(sales, [], {},
+                       known_counters=["  int riyadh CITY (saudi arabia) "])
+    assert res.is_known("INT Riyadh City (Saudi Arabia)")
+    assert res.known_unmatched == []
+
+
+def test_a_confirmation_that_matches_nothing_is_named(tmp_path):
+    """Doing nothing quietly is how a typo in a hand-edited file survives for
+    months. The report says the confirmation did not land."""
+    p = tmp_path / "sales.xlsx"
+    _sales_report(p, [_line(16, "Ticket payment", "0A1111",
+                            "INT Riyadh City (Saudi Arabia)", 10000)])
+    sales = cr.read_sales_report(p)
+    res = cr.reconcile(sales, [], {}, known_counters=["INT Riyad City"])
+    assert res.known_unmatched == ["INT Riyad City"]
+    assert not res.is_known("INT Riyadh City (Saudi Arabia)")

@@ -329,6 +329,7 @@ class ReconResult:
     currency_suspect: dict = field(default_factory=dict)
     currency_rates: dict = field(default_factory=dict)
     known_counters: set = field(default_factory=set)
+    known_unmatched: list = field(default_factory=list)
     duplicate_rows: list = field(default_factory=list)
     duplicates_removed: int = 0      # survives a second pass, unlike the rows
     ambiguous: dict = field(default_factory=dict)
@@ -340,6 +341,15 @@ class ReconResult:
 
     def of(self, kind):
         return [f for f in self.findings if f.kind == kind]
+
+    def is_known(self, pos) -> bool:
+        """Has a person confirmed this point of sale is a staffed counter?
+
+        Matched on the normalised name, not the exact one. The list is typed by
+        hand into a JSON file, so 'INT Riyadh City (Saudi Arabia)' and
+        'int riyadh city (saudi arabia)' have to mean the same desk.
+        """
+        return _norm(pos) in {_norm(k) for k in self.known_counters}
 
     @property
     def unreported_amount(self) -> float:
@@ -435,6 +445,12 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
     filed = {k: set(v) for k, v in (filed_days or {}).items()}
     res.ambiguous = dict(ambiguous or {})
     res.known_counters = set(known_counters or ())
+    # A confirmation that matches no point of sale does nothing, and doing
+    # nothing quietly is how a typo in a hand-edited file survives for months.
+    # Name it instead, so the person who typed it can see it did not land.
+    seen = {_norm(p) for p in sales.points_of_sale}
+    res.known_unmatched = sorted(k for k in res.known_counters
+                                 if _norm(k) not in seen)
 
     # AGGREGATE the reported side first. A three-passenger booking is three rows
     # on the counter sheet but one line in the system, so matching row-by-row
@@ -654,7 +670,13 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
           + (f"   ·   For {', '.join(res.non_comparable)} the amount the "
              f"COUNTER wrote is in local currency and is not compared; what is "
              f"MISSING is the system's own figure and is counted in full."
-             if res.non_comparable else ""),
+             if res.non_comparable else "")
+          + (f"   ·   CHECK THE SPELLING: {', '.join(res.known_unmatched)} "
+             f"{'is' if len(res.known_unmatched) == 1 else 'are'} listed as "
+             f"confirmed counter{'' if len(res.known_unmatched) == 1 else 's'} "
+             f"but match no point of sale in the sales report, so the "
+             f"confirmation did nothing."
+             if res.known_unmatched else ""),
           size=9, color=GREY, fill=PAPER, align="left")
     ws.row_dimensions[2].height = 17
 
@@ -771,7 +793,7 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         if v.get("dupe_n"):
             note.append(f"{v['dupe_n']} duplicated row(s) removed")
         if v.get("not_submitted") and v.get("sys_n", 0) < LOW_VOLUME:
-            if c in res.known_counters:
+            if res.is_known(c):
                 # confirmed a real desk, so low volume is a staffing problem
                 note.append(f"only {v['sys_n']} sale(s) — confirmed counter, "
                             f"still owes a report")
@@ -1109,7 +1131,15 @@ def load_known_counters(path) -> set:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return set()
-    return {str(x) for x in (data.get("known_counters") or []) if x}
+    if not isinstance(data, dict):
+        return set()          # a hand-edited file that lost its outer braces
+    raw = data.get("known_counters")
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    # Strip before keeping. This list is typed by a person, and a trailing
+    # space is the difference between confirming a counter and silently
+    # confirming nothing.
+    return {str(x).strip() for x in raw if str(x).strip()}
 
 
 def load_mapping_overrides(path) -> dict:
