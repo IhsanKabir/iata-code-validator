@@ -469,3 +469,71 @@ def test_sales_outside_both_windows_are_ignored(tmp_path):
     res = vm.measure_impact(data, rows, month=8, year=2026)
     assert res.visited_before == pytest.approx(100.0)
     assert res.visited_after == pytest.approx(100.0)
+
+
+# --------------------------------------------------------------------------
+# identity must merge spellings without merging businesses
+# --------------------------------------------------------------------------
+def test_three_businesses_sharing_a_first_word_stay_three():
+    """Deleting the trade words merged SHEBA AIR SERVICE, SHEBA AIR TRAVELS and
+    SHEBA TRAVELS & TOURS into one agency, and 406 keys held three or more
+    different customers."""
+    names = ["SHEBA AIR SERVICE", "SHEBA AIR TRAVELS", "SHEBA TRAVELS & TOURS"]
+    assert len({vm.identity(n) for n in names}) == 3
+    ss = ["S S Holidays", "S.S Enterprise", "S.S International"]
+    assert len({vm.identity(n) for n in ss}) == 3
+
+
+@pytest.mark.parametrize("a, b", [
+    ("AB Travel", "AB Travels"),
+    ("ALIF TRAVELS", "Alif Travels"),
+    ("Sharetrip limited", "Share Trip Limited"),
+    ("CARNIVAL AIR TICKETING LTD.", "Carnival Air Ticketing Ltd. (IATA)"),
+    ("Real Journey Tours & Travels", "REAL JOURNEY TOURS AND TRAVELS"),
+    ("Rain Tours And Travels", "M/S Rain Tours And Travels"),
+])
+def test_one_agency_spelled_two_ways_still_merges(a, b):
+    assert vm.identity(a) == vm.identity(b)
+
+
+# --------------------------------------------------------------------------
+# the lift is a range, and the control has to be like for like
+# --------------------------------------------------------------------------
+def test_the_control_is_not_flattered_by_agencies_that_had_no_before(tmp_path):
+    """12,743 control agencies had no July sales at all and could only go up,
+    against 52 on the visited side. Left in, they drag the comparison."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = [
+        ("Alpha Travels", date(2026, 7, 20), 100.0),
+        ("Alpha Travels", date(2026, 8, 10), 90.0),      # visited: -10%
+        ("Trading Other", date(2026, 7, 20), 100.0),
+        ("Trading Other", date(2026, 8, 10), 50.0),      # control: -50%
+        ("Brand New Agency", date(2026, 8, 10), 400.0),  # no before at all
+    ]
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    # the wide control is flattered by the newcomer
+    assert res.control_change > -0.5
+    # the like-for-like basis is not
+    assert vm.ImpactResult._rate(*res.trading_control) == pytest.approx(-0.5)
+    assert res.trading_lift == pytest.approx(0.4)
+    assert res.started_control == 1
+
+
+def test_every_way_of_measuring_it_is_reported(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    data = vm.read_all([p], month=8, year=2026)
+    rows = [
+        ("Alpha Travels", date(2026, 7, 20), 100.0),
+        ("Alpha Travels", date(2026, 8, 10), 90.0),
+        ("Trading Other", date(2026, 7, 20), 100.0),
+        ("Trading Other", date(2026, 8, 10), 50.0),
+    ]
+    res = vm.measure_impact(data, rows, month=8, year=2026)
+    lo, hi = res.lift_range
+    assert lo is not None and hi is not None
+    assert lo <= res.trading_lift <= hi
+    # an exact-match-only figure exists even when nothing was matched loosely
+    assert res.exact_lift is not None

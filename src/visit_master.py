@@ -47,24 +47,30 @@ DAY_MONTH_RE = re.compile(
 ZONE_CODE_RE = re.compile(r"^\d{1,2}[A-Za-z]?$")
 
 # words that say what KIND of business an agency is, not which one it is
-_AGENCY_SUFFIX = re.compile(
-    r"\b(limited|ltd|ltdd|pvt|private|international|intl|travels?|tours?|"
-    r"touring|agency|agencies|services?|enterprise|air|aviation|holidays?|"
-    r"co|company|corporation|and|the|iata)\b", re.I)
+# Words that carry no identity at all: a legal form, a filing tag, a branch
+# marker. These are dropped.
+_AGENCY_NOISE = re.compile(
+    r"\b(limited|ltd|ltdd|pvt|private|co|company|corp|corporation|inc|"
+    r"m/s|ms|iata|non|the|and)\b|\((?:[a-z]{3}|iata|non[ -]?iata)\)", re.I)
+# Words that ARE part of the name but get typed either way round. These are
+# normalised, never deleted -- deleting them merged three different Sheba
+# agencies (AIR SERVICE, AIR TRAVELS, TRAVELS & TOURS) into one.
+_AGENCY_PLURAL = re.compile(
+    r"\b(travel|tour|holiday|service|agency|agencie|enterprise)s?\b", re.I)
 
 
 def identity(name: str) -> str:
-    """A key that survives how the name was typed.
+    """A key that survives how the name was typed, without merging businesses.
 
-    'AB Travel' and 'AB Travels', 'ALIF TRAVELS' and 'Alif Travels' are one
-    agency written twice; counting them separately overstated the estate by
-    nearly a hundred. The same key has to reach the sales system, where the
-    SAME agency is filed as 'Carnival Air Ticketing Ltd. (IATA)' against the
-    rep's 'CARNIVAL AIR TICKETING LTD.', so the words that say what KIND of
-    business it is are dropped and '&' is read as 'and'.
+    'AB Travel' and 'AB Travels' are one agency written twice, and the sales
+    system files 'Carnival Air Ticketing Ltd. (IATA)' where a rep writes
+    'CARNIVAL AIR TICKETING LTD.'. But 'SHEBA AIR SERVICE' and 'SHEBA TRAVELS &
+    TOURS' are two businesses, so the trade words are folded to a single form
+    rather than thrown away.
     """
     text = _n(name).replace("&", " and ")
-    text = _AGENCY_SUFFIX.sub(" ", text)
+    text = _AGENCY_NOISE.sub(" ", text)
+    text = _AGENCY_PLURAL.sub(lambda m: m.group(1).lower(), text)
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
@@ -852,6 +858,12 @@ def build_master_path(out_dir, month: int, year: int) -> Path:
 # --------------------------------------------------------------------------
 EARLY_DAY = 10           # a visit by this day precedes most of the window
 GROWTH_BAND = 0.05       # inside this, call it flat rather than a move
+# A near match is only allowed on the DISTINCTIVE part of the name. Matching
+# whole names let "Tamchi Tours & Travels" score 92 against "Tamim Tours &
+# Travels", because the shared boilerplate carried it. Below this length a key
+# is too short to be sure of.
+NEAR_SCORE = 92
+NEAR_MIN_KEY = 6
 
 
 @dataclass
@@ -864,6 +876,8 @@ class AgencyImpact:
     before: float = 0.0
     after: float = 0.0
     matched: bool = False
+    match_kind: str = ""          # "exact" | "near"
+    matched_as: str = ""          # the customer name it was matched to
 
     @property
     def change(self):
@@ -906,6 +920,18 @@ class ImpactResult:
     late_after: float = 0.0
     unvisited_top: list = field(default_factory=list)
     window: str = ""
+    # The headline moves with choices nobody outside this code can see, so all
+    # of them are carried and printed together rather than one being picked.
+    # Restricting both sides to agencies that bought in the BEFORE window is
+    # the like-for-like basis: the control is otherwise flattered by agencies
+    # that had no July sales at all and could only go up.
+    trading_visited: tuple = (0.0, 0.0)
+    trading_control: tuple = (0.0, 0.0)
+    sized_control: tuple = (0.0, 0.0)
+    sized_control_n: int = 0
+    exact_visited: tuple = (0.0, 0.0)
+    started_visited: int = 0
+    started_control: int = 0
 
     @staticmethod
     def _rate(before, after):
@@ -940,6 +966,59 @@ class ImpactResult:
     @property
     def matched(self) -> int:
         return sum(1 for a in self.agencies if a.matched)
+
+    @staticmethod
+    def _lift(v, c):
+        vr = ImpactResult._rate(*v)
+        cr = ImpactResult._rate(*c)
+        return None if vr is None or cr is None else vr - cr
+
+    @property
+    def trading_lift(self):
+        """The like-for-like answer: both sides already trading in July."""
+        return self._lift(self.trading_visited, self.trading_control)
+
+    @property
+    def sized_lift(self):
+        """Against a control of comparable size, not the whole long tail."""
+        return self._lift(self.trading_visited, self.sized_control)
+
+    @property
+    def exact_lift(self):
+        """Ignoring every near match, in case one of them is wrong."""
+        return self._lift(self.exact_visited, self.trading_control)
+
+    @property
+    def lift_range(self):
+        vals = [x for x in (self.lift, self.trading_lift, self.sized_lift,
+                            self.exact_lift) if x is not None]
+        return (min(vals), max(vals)) if vals else (None, None)
+
+
+def _near_matches(unmatched, totals) -> dict:
+    """Visited agencies whose customer record is spelled slightly differently.
+
+    Only the distinctive part is compared -- what is left after the words that
+    say what KIND of business it is -- so "secquence" finds "sequence" while
+    "tamchi" does not find "tamim". A wrong link here would credit one agency's
+    sales to another, so the bar is high and every one is listed on the sheet.
+    """
+    try:
+        from rapidfuzz import fuzz, process
+    except ImportError:
+        return {}
+    choices = [k for k in totals if len(k) >= NEAR_MIN_KEY]
+    if not choices:
+        return {}
+    out: dict = {}
+    for key in unmatched:
+        if len(key) < NEAR_MIN_KEY:
+            continue
+        hit = process.extractOne(key, choices, scorer=fuzz.ratio,
+                                 score_cutoff=NEAR_SCORE)
+        if hit:
+            out[key] = hit[0]
+    return out
 
 
 def measure_impact(data: VisitData, sales_rows, *, month: int, year: int,
@@ -983,11 +1062,16 @@ def measure_impact(data: VisitData, sales_rows, *, month: int, year: int,
 
     res = ImpactResult(window=f"{pre_from:%d %b} – {start - timedelta(days=1):%d %b} "
                               f"vs {start:%d %b} – {post_to:%d %b %Y}")
+    near = _near_matches([k for k in visits_of if k not in totals], totals)
     for key, n in visits_of.items():
-        before, after = totals.get(key, (0.0, 0.0))
+        hit = key if key in totals else near.get(key)
+        before, after = totals.get(hit, (0.0, 0.0)) if hit else (0.0, 0.0)
         a = AgencyImpact(key=key, name=name_of[key], rep=rep_of[key], visits=n,
                          first_visit=first.get(key), before=before, after=after,
-                         matched=key in totals)
+                         matched=hit is not None,
+                         match_kind=("exact" if key in totals
+                                     else "near" if hit else ""),
+                         matched_as=display.get(hit, "") if hit else "")
         res.agencies.append(a)
         if not a.matched:
             continue
@@ -1000,14 +1084,40 @@ def measure_impact(data: VisitData, sales_rows, *, month: int, year: int,
             res.late_before += before
             res.late_after += after
 
+    # a like-for-like basis, and a control of comparable size
+    sizes = sorted(a.before for a in res.agencies if a.matched and a.before > 0)
+    lo = sizes[len(sizes) // 10] if sizes else 0        # ignore the extremes
+    hi = sizes[9 * len(sizes) // 10] if sizes else 0
+    for a in res.agencies:
+        if not a.matched:
+            continue
+        if a.before > 0:
+            res.trading_visited = (res.trading_visited[0] + a.before,
+                                   res.trading_visited[1] + a.after)
+            if a.match_kind == "exact":
+                res.exact_visited = (res.exact_visited[0] + a.before,
+                                     res.exact_visited[1] + a.after)
+        elif a.after:
+            res.started_visited += 1
+
+    claimed = set(visits_of) | set(near.values())
     for key, (before, after) in totals.items():
-        if key in visits_of:
+        if key in claimed:
             continue
         res.control_before += before
         res.control_after += after
         res.control_agencies += 1
+        if before > 0:
+            res.trading_control = (res.trading_control[0] + before,
+                                   res.trading_control[1] + after)
+            if lo <= before <= hi:
+                res.sized_control = (res.sized_control[0] + before,
+                                     res.sized_control[1] + after)
+                res.sized_control_n += 1
+        elif after:
+            res.started_control += 1
     res.unvisited_top = sorted(
-        ((display[k], v[1]) for k, v in totals.items() if k not in visits_of),
+        ((display[k], v[1]) for k, v in totals.items() if k not in claimed),
         key=lambda kv: -kv[1])[:40]
     return res
 
@@ -1068,24 +1178,28 @@ def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
           size=9, color=GREY, fill=PAPER, align="left")
     ws.row_dimensions[2].height = 17
 
-    lift = res.lift or 0
+    lift = res.trading_lift or 0
+    lo, hi = res.lift_range
+    tv, tc = res.trading_visited, res.trading_control
     r = 4
-    r = _band(ws, r, "THE ANSWER")
+    r = _band(ws, r, "THE ANSWER",
+              "both sides restricted to agencies that were already buying "
+              "before the month — the like-for-like basis")
     r = _kpi_strip(ws, r, [
         ("Agencies visited", len(res.agencies), "#,##0", None),
         ("Found in the sales data", res.matched, "#,##0", None),
-        ("Visited: before", res.visited_before, MONEY, None),
-        ("Visited: after", res.visited_after, MONEY, None),
-        ("Visited change", res.visited_change, PCT,
-         "1F6F3C" if (res.visited_change or 0) >= 0 else "C00000"),
-        ("Everyone else changed", res.control_change, PCT, None),
-        ("LIFT (percentage points)", lift, "+0.0;-0.0",
+        ("Visited: before", tv[0], MONEY, None),
+        ("Visited: after", tv[1], MONEY, None),
+        ("Visited change", ImpactResult._rate(*tv), PCT,
+         "1F6F3C" if (ImpactResult._rate(*tv) or 0) >= 0 else "C00000"),
+        ("Everyone else changed", ImpactResult._rate(*tc), PCT, None),
+        ("LIFT (percentage points)", lift * 100, "+0.0;-0.0",
          "1F6F3C" if lift > 0 else "C00000"),
     ])
     r = _kpi_strip(ws, r, [
-        (f"Visited by the {EARLY_DAY}th: lift", res.early_lift or 0, "+0.0;-0.0",
-         "1F6F3C" if (res.early_lift or 0) > 0 else "C00000"),
-        ("Visited later: lift", res.late_lift or 0, "+0.0;-0.0",
+        (f"Visited by the {EARLY_DAY}th: lift", (res.early_lift or 0) * 100,
+         "+0.0;-0.0", "1F6F3C" if (res.early_lift or 0) > 0 else "C00000"),
+        ("Visited later: lift", (res.late_lift or 0) * 100, "+0.0;-0.0",
          "1F6F3C" if (res.late_lift or 0) > 0 else "C00000"),
         ("Grew", sum(1 for a in res.agencies if a.verdict == "grew"), "#,##0",
          "1F6F3C"),
@@ -1101,6 +1215,42 @@ def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
          sum(1 for a in res.agencies if not a.matched), "#,##0", "C00000"),
     ])
     r += 1
+
+    # ---- how much does the answer depend on how it was measured? ---------
+    r = _band(ws, r, "HOW SURE IS THIS?",
+              "the same data measured four defensible ways; the direction is "
+              "the same every time, the size is not")
+    r = _headers(ws, r, ["Way of measuring it", "Lift (percentage points)",
+                         "What it assumes", "", "", "", "", "", "", "", "",
+                         "", "", "", "", "", "", "", "", "", ""])
+    for label, value, note in (
+            ("Already buying, both sides", res.trading_lift,
+             "the like-for-like basis, and the one the headline uses"),
+            ("Against a control of similar size", res.sized_lift,
+             f"only the {res.sized_control_n:,} agencies in the same size band, "
+             f"since the visited ones are far larger than the average"),
+            ("Exact name matches only", res.exact_lift,
+             "ignores every near match, in case one of them links the wrong "
+             "agency"),
+            ("Against every other agency", res.lift,
+             "the widest control, flattered by "
+             f"{res.started_control:,} agencies that had no sales before the "
+             "month at all and could only go up")):
+        _cell(ws, r, 1, label, bold=True, size=10, border=True)
+        _cell(ws, r, 2, (value or 0) * 100, fmt="+0.00;-0.00", bold=True,
+              size=10, border=True, align="center",
+              fill=GOOD if (value or 0) > 0 else BAD)
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=21)
+        _cell(ws, r, 3, note, size=9, color=GREY, border=True)
+        r += 1
+    _cell(ws, r, 1, "Range", bold=True, size=10, border=True, fill=PAPER)
+    _cell(ws, r, 2, f"{(lo or 0) * 100:+.2f} to {(hi or 0) * 100:+.2f}",
+          bold=True, size=10, border=True, align="center", fill=PAPER)
+    ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=21)
+    _cell(ws, r, 3,
+          "Positive on every basis. Quote the range, not one number.",
+          size=9, color=GREY, border=True, fill=PAPER)
+    r += 2
 
     # ---- per rep ---------------------------------------------------------
     r = _band(ws, r, "BY SALES REP",
@@ -1119,7 +1269,7 @@ def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
             c["matched"] += 1
             c["before"] += a.before
             c["after"] += a.after
-    control = res.control_change or 0
+    control = ImpactResult._rate(*res.trading_control) or 0
     first = r
     for rep, c in sorted(per.items(),
                          key=lambda kv: -(kv[1]["after"] - kv[1]["before"])):
@@ -1239,7 +1389,9 @@ def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
           "visit, and bigger or friendlier agencies may have held up anyway. "
           "The one internal check available is timing: agencies visited early "
           "in the month, where the visit precedes most of the measured period, "
-          "show a larger lift than those visited late.",
+          "show a larger lift than those visited late. Measured four ways the "
+          "answer stays positive but ranges widely, so the range above is the "
+          "honest statement of it.",
           size=8, color=GREY, fill=PAPER, wrap=True)
     ws.row_dimensions[r].height = 26
     ws.freeze_panes = "A9"
