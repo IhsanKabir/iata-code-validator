@@ -39,6 +39,7 @@ hiddenimports = [
     "src.counter_reconcile",
     "src.counter_blocks",
     "src.visit_master",
+    "src.report_templates",
     # Lazy-imported only when the user opens the time-series view on the
     # OEP tab; PyInstaller's static analyzer can't see the deferred import.
     "matplotlib",

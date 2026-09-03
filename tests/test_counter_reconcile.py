@@ -763,3 +763,39 @@ def test_a_missing_or_broken_mapping_file_is_not_an_error(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     assert cr.load_mapping_overrides(bad) == {}
+
+
+# --------------------------------------------------------------------------
+# a human can confirm a point of sale IS a counter
+# --------------------------------------------------------------------------
+def test_a_confirmed_counter_is_not_excused_for_being_small(tmp_path):
+    """INT Riyadh City sold once all month because it is short staffed, not
+    because it is a kiosk. Volume cannot tell the two apart."""
+    path = tmp_path / "map.json"
+    cr.save_mapping(path, {}, {}, known=["INT Riyadh City (Saudi Arabia)"])
+    assert cr.load_known_counters(path) == {"INT Riyadh City (Saudi Arabia)"}
+
+    data = _data(tmp_path, [
+        _line(16, "Ticket payment", "0A1111", "INT Riyadh City (Saudi Arabia)",
+              68174)])
+    res = cr.reconcile(data, [], MAP,
+                       known_counters=cr.load_known_counters(path))
+    assert res.known_counters == {"INT Riyadh City (Saudi Arabia)"}
+    assert res.per_counter["INT Riyadh City (Saudi Arabia)"]["not_submitted"]
+
+
+def test_known_counters_survive_a_rewrite(tmp_path):
+    """The file is rewritten every run; a human's list must not be lost."""
+    path = tmp_path / "map.json"
+    cr.save_mapping(path, {"A": "DAC-01 Airport (Dhaka)"}, {},
+                    known=["DAC-01 Airport (Dhaka)"])
+    cr.save_mapping(path, {"A": "DAC-01 Airport (Dhaka)"}, {},
+                    known=cr.load_known_counters(path))
+    assert cr.load_known_counters(path) == {"DAC-01 Airport (Dhaka)"}
+
+
+def test_a_missing_known_counters_list_is_not_an_error(tmp_path):
+    assert cr.load_known_counters(tmp_path / "nope.json") == set()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert cr.load_known_counters(bad) == set()

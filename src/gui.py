@@ -6344,6 +6344,9 @@ class App(WhatsAppMixin, HealthMixin):
 
         ctl = ttk.Frame(out_body)
         ctl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(ctl, text="Blank form…",
+                   command=lambda: self._save_template("counter")
+                   ).pack(side="right", padx=(12, 0))
         self.btn_ctr_run = ttk.Button(
             ctl, text="Build master summary", command=self._ctr_run,
             style="Primary.TButton")
@@ -6371,6 +6374,39 @@ class App(WhatsAppMixin, HealthMixin):
         sb = ttk.Scrollbar(box, command=self.ctr_log_text.yview)
         sb.pack(side="right", fill="y")
         self.ctr_log_text.configure(yscrollcommand=sb.set, state="disabled")
+
+    def _save_template(self, kind: str) -> None:
+        """Hand out the corrected blank form.
+
+        The report withholds a metric every month because a column was never
+        filled. Parsing cannot recover a blank, so the fix is a form that asks
+        for the field -- same layout the counters and reps already use, with
+        the missing columns present and marked.
+        """
+        from datetime import date as _d
+
+        from . import report_templates
+        default = ("Counter_Daily_Form.xlsx" if kind == "counter"
+                   else "Agency_Visit_Form.xlsx")
+        path = filedialog.asksaveasfilename(
+            title="Save the blank form", defaultextension=".xlsx",
+            initialfile=default,
+            filetypes=[("Excel workbook", "*.xlsx")])
+        if not path:
+            return
+        try:
+            build = (report_templates.build_counter_template if kind == "counter"
+                     else report_templates.build_visit_template)
+            build(path, day=_d.today())
+        except Exception as exc:  # noqa: BLE001
+            log.exception("template write failed")
+            messagebox.showerror("Blank form", f"Could not write it: {exc}")
+            return
+        messagebox.showinfo(
+            "Blank form",
+            "Saved.\n\nThe shaded columns are the ones the monthly report "
+            "cannot do without. Hand this out and those gaps stop appearing."
+            f"\n\n{path}")
 
     def _ctr_pick_folder(self) -> None:
         d = filedialog.askdirectory(title="Folder holding the counter workbooks")
@@ -6697,6 +6733,9 @@ class App(WhatsAppMixin, HealthMixin):
 
         ctl = ttk.Frame(out_body)
         ctl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(ctl, text="Blank form…",
+                   command=lambda: self._save_template("visit")
+                   ).pack(side="right", padx=(12, 0))
         self.btn_vis_run = ttk.Button(
             ctl, text="Build visit summary", command=self._vis_run,
             style="Primary.TButton")

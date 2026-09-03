@@ -778,12 +778,13 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         mapping, proofs = cr.verify_mapping(mapping, all_sales, sales)
         overrides = cr.load_mapping_overrides(mapping_file)
         mapping.update({c: p for c, p in overrides.items() if c in mapping})
-        cr.save_mapping(mapping_file, mapping, proofs)
+        known = cr.load_known_counters(mapping_file)
+        cr.save_mapping(mapping_file, mapping, proofs, known=known)
         filed_days = {m["counter"]: m["days"] for m in metas}
         recon = cr.reconcile(
             sales, all_sales, mapping, base_currency=base_currency,
             currency_by_counter={m["counter"]: m["currency"] for m in metas},
-            filed_days=filed_days, ambiguous=ambiguous)
+            filed_days=filed_days, ambiguous=ambiguous, known_counters=known)
 
     # With the rates in hand, restate every counter in base currency so one
     # table can hold them all. Nothing external is assumed: each rate came from
@@ -808,7 +809,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         recon = cr.reconcile(
             sales, all_sales, mapping, base_currency=base_currency,
             currency_by_counter={m["counter"]: base_currency for m in metas},
-            filed_days=filed_days, ambiguous=ambiguous)
+            filed_days=filed_days, ambiguous=ambiguous, known_counters=known)
         recon.currency_rates, recon.currency_suspect = rates, suspect
         recon.proofs = proofs
         for c, n in dupes.items():          # the second pass no longer sees them

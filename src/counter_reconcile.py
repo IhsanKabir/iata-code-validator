@@ -328,6 +328,7 @@ class ReconResult:
     non_comparable: list = field(default_factory=list)
     currency_suspect: dict = field(default_factory=dict)
     currency_rates: dict = field(default_factory=dict)
+    known_counters: set = field(default_factory=set)
     duplicate_rows: list = field(default_factory=list)
     duplicates_removed: int = 0      # survives a second pass, unlike the rows
     ambiguous: dict = field(default_factory=dict)
@@ -411,7 +412,7 @@ class ReconResult:
 
 def reconcile(sales: SalesData, counter_rows, mapping, *,
               currency_by_counter=None, base_currency: str = "BDT",
-              filed_days=None, ambiguous=None) -> ReconResult:
+              filed_days=None, ambiguous=None, known_counters=()) -> ReconResult:
     """Compare system lines against what the counters wrote down.
 
     Only days the sales report actually covers are judged. Anything outside that
@@ -433,6 +434,7 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
     pos_to_counter = {v: k for k, v in mapping.items()}
     filed = {k: set(v) for k, v in (filed_days or {}).items()}
     res.ambiguous = dict(ambiguous or {})
+    res.known_counters = set(known_counters or ())
 
     # AGGREGATE the reported side first. A three-passenger booking is three rows
     # on the counter sheet but one line in the system, so matching row-by-row
@@ -769,10 +771,13 @@ def write_reconciliation(ws, res: ReconResult, *, base_currency: str = "BDT",
         if v.get("dupe_n"):
             note.append(f"{v['dupe_n']} duplicated row(s) removed")
         if v.get("not_submitted") and v.get("sys_n", 0) < LOW_VOLUME:
-            # a location with a handful of sales a month is probably not a
-            # staffed desk; chasing it like the airport would waste the list
-            note.append(f"only {v['sys_n']} sale(s) all month — "
-                        f"may not be a staffed counter")
+            if c in res.known_counters:
+                # confirmed a real desk, so low volume is a staffing problem
+                note.append(f"only {v['sys_n']} sale(s) — confirmed counter, "
+                            f"still owes a report")
+            else:
+                note.append(f"only {v['sys_n']} sale(s) all month — "
+                            f"may not be a staffed counter")
         _cell(ws, r, 18, "; ".join(note), size=8, color="C00000", border=True)
         for j in range(19, 21):
             _cell(ws, r, j, None, border=True)
@@ -1087,6 +1092,26 @@ def verify_mapping(mapping, counter_rows, sales, *, min_pnrs=5,
     return resolved, proofs
 
 
+def load_known_counters(path) -> set:
+    """Points of sale a human has confirmed ARE staffed counters.
+
+    Volume cannot tell you this. INT Riyadh City sold once all month because it
+    is short staffed, not because it is a kiosk, and DAC-01 Airport is a real
+    counter that simply files nothing. Both were being softened with "may not be
+    a staffed counter", which is exactly the wrong note for a desk that owes a
+    report.
+    """
+    import json
+    path = Path(path)
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return set()
+    return {str(x) for x in (data.get("known_counters") or []) if x}
+
+
 def load_mapping_overrides(path) -> dict:
     """A human's decision about which desk a counter is, if one was recorded.
 
@@ -1106,16 +1131,20 @@ def load_mapping_overrides(path) -> dict:
             if v}
 
 
-def save_mapping(path, resolved, proofs) -> None:
+def save_mapping(path, resolved, proofs, known=()) -> None:
     """Record what was used and why, so the next run starts from the evidence."""
     import json
     from datetime import datetime
     path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        existing = load_known_counters(path)
         payload = {
             "_note": ("Edit point_of_sale to correct a counter. Anything you "
-                      "set here wins over the automatic match."),
+                      "set here wins over the automatic match. Add a point of "
+                      "sale to known_counters to say it IS a staffed desk that "
+                      "owes a report, however little it sells."),
+            "known_counters": sorted(existing | set(known or ())),
             "updated": datetime.now().isoformat(timespec="seconds"),
             "counters": {
                 c: {"point_of_sale": pos,
