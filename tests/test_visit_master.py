@@ -203,7 +203,8 @@ def test_revisiting_one_agency_is_not_seeing_two(tmp_path):
     assert len(r.agencies) == 1        # one agency, three visits
     assert r.repeats == 2
     assert len(agencies) == 1
-    assert agencies["ALPHA TRAVELS"]["visits"] == 3
+    # keyed by identity, so the spelling does not decide the key
+    assert next(iter(agencies.values()))["visits"] == 3
 
 
 def test_a_missing_figure_never_becomes_a_zero_in_the_total(tmp_path):
@@ -260,3 +261,96 @@ def test_files_and_folders_can_be_mixed(tmp_path):
 def test_an_empty_selection_is_an_error_not_an_empty_report(tmp_path):
     with pytest.raises(ValueError, match="No visit report"):
         vm.read_all(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# identity, duplicates and routes
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("a, b", [
+    ("AB Travel", "AB Travels"),
+    ("ALIF TRAVELS", "Alif Travels"),
+    ("Addcom Tour and Travel", "ADDCOM TOUR AND TRAVELS"),
+    ("Tour Planners", "Tour Planners Limited"),
+    ("A'Shahad Travels", "A'shahad Travels"),
+])
+def test_one_agency_written_two_ways_is_one_agency(a, b):
+    assert vm.identity(a) == vm.identity(b)
+
+
+def test_two_different_agencies_stay_different():
+    assert vm.identity("Alpha Travels") != vm.identity("Beta Travels")
+    assert vm.identity("Sky Way Victory") != vm.identity("Victory Travels")
+
+
+def test_one_rep_written_three_ways_is_one_rep():
+    """A single sheet carried all three of these, splitting the person's work
+    three ways in a scorecard meant to compare people."""
+    canon = vm.canonical_people([
+        "Md Barru Ibna Azam Barno", "Md. Barru Ibna Azam",
+        "Md. Barru Ibna Azam Barno"])
+    assert len(set(canon.values())) == 1
+
+
+def test_two_different_reps_on_one_sheet_stay_two():
+    canon = vm.canonical_people(["Md. Mahmudul Hasan", "Yeachir Arafat"])
+    assert len(set(canon.values())) == 2
+
+
+def test_the_same_report_filed_twice_does_not_double_the_month(tmp_path):
+    """A Downloads folder routinely holds 'report.xlsx' and 'report (1).xlsx'.
+    Reading both turned 2,201 visits into 4,944."""
+    a = tmp_path / "report.xlsx"
+    b = tmp_path / "report (1).xlsx"
+    for path in (a, b):
+        _report(path, {"rep1": [
+            ("11/08/2026", "Zone # 1", "ALEX ROY", [ROW_A, ROW_B])]})
+    once = vm.read_all([a], month=8, year=2026)
+    twice = vm.read_all([a, b], month=8, year=2026)
+    assert len(once.visits) == 2
+    assert len(twice.visits) == 2          # not 4
+    assert twice.duplicates == 2
+
+
+def test_a_genuinely_new_visit_in_a_second_file_is_kept(tmp_path):
+    a = tmp_path / "report.xlsx"
+    b = tmp_path / "report (1).xlsx"
+    _report(a, {"rep1": [("11/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    _report(b, {"rep1": [("12/08/2026", "Zone # 1", "ALEX ROY", [ROW_A])]})
+    both = vm.read_all([a, b], month=8, year=2026)
+    assert len(both.visits) == 2           # same agency, different days
+    assert both.duplicates == 0
+
+
+@pytest.mark.parametrize("written, expected", [
+    ("SPD-DAC-SPD", ["SPD", "DAC", "SPD"]),
+    ("KUL, SIN, BKK", ["KUL", "SIN", "BKK"]),
+    ("MCT/BD/MCT", ["MCT", "MCT"]),        # BD is not an airport code
+    ("Dxb, Auh", ["DXB", "AUH"]),
+    ("Middle East all sector.", ["Middle East"]),
+])
+def test_a_route_is_read_as_sectors_not_as_one_mangled_word(written, expected):
+    """Not splitting on the hyphen turned SPD-DAC-SPD into 'Spddacspd', 201
+    times over."""
+    data = vm.VisitData(visits=[vm.Visit(rep="R", sheet="s", day=None, zone="",
+                                         agency="A", routes=written)])
+    got = vm.route_demand(data)
+    for token in expected:
+        assert got[token] >= 1
+    assert "Spddacspd" not in got
+
+
+def test_two_reps_giving_one_agency_different_figures_is_reported(tmp_path):
+    """68 agencies were given two figures, up to seven times apart. Showing
+    only the larger would hide that they disagree."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [("11/08/2026", "Zone # 1", "ALEX ROY", [
+        ["Alpha Travels", "Mr. A", "Owner", "01700000001", "Motijheel",
+         "BDT- 1000000/-", "KSA", ""]])],
+        "rep2": [("11/08/2026", "Zone # 2", "SAM LEE", [
+            ["Alpha Travels", "Mr. A", "Owner", "01700000009", "Motijheel",
+             "BDT- 7000000/-", "KSA", ""]])]})
+    data = vm.read_all([p], month=8, year=2026)
+    _reps, _zones, agencies = vm.summarise(data)
+    a = next(iter(agencies.values()))
+    assert a["disputed"] is True
+    assert a["figures"] == {1_000_000, 7_000_000}

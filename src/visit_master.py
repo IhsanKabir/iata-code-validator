@@ -45,6 +45,48 @@ DAY_MONTH_RE = re.compile(
     r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.I)
 # a zone written as a bare code beside the date, e.g. "11B"
 ZONE_CODE_RE = re.compile(r"^\d{1,2}[A-Za-z]?$")
+
+# words that say what KIND of business an agency is, not which one it is
+_AGENCY_SUFFIX = re.compile(
+    r"\b(limited|ltd|international|intl|travels?|tours?|agency|agencies|"
+    r"services?|enterprise|air|aviation|holidays?|co|company)\b", re.I)
+
+
+def identity(name: str) -> str:
+    """A key that survives how the name was typed.
+
+    'AB Travel' and 'AB Travels', 'ALIF TRAVELS' and 'Alif Travels' are one
+    agency written twice; counting them separately overstated the estate by
+    nearly a hundred.
+    """
+    text = _AGENCY_SUFFIX.sub(" ", _n(name))
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def person_key(name: str) -> str:
+    """'Md. Barru Ibna Azam' and 'Md Barru Ibna Azam Barno' are one rep."""
+    return re.sub(r"[^a-z ]", "", _n(name).lower()).strip()
+
+
+def canonical_people(names) -> dict:
+    """Map every spelling of a rep to one name -- the fullest one written.
+
+    One sheet carried three spellings of the same person, which split their work
+    three ways in a scorecard meant to compare people.
+    """
+    keys = sorted({person_key(n): n for n in names}.items(),
+                  key=lambda kv: -len(kv[0]))
+    canon: dict[str, str] = {}
+    chosen: list[tuple[str, str]] = []
+    for key, name in keys:
+        for other_key, other_name in chosen:
+            if other_key.startswith(key) or key.startswith(other_key):
+                canon[name] = other_name
+                break
+        else:
+            chosen.append((key, name))
+            canon[name] = name
+    return canon
 PHONE_RE = re.compile(r"\d{6,}")
 ZONE_RE = re.compile(r"zone\s*[#:]?\s*(\d+)", re.I)
 DATE_RE = re.compile(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})")
@@ -176,6 +218,7 @@ class VisitData:
     blocks: int = 0
     sheets: int = 0
     empty_sheets: int = 0
+    duplicates: int = 0
     files: list = field(default_factory=list)
 
     @property
@@ -329,13 +372,23 @@ def read_all(selection, *, month=None, year=None, progress_cb=None,
     if not paths:
         raise ValueError(f"No visit report workbooks found in {selection}")
     total = VisitData()
+    seen: set = set()
     for i, p in enumerate(paths, start=1):
         if stop_flag is not None and stop_flag():
             break
         if progress_cb is not None:
             progress_cb(i, len(paths), p.stem)
         one = parse_workbook(p, month=month, year=year)
-        total.visits.extend(one.visits)
+        # A Downloads folder routinely holds "report.xlsx" and "report (1).xlsx".
+        # Reading both doubled every figure -- 2,201 visits became 4,944 -- so a
+        # visit already seen is dropped and counted, not added again.
+        for v in one.visits:
+            key = (person_key(v.rep), v.day, identity(v.agency), v.phone)
+            if key in seen:
+                total.duplicates += 1
+                continue
+            seen.add(key)
+            total.visits.append(v)
         total.issues.extend(one.issues)
         total.blocks += one.blocks
         total.sheets += one.sheets
@@ -371,18 +424,22 @@ class RepStats:
 
 def summarise(data: VisitData):
     """Per rep, per zone, per agency -- counting blanks as blanks throughout."""
+    canon = canonical_people({v.rep for v in data.visits})
+    for v in data.visits:
+        v.rep = canon.get(v.rep, v.rep)
+
     reps: dict = {}
     seen: Counter = Counter()
     for v in data.visits:
         r = reps.get(v.rep)
         if r is None:
             r = reps[v.rep] = RepStats(rep=v.rep)
-        key = (v.rep, v.agency.strip().upper())
+        key = (v.rep, identity(v.agency))
         seen[key] += 1
         if seen[key] > 1:
             r.repeats += 1
         r.visits += 1
-        r.agencies.add(v.agency.strip().upper())
+        r.agencies.add(identity(v.agency))
         if v.day:
             r.days.add(v.day)
         else:
@@ -411,32 +468,65 @@ def summarise(data: VisitData):
 
     agencies: dict = {}
     for v in data.visits:
-        key = v.agency.strip().upper()
+        key = identity(v.agency)
         a = agencies.setdefault(key, {"name": v.agency.strip(), "visits": 0,
                                       "reps": set(), "productivity": None,
-                                      "location": v.location, "routes": ""})
+                                      "figures": set(), "location": v.location,
+                                      "routes": "", "spellings": set()})
         a["visits"] += 1
         a["reps"].add(v.rep)
+        a["spellings"].add(v.agency.strip())
         if v.productivity is not None:
-            # the largest figure any rep recorded for this agency
+            a["figures"].add(v.productivity)
             a["productivity"] = max(a["productivity"] or 0, v.productivity)
         if v.routes and not a["routes"]:
             a["routes"] = v.routes
+    for a in agencies.values():
+        # 68 agencies were given two different figures, up to seven times
+        # apart. Showing only the larger would hide the disagreement.
+        a["disputed"] = len(a["figures"]) > 1
+        if a["spellings"]:
+            a["name"] = max(a["spellings"], key=len)
     return reps, dict(zones), agencies
 
 
-ROUTE_SPLIT = re.compile(r"[,/;&+]| and ", re.I)
+# a route is written as codes joined any number of ways: "SPD-DAC-SPD",
+# "KUL, SIN", "MCT/BD/MCT". Splitting on punctuation but NOT the hyphen turned
+# SPD-DAC-SPD into the single token "Spddacspd", 201 times.
+ROUTE_SPLIT = re.compile(r"[,/;&+\-\u2013\u2014]|\band\b|\bto\b", re.I)
+# written sectors, and what to call each of them. Reps write "Domistic",
+# "Middle East all sector." and similar, so the phrase is looked for inside the
+# text rather than matched whole.
+_WORD_SECTORS = {
+    "domistic": "Domestic", "domestic": "Domestic",
+    "middle east": "Middle East", "international": "International",
+    "india": "India", "pakistan": "Pakistan", "nepal": "Nepal",
+    "bangladesh": "Bangladesh", "saudi": "Saudi",
+}
 
 
 def route_demand(data: VisitData) -> Counter:
-    """Which sectors the visited agencies say they sell most."""
+    """Which sectors the visited agencies say they sell most.
+
+    Three-letter airport codes are counted as codes; a handful of written words
+    ("Domestic", "Middle East") are counted as themselves. Anything else is left
+    out rather than guessed at.
+    """
     out: Counter = Counter()
     for v in data.visits:
         for part in ROUTE_SPLIT.split(v.routes or ""):
-            token = re.sub(r"[^A-Za-z ]", "", part).strip()
-            if 2 <= len(token) <= 24 and token.lower() not in (
-                    "and", "all", "etc", "sector", "domistic route"):
-                out[token.title()] += 1
+            token = re.sub(r"[^A-Za-z ]", " ", part).strip()
+            token = re.sub(r"\s+", " ", token)
+            if not token:
+                continue
+            low = token.lower()
+            if len(token) == 3 and " " not in token:
+                out[token.upper()] += 1
+            else:
+                for phrase, sector in _WORD_SECTORS.items():
+                    if phrase in low:
+                        out[sector] += 1
+                        break
     return out
 
 
@@ -454,6 +544,8 @@ class VisitResult:
     figure_rate: float = 0.0
     productivity: float = 0.0
     zone_blank: int = 0
+    duplicates: int = 0
+    disputed: int = 0
     stopped: bool = False
     window: str = ""
 
@@ -498,7 +590,9 @@ def build_master(selection, out_path, *, month: int, year: int,
     _cell(ws, 2, 1,
           f"  {len(reps)} reps · {len(data.visits):,} visits · "
           f"{len(agencies):,} agencies · {window} · "
-          f"{len(data.files)} file(s), {data.blocks} daily blocks."
+          f"{len(data.files)} file(s), {data.blocks} daily blocks"
+          + (f", {data.duplicates:,} duplicate visit(s) dropped"
+             if data.duplicates else "") + "."
           "   A figure the rep did not write is counted as not written, never "
           "as zero — and a range like '3-5 lakh' is a conversation, not a "
           "number, so it is not read as one.",
@@ -525,7 +619,8 @@ def build_master(selection, out_path, *, month: int, year: int,
         ("Figure not written", len(data.visits) - with_figure, "#,##0",
          "C00000"),
         ("Figure coverage", with_figure / len(data.visits), PCT, None),
-        ("Zone not written", zone_blank, "#,##0", "C00000"),
+        ("Duplicate visits dropped", data.duplicates, "#,##0",
+         "C00000" if data.duplicates else None),
         ("Date not written", issues.get("no_date", 0), "#,##0", "C00000"),
         ("Date outside the month", issues.get("date_outside_month", 0),
          "#,##0", "C00000"),
@@ -544,7 +639,9 @@ def build_master(selection, out_path, *, month: int, year: int,
         "", "", "", "", "", "", "", "Verdict"])
     for rp in sorted(reps.values(), key=lambda x: -len(x.agencies)):
         cover = rp.figure_rate
-        if rp.visits and len(rp.agencies) / rp.visits < 0.5:
+        if rp.no_date > rp.visits * 0.25:
+            verdict, tone = "DATES MISSING", WARN
+        elif rp.visits and len(rp.agencies) / rp.visits < 0.5:
             verdict, tone = "MOSTLY REVISITS", WARN
         elif cover < 0.25:
             verdict, tone = "FIGURES NOT WRITTEN", WARN
@@ -561,8 +658,11 @@ def build_master(selection, out_path, *, month: int, year: int,
               size=9, border=True, align="center")
         _cell(ws, r, 6, len(rp.days) or None, size=9, border=True,
               align="center")
+        # a rep whose dates are mostly missing collapses onto one day, and
+        # then "41 visits a day" is an artefact of the blanks, not a workload
+        _shaky = rp.no_date > rp.visits * 0.25
         _cell(ws, r, 7, rp.per_day or None, fmt="0.0", size=9, border=True,
-              align="center")
+              align="center", fill=WARN if _shaky else None)
         _cell(ws, r, 8, len(rp.zones) or None, size=9, border=True,
               align="center")
         _cell(ws, r, 9, rp.productivity or None, fmt=MONEY, size=9, border=True,
@@ -615,20 +715,26 @@ def build_master(selection, out_path, *, month: int, year: int,
               "the largest monthly figure any rep recorded, and how often the "
               "agency was actually visited")
     hdr = r
-    r = _headers(ws, r, ["Agency", "Monthly billing (BDT)", "Visits", "Reps",
-                         "Location", "Most selling routes", "", "", "", "",
-                         "", "", "", "", "", "", "", "", "", "", ""])
+    r = _headers(ws, r, ["Agency", "Monthly billing (BDT)", "Reps disagree",
+                         "Visits", "Reps", "Location", "Most selling routes",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "",
+                         ""])
     ranked = sorted(agencies.values(),
                     key=lambda a: -(a["productivity"] or -1))[:60]
     for a in ranked:
         _cell(ws, r, 1, a["name"], bold=True, size=10, border=True)
         _cell(ws, r, 2, a["productivity"], fmt=MONEY, size=10, border=True,
               align="right")
-        _cell(ws, r, 3, a["visits"], size=9, border=True, align="center")
-        _cell(ws, r, 4, len(a["reps"]), size=9, border=True, align="center")
-        _cell(ws, r, 5, a["location"][:28], size=9, border=True)
-        _cell(ws, r, 6, a["routes"][:40], size=8, color=GREY, border=True)
-        for j in range(7, 22):
+        _cell(ws, r, 3,
+              (f"{min(a['figures']):,.0f} … {max(a['figures']):,.0f}"
+               if a["disputed"] else None),
+              size=8, color="C00000", border=True,
+              fill=WARN if a["disputed"] else None)
+        _cell(ws, r, 4, a["visits"], size=9, border=True, align="center")
+        _cell(ws, r, 5, len(a["reps"]), size=9, border=True, align="center")
+        _cell(ws, r, 6, a["location"][:28], size=9, border=True)
+        _cell(ws, r, 7, a["routes"][:40], size=8, color=GREY, border=True)
+        for j in range(8, 22):
             _cell(ws, r, j, None, border=True)
         r += 1
     if ranked:
@@ -699,7 +805,8 @@ def build_master(selection, out_path, *, month: int, year: int,
         path=out_path, visits=len(data.visits), reps=len(reps),
         agencies=len(agencies), days=len(days), repeats=repeats,
         figure_rate=with_figure / len(data.visits), productivity=total_prod,
-        zone_blank=zone_blank, window=window,
+        zone_blank=zone_blank, window=window, duplicates=data.duplicates,
+        disputed=sum(1 for a in agencies.values() if a["disputed"]),
         stopped=bool(stop_flag is not None and stop_flag()))
 
 
