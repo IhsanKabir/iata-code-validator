@@ -204,10 +204,18 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
     # Counters whose desk was never proved from their own PNRs, or that the
     # matching could not tell apart. Anything decided BY the mapping is held
     # back for these.
-    from .counter_reconcile import SPLIT, UNPROVEN
+    from .counter_reconcile import CONFIRMED, CORRECTED, SPLIT, UNPROVEN
     unproven = {c for c, pr in (res.proofs or {}).items()
                 if getattr(pr, "verdict", "") in (UNPROVEN, SPLIT)}
-    unproven |= set(res.ambiguous or ())
+    # An ambiguous NAME is not an unsettled desk. Cox Bazar, Uttara and ZYL
+    # each had a rival by name and each put 98-100% of their own PNRs at the
+    # desk they were given -- that is the evidence the proving pass exists to
+    # collect, and holding their claims back on the name alone suppressed real
+    # findings. Only where the PNRs did not settle it does the rival matter.
+    settled = {CONFIRMED, CORRECTED}
+    unproven |= {c for c in (res.ambiguous or ())
+                 if getattr((res.proofs or {}).get(c), "verdict", "")
+                 not in settled}
     if res.proofs:
         # Absence of proof is not proof. A counter the proving pass never
         # reached is held back exactly like one it could not confirm.

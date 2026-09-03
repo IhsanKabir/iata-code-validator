@@ -605,3 +605,28 @@ def test_two_counters_on_one_desk_are_both_named():
     res.proofs = {c: _Proof(cr.CONFIRMED) for c in res.mapping}
     named = cv.verify_unmatched(res, sales).checks[0].sys_counter
     assert "Banani" in named and "Banani Old" in named, named
+
+
+def test_a_rival_by_name_does_not_override_the_counters_own_pnrs():
+    """Cox Bazar, Uttara and ZYL each had a rival desk by name and each put
+    98-100% of their own PNRs at the desk they were given. Holding their
+    claims back on the name alone suppressed real findings."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.ambiguous = {"Uttara": ["DAC-09 Uttara", "DAC-01 Airport (Dhaka)"]}
+    res.proofs = {"Uttara": _Proof(cr.CONFIRMED)}
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.SOLD_ELSEWHERE
+    assert out.overclaimed == 5000
+
+
+def test_an_ambiguous_counter_its_own_pnrs_could_not_settle_is_held_back():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("DOH", "0A1111", 5000)],
+               {"DOH": "INT Doha (Qatar)", "Banani": "DAC-16 Banani New"})
+    res.ambiguous = {"DOH": ["INT Doha (Qatar)", "DAC-16 Banani New"]}
+    res.proofs = {"DOH": _Proof(cr.UNPROVEN)}
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.MAPPING_UNPROVEN
+    assert out.overclaimed == 0
