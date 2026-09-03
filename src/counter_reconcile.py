@@ -1056,6 +1056,50 @@ def read_sales_from_warehouse(source: WarehouseSource, *, month: int, year: int,
     return data
 
 
+
+def find_locators(source: WarehouseSource, codes) -> dict:
+    """Where the warehouse has each of these PNRs, across ALL of its months.
+
+    A PNR the counter wrote that August has no sale for is not thereby a
+    phantom: 14 of August's 25 turned out to be sales from earlier months,
+    mostly the original booking behind a reissue. Asking the warehouse costs
+    one query and settles them without a single Zenith call.
+
+    Returns {locator: {"first": date, "last": date, "n": int, "pos": [...]}}.
+    """
+    codes = sorted({str(c or "").strip().upper() for c in codes if c})
+    if not codes:
+        return {}
+    duckdb = _duckdb()
+    if duckdb is None:
+        return {}
+    target = (source.path.as_posix() if source.kind == "gold"
+              else source.path.as_posix() + "/**/*.parquet")
+    target = target.replace("'", "''")
+    quoted = ", ".join("'" + c.replace("'", "''") + "'" for c in codes)
+    try:
+        con = duckdb.connect()
+        con.execute("SET enable_progress_bar=false")
+        rows = con.execute(f"""
+            select upper(trim("Record Locator")) as loc,
+                   min("Pure Date"), max("Pure Date"), count(*),
+                   string_agg(distinct "Point of sales", ' | ')
+            from read_parquet('{target}')
+            where upper(trim("Record Locator")) in ({quoted})
+            group by 1
+        """).fetchall()
+    except Exception:                      # noqa: BLE001
+        # The check must degrade to "not checked", never to a wrong verdict.
+        return {}
+    out = {}
+    for loc, first, last, n, pos in rows:
+        out[str(loc)] = {
+            "first": _as_date(first), "last": _as_date(last), "n": int(n or 0),
+            "pos": [p.strip() for p in str(pos or "").split("|") if p.strip()],
+        }
+    return out
+
+
 # --------------------------------------------------------------------------
 # proving the mapping, rather than trusting it
 # --------------------------------------------------------------------------

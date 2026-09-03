@@ -689,21 +689,34 @@ def _headers(ws, r, labels):
     return r + 1
 
 
+PER_STRIP = 7          # 7 tiles x 3 columns fills the 21-column grid exactly
+
+
 def _kpi_strip(ws, r, items):
-    """Seven merged KPI tiles across the grid: the headline, readable in one look."""
+    """Merged KPI tiles across the grid: the headline, readable in one look.
+
+    Seven fit on a row. An eighth used to be written off the right-hand edge
+    of the grid and vanish, so more than seven wraps onto another row rather
+    than being lost.
+    """
     span = 3
-    for i, (label, value, fmt, tone) in enumerate(items):
-        c = 1 + i * span
-        ws.merge_cells(start_row=r, start_column=c, end_row=r, end_column=c + span - 1)
-        ws.merge_cells(start_row=r + 1, start_column=c, end_row=r + 1,
-                       end_column=c + span - 1)
-        _cell(ws, r, c, label.upper(), bold=True, size=8, color="FFFFFF",
-              fill=NAVY, align="center")
-        _cell(ws, r + 1, c, value, bold=True, size=14, color=tone or NAVY,
-              fill=PAPER, fmt=fmt, align="center")
-    ws.row_dimensions[r].height = 15
-    ws.row_dimensions[r + 1].height = 26
-    return r + 2
+    items = list(items)
+    for start in range(0, max(len(items), 1), PER_STRIP):
+        chunk = items[start:start + PER_STRIP]
+        for i, (label, value, fmt, tone) in enumerate(chunk):
+            c = 1 + i * span
+            ws.merge_cells(start_row=r, start_column=c, end_row=r,
+                           end_column=c + span - 1)
+            ws.merge_cells(start_row=r + 1, start_column=c, end_row=r + 1,
+                           end_column=c + span - 1)
+            _cell(ws, r, c, label.upper(), bold=True, size=8, color="FFFFFF",
+                  fill=NAVY, align="center")
+            _cell(ws, r + 1, c, value, bold=True, size=14, color=tone or NAVY,
+                  fill=PAPER, fmt=fmt, align="center")
+        ws.row_dimensions[r].height = 15
+        ws.row_dimensions[r + 1].height = 26
+        r += 2
+    return r
 
 
 def _pay_cells(ws, r, agg, start_col=14):
@@ -1375,6 +1388,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             from .zenith_pnr_client import lookup_pnr as lookup
         verified = counter_verify.verify_unmatched(
             recon, sales, session=zenith_session, lookup=lookup,
+            warehouse=(src if use_warehouse and not sales_report else None),
             max_lookups=max_lookups, stop_flag=stop_flag,
             progress_cb=(lambda d, n, code: progress_cb(
                 d, n, f"PNR check {d}/{n} · {code}")) if progress_cb else None)

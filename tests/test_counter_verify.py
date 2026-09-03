@@ -384,3 +384,186 @@ def test_an_empty_overclaim_sheet_says_so_rather_than_looking_broken():
     text = " ".join(str(c.value) for row in wb.active.iter_rows()
                     for c in row if c.value)
     assert "Nothing was overclaimed" in text
+
+
+# --- the three things that would accuse someone wrongly --------------------
+
+class _Proof:
+    def __init__(self, verdict):
+        self.verdict = verdict
+
+
+def test_no_claim_is_made_where_the_counters_desk_was_never_proved():
+    """'This is another counter's sale' is decided entirely by which desk we
+    think this counter is. Where that was never proved, the accusation is
+    about our own matching, not about a person."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote_by("Uttara", "0A1111", 5000, "ALEX ROY")],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.proofs = {"Uttara": _Proof(cr.UNPROVEN)}
+
+    out = cv.verify_unmatched(res, sales)
+    check = out.checks[0]
+    assert check.verdict == cv.MAPPING_UNPROVEN
+    assert not check.is_overclaim
+    assert out.overclaimed == 0
+    assert check in out.held_back
+    assert not check.resolved            # it is an open question, not an answer
+
+
+def test_a_counter_that_works_two_desks_is_not_accused_either():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.proofs = {"Uttara": _Proof(cr.SPLIT)}
+    assert cv.verify_unmatched(res, sales).overclaimed == 0
+
+
+def test_an_ambiguous_counter_is_not_accused_either():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.ambiguous = {"Uttara": ["DAC-09 Uttara", "DAC-16 Banani New"]}
+    assert cv.verify_unmatched(res, sales).overclaimed == 0
+
+
+def test_a_proved_mapping_still_produces_the_claim():
+    """The guard must not swallow the finding it exists to qualify."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.proofs = {"Uttara": _Proof(cr.CONFIRMED)}
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.SOLD_ELSEWHERE
+    assert out.overclaimed == 5000
+
+
+def test_writing_a_pnr_twice_is_still_a_claim_on_an_unproven_mapping():
+    """That row proves its own mapping: the system HAS the PNR at that desk.
+    Holding it back would lose a real finding."""
+    sales = _Sales([_Line("DAC-09 Uttara", "0A3333", date(2026, 8, 9))])
+    matched = cr.Finding(cr.MATCHED, "Uttara", "DAC-09 Uttara",
+                         date(2026, 8, 9), "0A3333", "ISSUE", 1000.0, 1000.0)
+    res = _res([matched, _wrote("Uttara", "0A3333", 7000)],
+               {"Uttara": "DAC-09 Uttara"})
+    res.proofs = {"Uttara": _Proof(cr.UNPROVEN)}
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.WROTE_IT_TWICE
+    assert out.overclaimed == 7000
+
+
+class _Warehouse:
+    """Stands in for the local sales warehouse."""
+    def __init__(self, hits):
+        self.hits = hits
+
+
+def test_a_pnr_the_warehouse_has_in_another_month_is_not_a_phantom(monkeypatch):
+    """14 of August's 25 unknowns were sales from earlier months, mostly the
+    original booking behind a reissue. Charging those to someone would be
+    plainly wrong."""
+    monkeypatch.setattr(cr, "find_locators", lambda _src, codes: {
+        "0AOLD1": {"first": date(2026, 2, 12), "last": date(2026, 2, 12),
+                   "n": 2, "pos": ["Galileo 1G 1G"]}})
+    res = _res([_wrote_by("Uttara", "0AOLD1", 8000, "ALEX ROY")],
+               {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, _Sales([]), warehouse=_Warehouse({}))
+    check = out.checks[0]
+    assert check.verdict == cv.ANOTHER_MONTH
+    assert not check.is_overclaim
+    assert check.resolved                # it IS an answer, just not a claim
+    assert "Feb 2026" in check.detail
+    assert "Galileo 1G 1G" in check.detail
+    assert out.overclaimed == 0
+
+
+def test_the_warehouse_is_asked_before_zenith_is(monkeypatch):
+    """A question the local data answers must never cost a live call."""
+    monkeypatch.setattr(cr, "find_locators", lambda _src, codes: {
+        "0AOLD1": {"first": date(2026, 2, 12), "last": date(2026, 2, 12),
+                   "n": 1, "pos": []}})
+    calls = []
+    res = _res([_wrote("Uttara", "0AOLD1"), _wrote("Uttara", "0ANEW1")],
+               {"Uttara": "DAC-09 Uttara"})
+    out = cv.verify_unmatched(res, _Sales([]), warehouse=_Warehouse({}),
+                              session=object(),
+                              lookup=lambda _s, c: calls.append(c))
+    assert calls == ["0ANEW1"]          # the settled one was never asked about
+    assert out.looked_up == 1
+
+
+def test_a_warehouse_that_cannot_be_read_leaves_rows_unchecked(monkeypatch):
+    """It must degrade to 'not checked', never to a wrong verdict."""
+    def boom(_src, _codes):
+        raise RuntimeError("parquet is gone")
+
+    monkeypatch.setattr(cr, "find_locators", boom)
+    res = _res([_wrote("Uttara", "0AOLD1", 5000)], {"Uttara": "DAC-09 Uttara"})
+    with pytest.raises(RuntimeError):
+        cv.verify_unmatched(res, _Sales([]), warehouse=_Warehouse({}))
+
+
+def test_a_value_restated_from_another_currency_is_marked_as_an_estimate():
+    """MAA writes INR and KUL writes MYR. Their claims are converted at a rate
+    we derived ourselves, and must not read as counted figures."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("MAA", "0A1111", 3936)],
+               {"MAA": "INT Chennai City (India)",
+                "Banani": "DAC-16 Banani New"})
+    res.non_comparable = ["MAA"]
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].converted
+    assert out.converted_claims == out.overclaims
+
+    from openpyxl import Workbook
+    wb = Workbook()
+    cv.write_overclaim(wb.active, out, None, month=8, year=2026)
+    text = " ".join(str(c.value) for row in wb.active.iter_rows()
+                    for c in row if c.value)
+    assert "converted" in text
+    assert "estimates" in text
+
+
+def test_a_bdt_counter_is_not_marked_converted():
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    out = cv.verify_unmatched(res, sales)
+    assert not out.checks[0].converted
+    assert out.converted_claims == []
+
+
+def test_what_was_held_back_is_stated_rather_than_silently_dropped():
+    from openpyxl import Workbook
+
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.proofs = {"Uttara": _Proof(cr.UNPROVEN)}
+    out = cv.verify_unmatched(res, sales)
+
+    wb = Workbook()
+    cv.write_overclaim(wb.active, out, None, month=8, year=2026)
+    text = " ".join(str(c.value) for row in wb.active.iter_rows()
+                    for c in row if c.value)
+    assert "deliberately left out" in text
+    assert "HELD BACK ON PURPOSE" in text          # the tile labels are upper
+    assert "WHAT IS DELIBERATELY NOT IN THAT TOTAL" in text
+
+
+def test_more_than_seven_headline_tiles_are_not_lost_off_the_grid():
+    """Seven tiles fill the 21-column grid. An eighth used to be written past
+    the right-hand edge and vanish, taking a caveat with it."""
+    from openpyxl import Workbook
+
+    from src.counter_master import _kpi_strip
+
+    wb = Workbook()
+    ws = wb.active
+    items = [(f"TILE {i}", i, "0", None) for i in range(9)]
+    end = _kpi_strip(ws, 1, items)
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row
+                    if c.value)
+    for i in range(9):
+        assert f"TILE {i}" in text, i
+    assert end == 5          # two rows of tiles, each two rows tall, plus one
