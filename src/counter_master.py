@@ -23,7 +23,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from . import counter_blocks
+from . import counter_blocks, counter_verify
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -185,6 +185,10 @@ class MasterResult:
     gap_source: str = ""           # what the gap sheet was compared against
     no_report_sites: tuple = ()
     window: str = ""
+    checked_n: int = 0             # written PNRs the system had no match for
+    checked_resolved: int = 0      # ...of which the check explained
+    checked_lookups: int = 0       # live Zenith calls the check actually made
+    checked_counts: tuple = ()     # (verdict, rows, value) worst first
 
 
 # --------------------------------------------------------------------------
@@ -1353,10 +1357,26 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
     ws.page_setup.orientation = "landscape"
 
 
+    verified = None
     if recon is not None:
         cr.write_reconciliation(wb.create_sheet("Unreported"), recon,
                                 base_currency=base_currency,
                                 filed_days=filed_days)
+        # A PNR the counter wrote that the system cannot match is the one
+        # finding the comparison could not explain. Most of the answer is in
+        # the sales report already; only what is nowhere costs a live call.
+        lookup = None
+        if zenith_session is not None:
+            from .zenith_pnr_client import lookup_pnr as lookup
+        verified = counter_verify.verify_unmatched(
+            recon, sales, session=zenith_session, lookup=lookup,
+            max_lookups=max_lookups, stop_flag=stop_flag,
+            progress_cb=(lambda d, n, code: progress_cb(
+                d, n, f"PNR check {d}/{n} · {code}")) if progress_cb else None)
+        if verified.checks:
+            counter_verify.write_pnr_check(
+                wb.create_sheet("PNR Check"), verified, month=month, year=year,
+                base_currency=base_currency)
     out_path = Path(out_path)
     wb.save(out_path)
     return MasterResult(
@@ -1382,6 +1402,11 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         no_report_sites=tuple(p for p, _ in recon.unmapped_pos) if recon else (),
         window=(f"{recon.first_day:%d %b} to {recon.last_day:%d %b %Y}"
                 if recon and recon.first_day else ""),
+        checked_n=len(verified.checks) if verified else 0,
+        checked_resolved=verified.resolved if verified else 0,
+        checked_lookups=verified.looked_up if verified else 0,
+        checked_counts=tuple(counter_verify.summarise(verified))
+        if verified else (),
     )
 
 

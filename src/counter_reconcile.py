@@ -600,11 +600,18 @@ def reconcile(sales: SalesData, counter_rows, mapping, *,
         # belong to a ticket issued in the adjacent month, which this comparison
         # cannot see. Flag it rather than call it a phantom.
         edge = slot["day"] <= 2 or slot["day"] >= 30
+        # Carry the day the counter wrote, rather than leaving it in the note.
+        # These rows had no date on the sheet at all, which made a written PNR
+        # impossible to look up against anything.
+        try:
+            wrote_on = date(sales.first_day.year, sales.first_day.month,
+                            slot["day"])
+        except ValueError:
+            wrote_on = None
         res.findings.append(Finding(
-            NOT_IN_SYSTEM, cnt, key[0], None, key[2], key[3],
+            NOT_IN_SYSTEM, cnt, key[0], wrote_on, key[2], key[3],
             0.0, slot["amount"],
-            note=(f"counter day {slot['day']}"
-                  + (" — may be issued in the adjacent month" if edge else ""))))
+            note=("may be issued in the adjacent month" if edge else "")))
 
     # A counter whose matched sales are consistently a different SIZE is keeping
     # its sheet in another currency, whatever its column header claims. Trusting

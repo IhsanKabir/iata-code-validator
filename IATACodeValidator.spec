@@ -37,6 +37,7 @@ hiddenimports = [
     # listed rather than assumed -- a missed one loses the whole tab silently.
     "src.counter_master",
     "src.counter_reconcile",
+    "src.counter_verify",
     "src.counter_blocks",
     "src.visit_master",
     "src.report_templates",

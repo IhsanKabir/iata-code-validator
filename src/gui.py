@@ -4339,6 +4339,17 @@ class App(WhatsAppMixin, HealthMixin):
                 elif sites:
                     self._ctr_log("No report at all: " + ", ".join(sites[:6])
                                   + (" …" if len(sites) > 6 else ""))
+            if info.get("checked_n"):
+                # the one finding the comparison could not explain by itself
+                self._ctr_log(
+                    f"PNR check: {info['checked_n']:,} written PNR(s) had no "
+                    f"matching sale · {info.get('checked_resolved', 0):,} "
+                    f"explained"
+                    + (f" ({info.get('checked_lookups', 0):,} looked up live)"
+                       if info.get("checked_lookups") else
+                       " from the sales report alone"))
+                for verdict, n, amt in (info.get("checked_counts") or [])[:5]:
+                    self._ctr_log(f"    {verdict}: {n:,} · {amt:,.0f}")
             self._ctr_log(f"File: {info.get('path', '')}")
             self.ctr_progress_label.configure(text=f"Done{note}.")
             messagebox.showinfo(
@@ -6321,13 +6332,18 @@ class App(WhatsAppMixin, HealthMixin):
                                   padx=(20, 0))
         ttk.Checkbutton(
             sales, variable=self.ctr_lookup_pnrs,
-            text="Also look each unreported PNR up in Zenith to name it "
+            text="Also check unmatched PNRs in Zenith — name the unreported "
+                 "ones, and settle the ones the counters wrote "
                  "(needs sign-in, slower)",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(
             sales, style="Hint.TLabel",
             text="Adds the booking's status, route and customer to the "
-                 "unreported list. A PNR that cannot be read is marked unknown.",
+                 "unreported list, and settles the PNRs a counter wrote that "
+                 "the system has no match for. Most of those are answered from "
+                 "the sales report at no cost; only what is nowhere is looked "
+                 "up. A PNR that cannot be read is marked unknown, never "
+                 "reported as missing.",
         ).grid(row=3, column=0, columnspan=3, sticky="w", padx=(20, 0))
         # an explicit export still works, for a machine without the warehouse
         sales_entry = ttk.Entry(sales, textvariable=self.ctr_sales_path)
@@ -6643,6 +6659,10 @@ class App(WhatsAppMixin, HealthMixin):
             "not_submitted_counters": list(result.not_submitted_counters),
             "window": result.window,
             "gap_source": result.gap_source,
+            "checked_n": result.checked_n,
+            "checked_resolved": result.checked_resolved,
+            "checked_lookups": result.checked_lookups,
+            "checked_counts": list(result.checked_counts),
         })
 
     # ------------------------------------------------------------------
