@@ -567,3 +567,41 @@ def test_more_than_seven_headline_tiles_are_not_lost_off_the_grid():
     for i in range(9):
         assert f"TILE {i}" in text, i
     assert end == 5          # two rows of tiles, each two rows tall, plus one
+
+
+def test_a_restated_value_is_still_marked_after_the_second_comparison():
+    """The comparison runs twice and the second runs on rows already restated,
+    so it declares everything comparable -- right for it, and wrong for a
+    sheet that has to say which values were converted rather than counted."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("MAA", "0A1111", 3936)],
+               {"MAA": "INT Chennai City (India)",
+                "Banani": "DAC-16 Banani New"})
+    res.non_comparable = []                 # exactly what the second pass says
+    res.restated_counters = ("MAA",)
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].converted
+    assert out.converted_claims
+
+
+def test_a_counter_the_proving_pass_never_reached_is_held_back_too():
+    """Absence of proof is not proof."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New"})
+    res.proofs = {"Banani": _Proof(cr.CONFIRMED)}      # Uttara never checked
+    out = cv.verify_unmatched(res, sales)
+    assert out.checks[0].verdict == cv.MAPPING_UNPROVEN
+    assert out.overclaimed == 0
+
+
+def test_two_counters_on_one_desk_are_both_named():
+    """Naming whichever won a dict comprehension would tell someone their sale
+    sits at a counter it may not."""
+    sales = _Sales([_Line("DAC-16 Banani New", "0A1111", date(2026, 8, 7))])
+    res = _res([_wrote("Uttara", "0A1111", 5000)],
+               {"Uttara": "DAC-09 Uttara", "Banani": "DAC-16 Banani New",
+                "Banani Old": "DAC-16 Banani New"})
+    res.proofs = {c: _Proof(cr.CONFIRMED) for c in res.mapping}
+    named = cv.verify_unmatched(res, sales).checks[0].sys_counter
+    assert "Banani" in named and "Banani Old" in named, named

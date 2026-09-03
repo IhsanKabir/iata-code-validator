@@ -331,6 +331,11 @@ class ReconResult:
     currency_rates: dict = field(default_factory=dict)
     known_counters: set = field(default_factory=set)
     known_unmatched: list = field(default_factory=list)
+    # Counters whose rows were restated into the base currency by us. The
+    # second comparison runs on restated rows and so declares everything
+    # comparable, which is right for IT and wrong for anything that needs to
+    # know a value was converted rather than counted.
+    restated_counters: tuple = ()
     duplicate_rows: list = field(default_factory=list)
     duplicates_removed: int = 0      # survives a second pass, unlike the rows
     ambiguous: dict = field(default_factory=dict)

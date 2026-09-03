@@ -836,6 +836,8 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         # the same currency as everything else. Without this it reported KUL as
         # having declared 77,127 while the master sheet said 2,424,810.
         rates, suspect = recon.currency_rates, recon.currency_suspect
+        # who was restated, before the second pass forgets it ever mattered
+        restated = tuple(recon.non_comparable)
         dupes = {c: v.get("dupe_n", 0) for c, v in recon.per_counter.items()
                  if v.get("dupe_n")}
         recon = cr.reconcile(
@@ -843,6 +845,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
             currency_by_counter={m["counter"]: base_currency for m in metas},
             filed_days=filed_days, ambiguous=ambiguous, known_counters=known)
         recon.currency_rates, recon.currency_suspect = rates, suspect
+        recon.restated_counters = restated
         recon.proofs = proofs
         for c, n in dupes.items():          # the second pass no longer sees them
             recon.per_counter.setdefault(c, {})["dupe_n"] = n

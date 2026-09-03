@@ -194,7 +194,13 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
         return out
 
     index = _index_by_locator(sales)
-    pos_to_counter = {p: c for c, p in (res.mapping or {}).items()}
+    # Two counters can be mapped to one desk. Naming only whichever happened to
+    # win the dict comprehension would tell someone their sale is at a counter
+    # it may not be, so name them all.
+    pos_to_counter: dict = {}
+    for counter, pos in (res.mapping or {}).items():
+        pos_to_counter[pos] = (f"{pos_to_counter[pos]} / {counter}"
+                               if pos in pos_to_counter else counter)
     # Counters whose desk was never proved from their own PNRs, or that the
     # matching could not tell apart. Anything decided BY the mapping is held
     # back for these.
@@ -202,9 +208,13 @@ def verify_unmatched(res, sales, *, session=None, lookup=None,
     unproven = {c for c, pr in (res.proofs or {}).items()
                 if getattr(pr, "verdict", "") in (UNPROVEN, SPLIT)}
     unproven |= set(res.ambiguous or ())
+    if res.proofs:
+        # Absence of proof is not proof. A counter the proving pass never
+        # reached is held back exactly like one it could not confirm.
+        unproven |= set(res.mapping or ()) - set(res.proofs)
     # Counters whose sheet is kept in another currency: their value here was
     # restated by us at a rate we derived, so it is an estimate.
-    restated = set(res.non_comparable or ())
+    restated = set(getattr(res, "restated_counters", ()) or ())         | set(res.non_comparable or ())
     # How many system lines exist for each PNR, and how many the comparison has
     # already paired off. What is left over is what a further row could be.
     from .counter_reconcile import BLOCK_MISMATCH, DATE_SHIFTED, MATCHED
