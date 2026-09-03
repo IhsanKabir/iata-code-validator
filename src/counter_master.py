@@ -886,7 +886,11 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
          / grand_pay, PCT, None),
         ("Payment not written", pay_tot.get("Not written", 0) / grand_pay, PCT,
          "C00000"),
-        ("Overseas counters", len(foreign), "0", None),
+        # After conversion nothing is "foreign" by the currency test, so this
+        # read 0 while six counters had in fact been restated. Say what was
+        # actually done instead.
+        ("Counters converted to BDT",
+         sum(1 for c in ctr.values() if getattr(c, "rate", None)), "0", None),
         ("Days reported", reported, "0", None),
     ])
     r += 1
