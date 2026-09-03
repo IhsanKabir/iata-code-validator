@@ -339,6 +339,7 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
     native: Counter = Counter()      # the channel labels this counter really uses
     day_sources = Counter()
     days_seen: set[int] = set()
+    day_counts: Counter = Counter()   # how many sheets claim each day
     populated = 0
     total_sheets = 0
 
@@ -368,6 +369,7 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
         day_sources[src] += 1
         if day:
             days_seen.add(day)
+            day_counts[day] += 1
         if src == "title(stale-month)":
             issues.append(Issue(counter, "stale_month",
                                 f"{title}: title names another month"))
@@ -459,6 +461,14 @@ def parse_workbook(path: Path, month: int) -> tuple[list[SaleRow], list[Issue], 
     if len(currencies) > 1:
         issues.append(Issue(counter, "currency_drift",
                             "sheets label " + "/".join(sorted(currencies))))
+    # A day-sheet copied without changing its date puts a whole week on
+    # one day. The coverage figure already looks wrong when that happens,
+    # but "30 sheets, 3% of the month" reads as a counter that did not
+    # report rather than as dates that were never edited, so say which.
+    for d, n in sorted(day_counts.items()):
+        if n >= 3:
+            issues.append(Issue(counter, "repeated_day",
+                                f"{n} sheets are all dated day {d}"))
     meta = {
         "counter": counter,
         "currency": currencies.most_common(1)[0][0] if currencies else "BDT",
@@ -1283,6 +1293,7 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
         rows = sum(1 for s in all_sales if s.counter == c)
         cov = len(m["days"]) / days_in_month
         verdict = ("USABLE" if cov >= 0.8 and not ik.get("currency_drift")
+                   and not ik.get("repeated_day")
                    else "PARTIAL" if cov >= 0.4 else "NOT REPORTING")
         tone = {"USABLE": GOOD, "PARTIAL": WARN, "NOT REPORTING": BAD}[verdict]
         _cell(ws, r, 1, c, bold=True, size=10, border=True)
@@ -1301,9 +1312,14 @@ def build_master(paths, out_path: Path, *, month: int, year: int,
               align="center")
         _cell(ws, r, 11, "YES" if ik.get("currency_drift") else None, size=9,
               border=True, align="center", color="C00000")
-        _cell(ws, r, 12, ", ".join(f"{k}:{v}" for k, v in
-                                   sorted(m["day_sources"].items())), size=8,
-              border=True)
+        _day_src = ", ".join(f"{k}:{v}" for k, v in
+                             sorted(m["day_sources"].items()))
+        if ik.get("repeated_day"):
+            # sheets copied without editing the date: the coverage above is
+            # low because the dates repeat, not because nobody reported
+            _day_src += f"  ·  {ik['repeated_day']} date(s) claimed by 3+ sheets"
+        _cell(ws, r, 12, _day_src, size=8, border=True,
+              color="C00000" if ik.get("repeated_day") else None)
         # the counter's own printed total still includes these; ours does not
         _dupes = ((recon.per_counter.get(c, {}) or {}).get("dupe_n", 0)
                   if recon is not None else 0)

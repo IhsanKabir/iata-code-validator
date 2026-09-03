@@ -167,6 +167,15 @@ def build_counter_template(out_path, *, day=None) -> Path:
     # the report read the sheet correctly.
     r = _title(ws, r, "Day total", "keep filling these in — the report checks "
                                    "itself against them")
+    ws.merge_cells(f"A{r}:P{r}")
+    _cell(ws, r, 1,
+          "  Copy this sheet for each day and CHANGE THE DATE at the top of "
+          "every copy. Sheets that all carry the same date put a whole week's "
+          "sales on one day; the report now names that rather than reading it "
+          "as a counter that stopped reporting.",
+          size=8, colour=GREY, fill=PAPER, wrap=True)
+    ws.row_dimensions[r].height = 24
+    r += 2
     for label in ("Previous Sales", "Total Sales", "Refund",
                   "Net Sell After Refund"):
         _cell(ws, r, 1, label + " :", bold=True, size=10, border=True)

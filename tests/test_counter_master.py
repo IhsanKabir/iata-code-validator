@@ -716,3 +716,46 @@ def test_the_headcount_is_the_same_everywhere_it_is_stated(tmp_path):
     # and the nameless row's money is still counted
     assert res.net == pytest.approx(3000)
     book.close()
+
+
+def test_sheets_copied_without_changing_the_date_are_named(tmp_path):
+    """A day-sheet copied without editing its date puts a whole week on one
+    day. Coverage alone reads that as a counter that stopped reporting, so the
+    repeated date is named instead of left to be inferred."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    for i in range(4):
+        ws = wb.create_sheet(f"Sheet{i + 1}")
+        ws["A1"] = "Counter Daily Activities of 3 Aug 2026"
+        ws.append([])
+        ws.append(["Counter Name", "Action", "Employee Name", "Employee ID",
+                   "PNR", "Sales Amount (BDT)", "Cash"])
+        ws.append(["Uttara", "Ticket Issue", "SOMEONE", "USBA-1234",
+                   f"0A111{i}", 5000, 5000])
+    p = tmp_path / "Uttara Counter Aug 2026.xlsx"
+    wb.save(p)
+
+    rows, issues, meta = cm.parse_workbook(p, month=8)
+    assert len(rows) == 4
+    repeated = [i for i in issues if i.kind == "repeated_day"]
+    assert repeated, [i.kind for i in issues]
+    assert "day 3" in repeated[0].detail
+    assert meta["days"] == {3}          # and coverage is genuinely 1 day
+
+
+def test_distinct_dates_are_not_flagged_as_repeated(tmp_path):
+    wb = Workbook()
+    wb.remove(wb.active)
+    for day in (3, 4, 5, 6):
+        ws = wb.create_sheet(f"Sheet{day}")
+        ws["A1"] = f"Counter Daily Activities of {day} Aug 2026"
+        ws.append([])
+        ws.append(["Counter Name", "Action", "Employee Name", "Employee ID",
+                   "PNR", "Sales Amount (BDT)", "Cash"])
+        ws.append(["Uttara", "Ticket Issue", "SOMEONE", "USBA-1234",
+                   f"0A111{day}", 5000, 5000])
+    p = tmp_path / "Uttara Counter Aug 2026.xlsx"
+    wb.save(p)
+    _, issues, meta = cm.parse_workbook(p, month=8)
+    assert not [i for i in issues if i.kind == "repeated_day"]
+    assert meta["days"] == {3, 4, 5, 6}
