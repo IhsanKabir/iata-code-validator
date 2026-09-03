@@ -759,3 +759,31 @@ def test_distinct_dates_are_not_flagged_as_repeated(tmp_path):
     _, issues, meta = cm.parse_workbook(p, month=8)
     assert not [i for i in issues if i.kind == "repeated_day"]
     assert meta["days"] == {3, 4, 5, 6}
+
+
+def test_a_repeated_date_is_named_on_the_data_quality_sheet(tmp_path):
+    """The number was already visible as low coverage. What was missing was the
+    reason, and a counter reading '31 sheets, 42% of the month' has no way to
+    tell a dating mistake from a month it did not report."""
+    folder = tmp_path / "c"
+    folder.mkdir()
+    wb = Workbook()
+    wb.remove(wb.active)
+    for i in range(5):                      # five sheets, all dated the 15th
+        _day_sheet(wb, f"S{i}", [
+            [None, "Ticket Issue", 1, "ALEX ROY", "USBA-90001", f"0A6{i:03d}",
+             None, "01700000009", None, 1000, 1000, None, None, None],
+        ], "15 Aug 2026")
+    wb.save(folder / "alpha counter aug 26.xlsx")
+
+    out = tmp_path / "m.xlsx"
+    cm.build_from_inputs(folder, out, month=8, year=2026)
+    ws = load_workbook(out)["Master"]
+    text = " ".join(str(c.value) for row in ws.iter_rows() for c in row
+                    if c.value)
+    assert "date(s) claimed by 3+ sheets" in text
+    # and such a counter is no longer called USABLE on coverage alone
+    quality = [str(c.value) for row in ws.iter_rows() for c in row
+               if c.value and str(c.value) in ("USABLE", "PARTIAL",
+                                               "NOT REPORTING")]
+    assert "USABLE" not in quality
