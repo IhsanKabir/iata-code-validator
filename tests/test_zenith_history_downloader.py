@@ -16,6 +16,7 @@ import pytest
 from src.zenith_history_downloader import (
     FlightRef,
     parse_flight_list,
+    parse_schedule,
 )
 
 
@@ -99,3 +100,42 @@ def test_filename_strips_leading_zero_on_day():
     # Day 3 — no leading zero, single-letter codes pass through unchanged
     assert "3 JAN" in f.filename
     assert "03 JAN" not in f.filename
+
+
+# --- the schedule fields the listing already carried -----------------------
+
+def test_the_listing_gives_up_its_times_and_aircraft():
+    """The scheduled leg and the aircraft were in the visu_PlanVolLeg string
+    all along; the pattern used to stop at the route and discard them."""
+    html = _flight_row(123456, "BS", 326, "24/05/2026", "CAN", "DAC",
+                       time="05:00-->07:10", aircraft="Boeing 737-800")
+    f = parse_flight_list(html)[0]
+    assert f.sched_dep == "05:00"
+    assert f.sched_arr == "07:10"
+    assert f.aircraft == "Boeing 737-800"
+
+
+def test_a_row_without_times_still_parses_as_before():
+    """Blank must mean 'the listing did not say', never a guessed time."""
+    html = (
+        '<a onclick="javascript:visu_PlanVolLeg(999,73,'
+        "'[BS     326].[24 24/05/2026].[CAN-DAC]')\">link</a>"
+    )
+    f = parse_flight_list(html)[0]
+    assert f.flight_number == "BS326" and f.origin == "CAN"
+    assert f.sched_dep == "" and f.sched_arr == "" and f.aircraft == ""
+
+
+def test_the_roster_keeps_every_leg_that_the_download_list_collapses():
+    """Legs of a multi-leg flight share the parent id_vol. Collapsing on it is
+    right for downloading and wrong for a schedule: it drops legs."""
+    html = (_flight_row(555, "BS", 341, "24/05/2026", "DAC", "CGP")
+            + _flight_row(555, "BS", 341, "24/05/2026", "CGP", "DXB"))
+
+    downloads = parse_flight_list(html)
+    roster = parse_schedule(html)
+
+    assert len(downloads) == 1                      # one file to fetch
+    assert len(roster) == 2                         # two legs to report
+    assert [(f.origin, f.destination) for f in roster] == [
+        ("DAC", "CGP"), ("CGP", "DXB")]

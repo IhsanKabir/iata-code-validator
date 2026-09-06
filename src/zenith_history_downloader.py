@@ -88,6 +88,12 @@ class FlightRef:
     flight_date: str           # 'DD/MM/YYYY'
     origin: str                # IATA code, e.g. 'CAN'
     destination: str           # IATA code, e.g. 'DAC'
+    # The scheduled leg, as the listing states it. Optional so every existing
+    # caller and every row that omits them behaves exactly as before; blank
+    # means the listing did not say, never that the flight has no time.
+    sched_dep: str = ""        # 'HH:MM'
+    sched_arr: str = ""        # 'HH:MM'
+    aircraft: str = ""         # e.g. 'Boeing 737-800'
 
     @property
     def filename(self) -> str:
@@ -130,6 +136,11 @@ _PLANVOL_RE = re.compile(
     r"'\[(?P<airline>[A-Z]+)\s*(?P<number>\d+)\s*\]"
     r"\.\[\d+\s+(?P<date>\d{2}/\d{2}/\d{4})\]"
     r"\.\[(?P<orig>[A-Z]{3})-(?P<dest>[A-Z]{3})\]"
+    # The listing already carries the scheduled times and the aircraft in the
+    # same string; the pattern used to stop at the route and throw them away.
+    # Both are optional so a row that omits them still matches as before.
+    r"(?:\.\[\s*(?P<dep>\d{1,2}:\d{2})\s*-+>\s*(?P<arr>\d{1,2}:\d{2})\s*\])?"
+    r"(?:\.\[(?P<aircraft>[^\]]*)\])?"
 )
 
 
@@ -146,14 +157,32 @@ def parse_flight_list(html: str) -> list[FlightRef]:
         if id_vol in seen:
             continue
         seen.add(id_vol)
-        out.append(FlightRef(
-            id_vol=id_vol,
-            flight_number=f"{m.group('airline')}{m.group('number')}",
-            flight_date=m.group("date"),
-            origin=m.group("orig"),
-            destination=m.group("dest"),
-        ))
+        out.append(_flight_from_match(m))
     return out
+
+
+def _flight_from_match(m) -> FlightRef:
+    return FlightRef(
+        id_vol=m.group("id_vol"),
+        flight_number=f"{m.group('airline')}{m.group('number')}",
+        flight_date=m.group("date"),
+        origin=m.group("orig"),
+        destination=m.group("dest"),
+        sched_dep=(m.group("dep") or "").strip(),
+        sched_arr=(m.group("arr") or "").strip(),
+        aircraft=(m.group("aircraft") or "").strip(),
+    )
+
+
+def parse_schedule(html: str) -> list[FlightRef]:
+    """Every leg in the listing, with nothing de-duplicated away.
+
+    `parse_flight_list` collapses on `id_vol`, which is right for downloading —
+    one Search_Event call per flight — but wrong for a schedule roster: the
+    legs of a multi-leg flight share their parent's `id_vol`, so collapsing
+    keeps only the first and silently drops the rest.
+    """
+    return [_flight_from_match(m) for m in _PLANVOL_RE.finditer(html)]
 
 
 def _validate_date(value: str, field: str) -> None:
