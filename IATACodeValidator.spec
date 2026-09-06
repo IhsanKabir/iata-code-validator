@@ -38,6 +38,8 @@ hiddenimports = [
     "src.counter_master",
     "src.counter_reconcile",
     "src.counter_verify",
+    "src.flight_schedule_report",
+    "src.flight_schedule_history",
     "src.counter_blocks",
     "src.visit_master",
     "src.report_templates",

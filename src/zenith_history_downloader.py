@@ -207,11 +207,15 @@ def list_flights(
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = LIST_MAX_PAGES,
     timeout_s: float = 90.0,
+    schedule: bool = False,
 ) -> list[FlightRef]:
     """Paginate the gestionregulation listing and return every flight.
 
     Date inputs are DD/MM/YYYY. Stops when a page returns fewer flights
     than `page_size` (the last page) or when `max_pages` is hit.
+
+    `schedule=True` returns every leg with its scheduled times and aircraft,
+    for a roster; the default de-duplicates on `id_vol` for downloading.
     """
     _validate_date(date_from, "date_from")
     _validate_date(date_to, "date_to")
@@ -243,7 +247,11 @@ def list_flights(
                 f"Zenith returned {resp.status_code} on flight list — session expired.",
             )
         resp.raise_for_status()
-        page_flights = parse_flight_list(resp.text)
+        # `schedule=True` keeps every leg. The default collapses on id_vol,
+        # which is what downloading wants -- one Search_Event per flight --
+        # and what a roster must not do, since legs share their parent's id.
+        page_flights = (parse_schedule(resp.text) if schedule
+                        else parse_flight_list(resp.text))
         new_flights = [f for f in page_flights if f.id_vol not in seen_ids]
         for f in new_flights:
             seen_ids.add(f.id_vol)
