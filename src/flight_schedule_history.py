@@ -27,7 +27,7 @@ wrong number:
 from __future__ import annotations
 
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -396,3 +396,32 @@ def aggregate(events, roster=None) -> AggregateResult:
             rec.flights_scheduled = scheduled.get(route) or None
 
     return res
+
+
+def detect_period(events):
+    """The month these history rows are about, by majority vote of the dates.
+
+    Asking for a month is asking to be given the wrong one: a run defaulted to
+    today's month once already and relabelled a whole month of another one.
+    The rows carry the flight dates, so the period is read rather than typed.
+
+    Returns (month, year, votes, agreement) -- or (None, None, {}, 0.0) when
+    nothing readable is present.
+    """
+    votes: Counter = Counter()
+    for event in events:
+        flight = getattr(event, "flight", None)
+        raw = (getattr(flight, "flight_date", "") or "").strip()
+        if raw:
+            parts = raw.split("/")
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                votes[(int(parts[1]), int(parts[2]))] += 1
+                continue
+        for change in changes_in_event(event):
+            if change.original_dep is not None:
+                votes[(change.original_dep.month, change.original_dep.year)] += 1
+                break
+    if not votes:
+        return None, None, {}, 0.0
+    (month, year), hits = votes.most_common(1)[0]
+    return month, year, dict(votes), hits / sum(votes.values())

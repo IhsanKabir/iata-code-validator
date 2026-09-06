@@ -285,3 +285,42 @@ def test_nothing_at_all_is_not_an_error():
     res = fsh.aggregate([])
     assert res.changes == [] and res.routes == {} and res.flights == {}
     assert res.passengers == 0 and not res.repetition_observed
+
+
+# --- the period is read, never asked for ----------------------------------
+
+def test_the_period_is_voted_from_the_dates_in_the_files():
+    """Asking for a month is asking to be given the wrong one: a run that
+    defaulted to today's month once relabelled a whole month of another."""
+    aug = _Flight("BS381", "DAC", "RUH", "28/08/2026")
+    events = [_Event(_time_change(date="28/08/2026"),
+                     when=datetime(2026, 8, d, 9, 0), flight=aug)
+              for d in range(1, 6)]
+    month, year, _votes, agree = fsh.detect_period(events)
+    assert (month, year) == (8, 2026)
+    assert agree == 1.0
+
+
+def test_a_folder_spanning_months_reports_low_agreement_not_a_clean_answer():
+    aug = _Flight("BS381", "DAC", "RUH", "28/08/2026")
+    jul = _Flight("BS381", "DAC", "RUH", "28/07/2026")
+    events = ([_Event(_time_change(), when=datetime(2026, 8, 1, 9, 0),
+                      flight=aug)] * 3
+              + [_Event(_time_change(), when=datetime(2026, 7, 1, 9, 0),
+                        flight=jul)] * 2)
+    month, year, _votes, agree = fsh.detect_period(events)
+    assert (month, year) == (8, 2026)
+    assert agree < 1.0            # the caller must be able to say "mixed"
+
+
+def test_the_departure_being_moved_dates_a_row_with_no_flight_cell():
+    res = fsh.detect_period([_Event(_time_change(date="28/08/2026"),
+                                    when=datetime(2026, 8, 1, 9, 0),
+                                    flight=_Flight())])
+    assert res[:2] == (8, 2026)
+
+
+def test_files_with_no_readable_date_say_so_rather_than_guessing():
+    month, year, votes, agree = fsh.detect_period(
+        [_Event("nothing", when=None, etype="Ticket Modification")])
+    assert month is None and year is None and votes == {} and agree == 0.0

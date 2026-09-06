@@ -345,10 +345,6 @@ class App(WhatsAppMixin, HealthMixin):
         self._vis_stop_flag = threading.Event()
         self._vis_worker: threading.Thread | None = None
         self._ctr_period_worker: threading.Thread | None = None
-        self.fsh_input_dir = tk.StringVar(value="")
-        self.fsh_output_dir = tk.StringVar(value=str(Path.home()))
-        self.fsh_month = tk.StringVar(value=f"{_today.month:02d}")
-        self.fsh_year = tk.IntVar(value=_today.year)
         self.fsh_with_roster = tk.BooleanVar(value=False)
         self._fsh_stop_flag = threading.Event()
         self._fsh_worker: threading.Thread | None = None
@@ -4336,6 +4332,12 @@ class App(WhatsAppMixin, HealthMixin):
                 f"    time changed {info.get('time', 0):,} · "
                 f"swapped {info.get('swaps', 0):,} · "
                 f"cancelled {info.get('cancelled', 0):,}")
+            if info.get("agreement", 1.0) < 0.6:
+                # a folder spanning several months is a real thing to know
+                self._fsh_log(
+                    f"    only {info.get('agreement', 0):.0%} of the dates fall "
+                    f"in {info.get('month', 0):02d}/{info.get('year', 0)} — "
+                    f"these files span more than one month")
             if not info.get("repetition"):
                 # the passenger counts rest on this; say so rather than imply
                 self._fsh_log(
@@ -5879,16 +5881,13 @@ class App(WhatsAppMixin, HealthMixin):
         counter_inner = ttk.Frame(inner_nb)
         visits_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
-        sched_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
         inner_nb.add(history_inner, text="Flight History Analyzer")
         inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
         inner_nb.add(counter_inner, text="Counter Activity")
         inner_nb.add(visits_inner, text="Agency Visits")
-        inner_nb.add(sched_inner, text="Flight Schedule History")
         inner_nb.add(reports_inner, text="Reports")
-        self._build_zenith_schedule_tab(sched_inner)
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
         self._build_zenith_counter_tab(counter_inner)
@@ -7081,99 +7080,12 @@ class App(WhatsAppMixin, HealthMixin):
             "control_change": result.control_change,
         })
 
-    # ------------------------------------------------------------------
-    # Flight Schedule History — how often a flight moved, by route
-    # ------------------------------------------------------------------
-    def _build_zenith_schedule_tab(self, parent: ttk.Frame) -> None:
-        parent = self._make_scrollable(parent)
-        sec = self._section(
-            parent, "Flight Schedule History",
-            help_text=(
-                "How many times each flight's date or time changed, how often "
-                "it was swapped or cancelled, and by how much — per flight and "
-                "per route, over a period. Reads the same ModificationHistory "
-                "exports the Flight History Analyzer uses."
-            ),
-        )
-
-        body = ttk.Frame(sec)
-        body.pack(fill="x", padx=2, pady=(0, 4))
-        ttk.Label(body, text="History files:", width=16, anchor="w").grid(
-            row=0, column=0, sticky="w", padx=(2, 4), pady=4)
-        ttk.Entry(body, textvariable=self.fsh_input_dir, width=58).grid(
-            row=0, column=1, sticky="ew", padx=(0, 4), pady=4)
-        ttk.Button(body, text="Browse…",
-                   command=self._fsh_pick_input).grid(row=0, column=2,
-                                                      padx=(4, 2), pady=4)
-        ttk.Label(body, text="Save report to:", width=16, anchor="w").grid(
-            row=1, column=0, sticky="w", padx=(2, 4), pady=4)
-        ttk.Entry(body, textvariable=self.fsh_output_dir, width=58).grid(
-            row=1, column=1, sticky="ew", padx=(0, 4), pady=4)
-        ttk.Button(body, text="Browse…",
-                   command=self._fsh_pick_output).grid(row=1, column=2,
-                                                       padx=(4, 2), pady=4)
-        body.columnconfigure(1, weight=1)
-
-        prow = ttk.Frame(sec)
-        prow.pack(fill="x", padx=2, pady=(2, 0))
-        ttk.Label(prow, text="Month:").pack(side="left", padx=(2, 4))
-        ttk.Combobox(prow, textvariable=self.fsh_month, state="readonly",
-                     width=5,
-                     values=[f"{m:02d}" for m in range(1, 13)]).pack(side="left")
-        ttk.Label(prow, text="   Year:").pack(side="left", padx=(8, 4))
-        ttk.Spinbox(prow, from_=2020, to=2100, width=7,
-                    textvariable=self.fsh_year).pack(side="left")
-        ttk.Label(prow, style="Hint.TLabel",
-                  text="   Titles the report; the files themselves decide what "
-                       "is counted.").pack(side="left")
-
-        roster = self._section(
-            parent, "Scheduling details",
-            help_text=(
-                "Ticking this fetches the flight roster for the month — the "
-                "scheduled times and aircraft — which also supplies the "
-                "denominator for 'share of flights changed'. Without it that "
-                "share is left blank rather than guessed. Needs a Zenith "
-                "sign-in."
-            ),
-        )
-        ttk.Checkbutton(
-            roster, variable=self.fsh_with_roster,
-            text="Fetch the flight roster from Zenith (adds the Schedule sheet)",
-        ).pack(anchor="w", padx=2, pady=(0, 4))
-
-        ctl = ttk.Frame(parent)
-        ctl.pack(fill="x", padx=4, pady=(8, 4))
-        self.btn_fsh_run = ttk.Button(
-            ctl, text="Build schedule history", command=self._fsh_run,
-            style="Accent.TButton")
-        self.btn_fsh_run.pack(side="left")
-        self.btn_fsh_stop = ttk.Button(ctl, text="Stop", command=self._fsh_stop,
-                                       state="disabled",
-                                       style="Danger.TButton")
-        self.btn_fsh_stop.pack(side="left", padx=(8, 0))
-        self.fsh_progress_label = ttk.Label(ctl, text="", style="Hint.TLabel")
-        self.fsh_progress_label.pack(side="left", padx=(10, 0))
-
-        self.fsh_log = tk.Text(parent, height=12, wrap="word")
-        self.fsh_log.pack(fill="both", expand=True, padx=4, pady=(4, 8))
-
-    def _fsh_pick_input(self) -> None:
-        d = filedialog.askdirectory(
-            title="Folder holding the ModificationHistory files")
-        if d:
-            self.fsh_input_dir.set(d)
-
-    def _fsh_pick_output(self) -> None:
-        d = filedialog.askdirectory(title="Choose output folder")
-        if d:
-            self.fsh_output_dir.set(d)
-
     def _fsh_log(self, msg: str) -> None:
+        """One status line. The tab already has a summary pane, so a second
+        log box would only compete with it."""
         try:
-            self.fsh_log.insert("end", msg + "\n")
-            self.fsh_log.see("end")
-        except Exception:                          # noqa: BLE001 - UI only
+            self.fsh_progress_label.configure(text=msg)
+        except Exception:   # noqa: BLE001 - UI only
             pass
 
     def _fsh_stop(self) -> None:
@@ -7183,11 +7095,12 @@ class App(WhatsAppMixin, HealthMixin):
     def _fsh_run(self) -> None:
         if self._fsh_worker is not None and self._fsh_worker.is_alive():
             return
-        folder = (self.fsh_input_dir.get() or "").strip()
+        folder = (self.zenith_fh_input_dir.get() or "").strip()
         if not folder or not Path(folder).is_dir():
             messagebox.showerror(
-                "Flight Schedule History",
-                "Choose the folder holding the ModificationHistory files.")
+                "Flight schedule history",
+                "Pick the logs folder in 'Folders' above first — the same "
+                "ModificationHistory files the history audit reads.")
             return
         if self.fsh_with_roster.get() and self._zenith_session is None:
             messagebox.showerror(
@@ -7198,18 +7111,17 @@ class App(WhatsAppMixin, HealthMixin):
         self._fsh_stop_flag.clear()
         self.btn_fsh_run.configure(state="disabled")
         self.btn_fsh_stop.configure(state="normal")
-        self.fsh_log.delete("1.0", "end")
         self._fsh_log(f"Reading history files from {folder}…")
         self._fsh_worker = threading.Thread(
             target=self._fsh_worker_run,
             args=(Path(folder),
-                  Path(self.fsh_output_dir.get().strip() or str(Path.home())),
-                  int(self.fsh_month.get()), int(self.fsh_year.get()),
+                  Path(self.zenith_fh_output_dir.get().strip()
+                       or str(Path.home())),
                   self._zenith_session if self.fsh_with_roster.get() else None),
             daemon=True)
         self._fsh_worker.start()
 
-    def _fsh_worker_run(self, folder, out_dir, month, year, session) -> None:
+    def _fsh_worker_run(self, folder, out_dir, session) -> None:
         from . import flight_schedule_history as fsh
         from . import flight_schedule_report as fsr
         from . import zenith_history_parser as hp
@@ -7231,6 +7143,18 @@ class App(WhatsAppMixin, HealthMixin):
                     self._post(MSG_FSH_LOG,
                                f"  skipped {path.name}: {exc}")
 
+            # The month is voted from the dates in the files. Asking for one
+            # is asking to be given the wrong one: a run that defaulted to
+            # today's month once relabelled a whole month of another.
+            month, year, _votes, agree = fsh.detect_period(events)
+            if month is None:
+                raise ValueError(
+                    "These files carry no readable flight date, so the period "
+                    "cannot be established.")
+            self._post(MSG_FSH_LOG,
+                       f"Period read from the files: {month:02d}/{year} "
+                       f"({agree:.0%} agreement)")
+
             roster = None
             if session is not None:
                 self._post(MSG_FSH_LOG, "Fetching the flight roster…")
@@ -7248,6 +7172,7 @@ class App(WhatsAppMixin, HealthMixin):
 
         self._post(MSG_FSH_DONE, {
             "path": str(path), "files": len(files),
+            "month": month, "year": year, "agreement": agree,
             "events": res.events_read, "changes": len(res.changes),
             "time": res.n_time, "swaps": res.n_swaps,
             "cancelled": res.n_cancelled,
@@ -7702,6 +7627,39 @@ class App(WhatsAppMixin, HealthMixin):
             style="Hint.TLabel",
         )
         self.zenith_fh_status_label.pack(side="left", padx=(12, 0))
+
+        # ----- Flight schedule history -----
+        # Same folder, same files, a different question: the audit above reads
+        # them per PNR to judge a reissue; this reads them per FLIGHT to count
+        # how often the schedule itself moved. No month is asked for -- it is
+        # voted from the dates in the files, because a run that defaults to
+        # today's month relabels somebody else's month.
+        sched_body = self._section(
+            parent, "Flight schedule history",
+            help_text=(
+                "How many times each flight's date or time changed, how often "
+                "it was swapped or cancelled, by how much and how late — per "
+                "flight and per route. Uses the folder above; the period is "
+                "read from the files."
+            ),
+        )
+        sched_row = ttk.Frame(sched_body)
+        sched_row.pack(fill="x", padx=2, pady=(0, 2))
+        self.btn_fsh_run = ttk.Button(
+            sched_row, text="Build schedule history", command=self._fsh_run)
+        self.btn_fsh_run.pack(side="left")
+        self.btn_fsh_stop = ttk.Button(
+            sched_row, text="Stop", command=self._fsh_stop, state="disabled",
+            style="Danger.TButton")
+        self.btn_fsh_stop.pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            sched_row, variable=self.fsh_with_roster,
+            text="also fetch the roster (scheduled times, aircraft, and the "
+                 "share of flights changed) — needs sign-in",
+        ).pack(side="left", padx=(12, 0))
+        self.fsh_progress_label = ttk.Label(sched_body, text="",
+                                            style="Hint.TLabel")
+        self.fsh_progress_label.pack(anchor="w", padx=2)
 
         # ----- Progress + results summary -----
         prog_body = self._section(parent, "Progress")

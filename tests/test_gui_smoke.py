@@ -160,3 +160,18 @@ def test_wide_grids_have_horizontal_scrollbars(app):
         tree = getattr(app, attr)
         assert str(tree.cget("xscrollcommand")), f"{attr} lacks xscrollcommand"
         assert str(tree.cget("yscrollcommand")), f"{attr} lacks yscrollcommand"
+
+
+def test_the_schedule_history_section_lives_in_the_history_tab(app):
+    """It reads the same folder and the same files as the history audit, so a
+    tab of its own would have duplicated three pickers to add one button."""
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    labels = {str(b.cget("text")).strip() for b in _all_buttons(app.root)}
+    assert "Build schedule history" in labels
+    # and it owns no folder pickers of its own
+    assert not hasattr(app, "fsh_input_dir")
+    assert not hasattr(app, "fsh_output_dir")
+    # nor a month picker: the period is read from the files
+    assert not hasattr(app, "fsh_month")
+    assert not hasattr(app, "fsh_year")
