@@ -2119,6 +2119,7 @@ FLIGHT_LOAD_FORMATS = (
     "Cross-tab (Ordered layout)",
     "Load Factor in Seats",
     "Daily Flight Load snapshot",
+    "Airline schedule",
 )
 
 # how many forward dates a snapshot sheet shows, matching the ops team's file
@@ -2381,5 +2382,6 @@ def build_flight_load_format_path(folder: Path, fmt: str, stem_dt=None) -> Path:
         "Cross-tab (Ordered layout)": "flight_loads_ordered",
         "Load Factor in Seats": "load_factor_seats",
         "Daily Flight Load snapshot": "daily_flight_load",
+        "Airline schedule": "airline_schedule",
     }.get(fmt, "flight_loads_extra")
     return folder / f"{slug}_{ts}.xlsx"

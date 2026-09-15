@@ -175,3 +175,44 @@ def test_the_schedule_history_section_lives_in_the_history_tab(app):
     # nor a month picker: the period is read from the files
     assert not hasattr(app, "fsh_month")
     assert not hasattr(app, "fsh_year")
+
+
+def test_the_flight_loads_tab_can_draw_the_schedule_from_the_last_pull(app):
+    """The schedule needs no second search: the flight listing already carries
+    every leg's own local time, aircraft and tail number."""
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    labels = {str(b.cget("text")).strip() for b in _all_buttons(app.root)}
+    assert "Draw airline schedule…" in labels
+    # disabled until a pull has actually produced rows
+    assert str(app.btn_zenith_fl_schedule.cget("state")) == "disabled"
+
+
+def test_an_extra_report_format_still_finishes_the_run(app, monkeypatch, tmp_path):
+    """Choosing any format other than the flat one used to return early, which
+    left the rows unretained, the Append and Schedule buttons disabled, the
+    legs grid empty and Stop still live — a finished pull that looked hung."""
+    from src import excel_io, zenith_client
+
+    rows = [object()]
+    monkeypatch.setattr(zenith_client, "fetch_flight_loads",
+                        lambda *a, **k: rows)
+    monkeypatch.setattr(excel_io, "write_zenith_flight_loads",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(excel_io, "write_flight_loads_daily_snapshots",
+                        lambda *a, **k: [])
+    posted: list = []
+    monkeypatch.setattr(app, "_post", lambda kind, payload=None:
+                        posted.append(kind))
+
+    app._zenith_fl_last_rows = []
+    app._zenith_fl_worker_run({
+        "date_from": "01/09/2026", "date_to": "06/09/2026",
+        "page_size": 100, "chunk_days": 5, "delay_s": 0.0,
+        "out_path": tmp_path / "loads.xlsx",
+        "fmt": "Daily Flight Load snapshot",
+    })
+
+    from src.gui import MSG_ZENITH_FL_DONE
+    assert MSG_ZENITH_FL_DONE in posted     # the run reports that it finished
+    assert app._zenith_fl_last_rows == rows  # and the rows are still usable

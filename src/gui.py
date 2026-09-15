@@ -4649,6 +4649,7 @@ class App(WhatsAppMixin, HealthMixin):
             self._zenith_fl_reset_buttons()
             # The Ordered-Report appender is now actionable.
             self.btn_zenith_fl_append_ordered.configure(state="normal")
+            self.btn_zenith_fl_schedule.configure(state="normal")
             # Populate the per-leg drill-down grid for passenger detail.
             self._zenith_fl_populate_legs()
             messagebox.showinfo(
@@ -7358,6 +7359,14 @@ class App(WhatsAppMixin, HealthMixin):
             state="disabled",
         )
         self.btn_zenith_fl_append_ordered.pack(side="left", padx=(8, 0))
+        # Draws from the rows the pull already returned: the airline schedule
+        # needs no second search, because the flight listing carries it.
+        self.btn_zenith_fl_schedule = ttk.Button(
+            ctl, text="Draw airline schedule…",
+            command=self._zenith_fl_draw_schedule,
+            state="disabled",
+        )
+        self.btn_zenith_fl_schedule.pack(side="left", padx=(8, 0))
 
         # ----- Per-leg drill-down: passenger manifest -----
         legs_body = self._section(
@@ -9513,6 +9522,16 @@ class App(WhatsAppMixin, HealthMixin):
                     # a Domestic AND an International workbook, matching how the
                     # ops team's files arrive (their sector rides on the filename)
                     written = excel_io.write_flight_loads_daily_snapshots(out_dir, rows)
+                elif fmt == "Airline schedule":
+                    # the schedule for the period just searched, from these
+                    # same rows -- the listing already carried every leg's own
+                    # local time, aircraft and tail number
+                    from . import airline_schedule
+                    dest = excel_io.build_flight_load_format_path(out_dir, fmt)
+                    airline_schedule.write_airline_schedule(
+                        dest, rows, date_from=cfg["date_from"],
+                        date_to=cfg["date_to"])
+                    written = [dest]
                 for dest in written:
                     self._post(MSG_ZENITH_FL_LOG, f"{fmt} written: {dest}")
             except Exception as exc:  # noqa: BLE001
@@ -9520,11 +9539,65 @@ class App(WhatsAppMixin, HealthMixin):
                 self._post(MSG_ZENITH_FL_LOG,
                            f"[WARN] {fmt} could not be written ({exc}). "
                            "The flat rows workbook was still saved.")
-            return
+            # and then FALL THROUGH. This used to return, which meant choosing
+            # any format other than the flat one left the rows unretained, the
+            # Append and Schedule buttons disabled, the legs grid empty and the
+            # Stop button still live -- a finished pull that looked hung.
         # Keep the rows in memory so the user can later append them to
         # an Ordered Report without re-running the fetch.
         self._zenith_fl_last_rows = rows
         self._post(MSG_ZENITH_FL_DONE, str(cfg["out_path"]))
+
+    def _zenith_fl_draw_schedule(self) -> None:
+        """Write the airline schedule for the period already searched.
+
+        Nothing is fetched: a Flight Loads pull returns every leg with its own
+        local time range, the aircraft and the tail number, which is the
+        schedule. Re-searching to get it would be asking twice for one answer.
+        """
+        if not self._zenith_fl_last_rows:
+            messagebox.showinfo(
+                "Draw airline schedule",
+                "Run a Flight Loads pull first — the schedule is drawn from "
+                "the rows that pull returns.",
+            )
+            return
+        f = filedialog.asksaveasfilename(
+            title="Save the airline schedule",
+            initialdir=self.zenith_fl_output_dir.get().strip()
+            or str(Path.home()),
+            initialfile="airline_schedule.xlsx",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not f:
+            return
+        from . import airline_schedule
+        try:
+            airline_schedule.write_airline_schedule(
+                Path(f), self._zenith_fl_last_rows,
+                date_from=self.zenith_fl_date_from.get().strip(),
+                date_to=self.zenith_fl_date_to.get().strip(),
+            )
+            res = airline_schedule.build(self._zenith_fl_last_rows)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Airline schedule write failed")
+            messagebox.showerror("Draw airline schedule — Error",
+                                 f"{type(exc).__name__}: {exc}")
+            return
+        self._zenith_fl_log(
+            f"Airline schedule written: {len(res.legs):,} leg(s), "
+            f"{res.flights:,} flight(s), {len(res.routes):,} route(s) -> {f}")
+        messagebox.showinfo(
+            "Draw airline schedule — Done",
+            f"Saved to: {f}\n\n"
+            f"  Legs:    {len(res.legs):,}\n"
+            f"  Flights: {res.flights:,}\n"
+            f"  Routes:  {len(res.routes):,}\n"
+            f"  Arriving next day: {res.crossing_midnight:,}\n"
+            f"  Operating on a later date than filed: "
+            f"{res.filed_under_another_date:,}",
+        )
 
     def _zenith_fl_append_ordered(self) -> None:
         """Append the last run's rows to a user-picked Ordered Report file."""

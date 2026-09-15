@@ -96,10 +96,11 @@ def test_format_paths_are_distinct_and_labelled():
     assert FLIGHT_LOAD_FORMATS[0] == "Flat rows only"
     made = {build_flight_load_format_path(__import__("pathlib").Path("."), f).name
             for f in FLIGHT_LOAD_FORMATS[1:]}
-    assert len(made) == 3                       # one filename per format, no clashes
+    assert len(made) == 4                       # one filename per format, no clashes
     assert any(n.startswith("load_factor_seats_") for n in made)
     assert any(n.startswith("daily_flight_load_") for n in made)
     assert any(n.startswith("flight_loads_ordered_") for n in made)
+    assert any(n.startswith("airline_schedule_") for n in made)
 
 
 def test_seats_report_totals_match_the_pulled_rows(tmp_path):
