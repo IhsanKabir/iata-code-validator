@@ -136,6 +136,10 @@ class ScheduledLeg:
     seats: int | None = None
     cabins: int = 0
     order: int = 0              # 1-based position within the flight that day
+    #: Cabins already counted into `seats`. No duplicate cabin row appeared in
+    #: the 2,528-row export this was built against, but summing one twice would
+    #: report an aircraft bigger than it is.
+    counted_cabins: set = field(default_factory=set)
 
     @property
     def sector(self) -> str:
@@ -168,6 +172,56 @@ class ScheduleResult:
     @property
     def flights(self) -> int:
         return len({(l.flight_number, l.flight_date) for l in self.legs})
+
+    @property
+    def _dates(self) -> list:
+        return sorted({l.leg_date for l in self.legs if l.leg_date})
+
+    @property
+    def first_date(self):
+        got = self._dates
+        return got[0] if got else None
+
+    @property
+    def last_date(self):
+        got = self._dates
+        return got[-1] if got else None
+
+    @property
+    def dates_covered(self) -> int:
+        return len(self._dates)
+
+    @property
+    def covered_span(self) -> str:
+        """The period these legs cover, read off the legs themselves.
+
+        The heading states this rather than a typed range: the same rows were
+        once labelled 01/09 to 06/09 while carrying all 30 dates of September,
+        and a heading naming a period it does not contain is worse than none.
+        """
+        if self.first_date is None:
+            return "no dated legs"
+        if self.first_date == self.last_date:
+            return f"{self.first_date:%d %b %Y}"
+        return f"{self.first_date:%d %b %Y} to {self.last_date:%d %b %Y}"
+
+    @property
+    def searched_span(self) -> str:
+        if self.date_from and self.date_to:
+            return f"{self.date_from} to {self.date_to}"
+        return ""
+
+    @property
+    def range_disagrees(self) -> bool:
+        """Was a period asked for that these legs do not sit inside?"""
+        if self.first_date is None or not (self.date_from and self.date_to):
+            return False
+        try:
+            want_a = datetime.strptime(self.date_from, "%d/%m/%Y").date()
+            want_b = datetime.strptime(self.date_to, "%d/%m/%Y").date()
+        except ValueError:
+            return False
+        return self.first_date < want_a or self.last_date > want_b
 
     @property
     def routes(self) -> Counter:
@@ -222,6 +276,10 @@ def build(rows, *, date_from: str = "", date_to: str = "") -> ScheduleResult:
                 inventory_status=(_txt(getattr(r, "inventory_status", ""))
                                   or NOT_WRITTEN),
             )
+        cabin = _txt(getattr(r, "leg_cabin", "")) or "(cabin not written)"
+        if cabin in leg.counted_cabins:
+            continue                    # the same cabin twice: already counted
+        leg.counted_cabins.add(cabin)
         leg.cabins += 1
         cap = _capacity(getattr(r, "seats_available", ""))
         if cap is not None:
@@ -233,14 +291,17 @@ def build(rows, *, date_from: str = "", date_to: str = "") -> ScheduleResult:
     for leg in merged.values():
         by_flight.setdefault((leg.flight_number, leg.flight_date), []).append(leg)
     for group in by_flight.values():
-        group.sort(key=lambda l: (l.leg_date or date.min, _minutes(l.dep)))
+        group.sort(key=lambda l: (l.leg_date is None, l.leg_date or date.min,
+                                  not l.dep, _minutes(l.dep)))
         for i, leg in enumerate(group, start=1):
             leg.order = i
 
+    # Undated legs sort LAST. Treating an unreadable time as 00:00 put them at
+    # the top of the sheet, where they read as the day's first departures.
     res.legs = sorted(
         merged.values(),
-        key=lambda l: (l.leg_date or date.min, _minutes(l.dep),
-                       l.flight_number, l.order))
+        key=lambda l: (l.leg_date is None, l.leg_date or date.min,
+                       not l.dep, _minutes(l.dep), l.flight_number, l.order))
     return res
 
 
@@ -269,8 +330,12 @@ def _note(ws, r, text, span=17):
 
 
 def write_airline_schedule(path, rows, *, date_from: str = "",
-                           date_to: str = "") -> None:
-    """Write the schedule workbook for the period that was searched."""
+                           date_to: str = "") -> ScheduleResult:
+    """Write the schedule workbook.
+
+    Returns what it wrote, so a caller reporting on the export does not have to
+    parse every row a second time.
+    """
     res = build(rows, date_from=date_from, date_to=date_to)
 
     wb = Workbook()
@@ -278,10 +343,11 @@ def write_airline_schedule(path, rows, *, date_from: str = "",
     ws.title = "Airline Schedule"
     ws.sheet_view.showGridLines = False
 
-    span = f"{date_from} to {date_to}" if date_from and date_to else "the pull"
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=17)
     t = ws.cell(row=1, column=1,
-                value=f"  AIRLINE SCHEDULE  ·  {span}")
+                value=f"  AIRLINE SCHEDULE  ·  {res.covered_span}"
+                      + ("   ·   CHECK THE RANGE" if res.range_disagrees
+                         else ""))
     t.font = Font(bold=True, size=15, color="FFFFFF", name="Segoe UI")
     t.fill = PatternFill("solid", fgColor=NAVY)
     ws.row_dimensions[1].height = 30
@@ -290,7 +356,15 @@ def write_airline_schedule(path, rows, *, date_from: str = "",
         ws, 2,
         f"{len(res.legs):,} leg(s) across {res.flights:,} flight(s), drawn from "
         f"the {res.rows_read:,} row(s) this Flight Loads search already "
-        f"returned — nothing was fetched again. Times are each LEG's own local "
+        f"returned — nothing was fetched again. The heading is the period these "
+        f"legs COVER ({res.dates_covered:,} date(s)), read off the legs "
+        f"themselves rather than a range typed into a box."
+        + (f"  You searched {res.searched_span}, which these legs do not sit "
+           f"inside — they are the rows the last pull returned, so the search "
+           f"boxes may have changed since."
+           if res.range_disagrees
+           else f"  Searched {res.searched_span}." if res.searched_span else "")
+        + f"  Times are each LEG's own local "
         f"range, not the flight's single departure time, which repeats across "
         f"legs and cannot order them."
         + (f"  {res.crossing_midnight:,} leg(s) arrive the next day."
@@ -337,6 +411,7 @@ def write_airline_schedule(path, rows, *, date_from: str = "",
 
     _write_by_route(wb.create_sheet("By route"), res)
     wb.save(path)
+    return res
 
 
 def _write_by_route(ws, res: ScheduleResult) -> None:

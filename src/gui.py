@@ -7494,6 +7494,9 @@ class App(WhatsAppMixin, HealthMixin):
         # Last run's rows — re-used by 'Append to Ordered Report' and the
         # passenger drill-down. tree iid (str index) maps back into this.
         self._zenith_fl_last_rows: list = []
+        #: the range the retained rows came from, so a later export cannot be
+        #: labelled with whatever the date boxes happen to say at the time
+        self._zenith_fl_last_range: tuple = ("", "")
         self._zenith_pax_worker: threading.Thread | None = None
         self._zenith_pax_stop_flag = threading.Event()
 
@@ -9546,6 +9549,7 @@ class App(WhatsAppMixin, HealthMixin):
         # Keep the rows in memory so the user can later append them to
         # an Ordered Report without re-running the fetch.
         self._zenith_fl_last_rows = rows
+        self._zenith_fl_last_range = (cfg["date_from"], cfg["date_to"])
         self._post(MSG_ZENITH_FL_DONE, str(cfg["out_path"]))
 
     def _zenith_fl_draw_schedule(self) -> None:
@@ -9574,12 +9578,15 @@ class App(WhatsAppMixin, HealthMixin):
             return
         from . import airline_schedule
         try:
-            airline_schedule.write_airline_schedule(
+            # The range comes from the pull that produced these rows, not from
+            # the boxes, which the user may have retyped since. The sheet then
+            # states the period the legs actually cover and flags a mismatch,
+            # so the heading cannot name a period the data does not contain.
+            searched = self._zenith_fl_last_range
+            res = airline_schedule.write_airline_schedule(
                 Path(f), self._zenith_fl_last_rows,
-                date_from=self.zenith_fl_date_from.get().strip(),
-                date_to=self.zenith_fl_date_to.get().strip(),
+                date_from=searched[0], date_to=searched[1],
             )
-            res = airline_schedule.build(self._zenith_fl_last_rows)
         except Exception as exc:  # noqa: BLE001
             log.exception("Airline schedule write failed")
             messagebox.showerror("Draw airline schedule — Error",

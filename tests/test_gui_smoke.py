@@ -205,7 +205,10 @@ def test_an_extra_report_format_still_finishes_the_run(app, monkeypatch, tmp_pat
     monkeypatch.setattr(app, "_post", lambda kind, payload=None:
                         posted.append(kind))
 
-    app._zenith_fl_last_rows = []
+    # the app fixture is module-scoped, so this state is restored rather than
+    # left dirty for whatever test runs next
+    monkeypatch.setattr(app, "_zenith_fl_last_rows", [], raising=False)
+    monkeypatch.setattr(app, "_zenith_fl_last_range", ("", ""), raising=False)
     app._zenith_fl_worker_run({
         "date_from": "01/09/2026", "date_to": "06/09/2026",
         "page_size": 100, "chunk_days": 5, "delay_s": 0.0,

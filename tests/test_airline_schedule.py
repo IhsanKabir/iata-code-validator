@@ -211,3 +211,94 @@ def test_building_is_deterministic():
     shape = lambda r: [(l.flight_number, l.route, l.order, l.dep)
                        for l in r.legs]
     assert shape(asch.build(rows)) == shape(asch.build(rows))
+
+
+# --- the heading must never name a period the legs do not cover ----------
+
+def test_the_heading_states_the_period_the_legs_actually_cover(tmp_path):
+    """These very rows were once labelled '01/09 to 06/09' while carrying all
+    30 dates of September. A heading that names a period it does not contain
+    is worse than no heading."""
+    rows = [_Row("BS341", f"{d:02d}/09/2026", "DAC-CGP",
+                 f"{d:02d}/09/2026 05:00 - 07:00") for d in (1, 15, 30)]
+    out = tmp_path / "s.xlsx"
+    res = asch.write_airline_schedule(out, rows, date_from="01/09/2026",
+                                      date_to="06/09/2026")
+    assert res.covered_span == "01 Sep 2026 to 30 Sep 2026"
+    assert res.dates_covered == 3
+    assert res.range_disagrees
+    text = " ".join(str(c.value) for row in
+                    load_workbook(out, data_only=True)["Airline Schedule"]
+                    .iter_rows() for c in row if c.value)
+    assert "01 Sep 2026 to 30 Sep 2026" in text
+    assert "CHECK THE RANGE" in text
+    assert "which these legs do not sit inside" in text
+
+
+def test_a_matching_range_is_not_flagged(tmp_path):
+    rows = [_Row("BS341", "02/09/2026", "DAC-CGP",
+                 "02/09/2026 05:00 - 07:00")]
+    out = tmp_path / "s.xlsx"
+    res = asch.write_airline_schedule(out, rows, date_from="01/09/2026",
+                                      date_to="06/09/2026")
+    assert not res.range_disagrees
+    text = " ".join(str(c.value) for row in
+                    load_workbook(out, data_only=True)["Airline Schedule"]
+                    .iter_rows() for c in row if c.value)
+    assert "CHECK THE RANGE" not in text
+    assert "Searched 01/09/2026 to 06/09/2026" in text
+
+
+def test_one_day_of_legs_reads_as_a_single_date():
+    res = asch.build([_Row("BS341", "01/09/2026", "DAC-CGP",
+                           "01/09/2026 05:00 - 07:00")])
+    assert res.covered_span == "01 Sep 2026"
+
+
+def test_no_dated_legs_says_so_rather_than_inventing_a_span():
+    res = asch.build([_Row("BS341", "01/09/2026", "DAC-CGP", "sometime")])
+    assert res.covered_span == "no dated legs"
+    assert res.first_date is None and res.dates_covered == 0
+
+
+# --- the remaining latent traps -----------------------------------------
+
+def test_the_same_cabin_twice_cannot_inflate_the_aircraft():
+    """No duplicate cabin row appeared in the 2,528-row export, but summing
+    one twice would report an aircraft bigger than it is."""
+    row = _Row("BS101", "01/09/2026", "DAC-CGP", "01/09/2026 07:00 - 07:55",
+               seats="2/72 97%")
+    res = asch.build([row, row])
+    (leg,) = res.legs
+    assert leg.cabins == 1
+    assert leg.seats == 72          # not 144
+
+
+def test_different_cabins_still_sum():
+    res = asch.build([
+        _Row("BS101", "01/09/2026", "DAC-CGP", "01/09/2026 07:00 - 07:55",
+             seats="2/72 97%"),
+        _Row("BS101", "01/09/2026", "DAC-CGP", "01/09/2026 07:00 - 07:55",
+             seats="0/8 100%", cabin="Business"),
+    ])
+    assert res.legs[0].seats == 80
+
+
+def test_a_leg_with_no_readable_time_sorts_last_not_first():
+    """Treating an unreadable range as 00:00 put it at the top of the sheet,
+    where it read as the day's first departure."""
+    res = asch.build([
+        _Row("BS999", "01/09/2026", "DAC-ZYL", "not a time"),
+        _Row("BS341", "01/09/2026", "DAC-CGP", "01/09/2026 05:00 - 07:00"),
+    ])
+    assert [l.flight_number for l in res.legs] == ["BS341", "BS999"]
+
+
+def test_the_writer_hands_back_what_it_wrote(tmp_path):
+    """So a caller reporting on the export need not re-parse every row."""
+    out = tmp_path / "s.xlsx"
+    res = asch.write_airline_schedule(
+        out, [_Row("BS341", "01/09/2026", "DAC-CGP",
+                   "01/09/2026 05:00 - 07:00")])
+    assert isinstance(res, asch.ScheduleResult)
+    assert len(res.legs) == 1
