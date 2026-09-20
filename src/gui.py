@@ -33,6 +33,7 @@ import threading
 import time
 import tkinter as tk
 import winsound
+from datetime import date, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -138,6 +139,11 @@ MSG_ZENITH_PAX_DONE = "zenith_pax_done"          # payload: dict(path, legs, pax
 MSG_ZENITH_PAX_ERROR = "zenith_pax_error"
 MSG_ZENITH_FL_DONE = "zenith_fl_done"           # payload: str(output path)
 MSG_ZENITH_FL_ERROR = "zenith_fl_error"
+# Zenith Sales Movement sub-tab — who is up and who is down, against their
+# own trailing average. Local only: it reads the sales warehouse, never Zenith.
+MSG_SM_LOG = "sm_log"               # payload: str
+MSG_SM_DONE = "sm_done"             # payload: dict(summary + rows + path)
+MSG_SM_ERROR = "sm_error"           # payload: str
 # Zenith Flight Schedule History sub-tab
 MSG_FSH_PROGRESS = "fsh_progress"   # (done, total, filename)
 MSG_FSH_LOG = "fsh_log"             # payload: str
@@ -4315,6 +4321,52 @@ class App(WhatsAppMixin, HealthMixin):
             self.fsh_progress_label.configure(text=f"{done}/{total} · {name}")
         elif kind == MSG_FSH_LOG:
             self._fsh_log(str(payload))
+        elif kind == MSG_SM_LOG:
+            self._sm_log(str(payload))
+        elif kind == MSG_SM_ERROR:
+            self._sm_log("Failed.")
+            self.btn_sm_run.configure(state="normal")
+            # A failed run leaves any earlier workbook untouched and still
+            # openable, so the button goes back to whatever it was.
+            self.btn_sm_open.configure(
+                state="normal" if self._sm_last_path else "disabled")
+            messagebox.showerror("Sales Movement", str(payload))
+        elif kind == MSG_SM_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            counts = info.get("counts", {})
+            self._sm_last_path = info.get("path", "")
+            self.zenith_sm_tree.delete(*self.zenith_sm_tree.get_children())
+            for (name, zone, rep, base, now, chg, pct, verdict,
+                 bucket) in info.get("reported", ()):
+                self.zenith_sm_tree.insert(
+                    "", "end",
+                    values=(name, zone or "—", rep or "—", f"{base:,.0f}",
+                            f"{now:,.0f}", f"{chg:+,.0f}",
+                            # a new customer has no denominator, so the cell
+                            # stays empty rather than showing a misleading 0%
+                            "" if pct is None else f"{pct:+.0%}", verdict),
+                    tags=("down" if bucket in ("declined", "lapsed",
+                                               "refunded") else "up",))
+            self._sm_log(
+                f"{len(info.get('reported', ())):,} mover(s) — "
+                f"down {counts.get('declined', 0):,} · "
+                f"stopped buying {counts.get('lapsed', 0):,} · "
+                f"refunded > sold {counts.get('refunded', 0):,} · "
+                f"up {counts.get('grew', 0):,} · new {counts.get('new', 0):,} "
+                f"· steady {counts.get('stable', 0):,}   "
+                f"[{info.get('money_lost', 0):,.0f} lost / "
+                f"+{info.get('money_gained', 0):,.0f} gained BDT]")
+            # The floor and any data-coverage caveat are the two things that
+            # silently change the answer, so both are shown, never logged away.
+            notes = list(info.get("warnings", ()))
+            if info.get("below_floor"):
+                notes.append(
+                    f"{info['below_floor']:,} customer(s) were below the "
+                    f"floor and are not in this list.")
+            self.zenith_sm_warning.configure(text="\n".join(notes))
+            self.btn_sm_run.configure(state="normal")
+            self.btn_sm_open.configure(state="normal" if self._sm_last_path
+                                       else "disabled")
         elif kind == MSG_FSH_ERROR:
             self._fsh_log(f"ERROR: {payload}")
             self.fsh_progress_label.configure(text="Failed.")
@@ -5881,6 +5933,7 @@ class App(WhatsAppMixin, HealthMixin):
         pnr_bulk_inner = ttk.Frame(inner_nb)
         counter_inner = ttk.Frame(inner_nb)
         visits_inner = ttk.Frame(inner_nb)
+        movement_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
@@ -5888,11 +5941,13 @@ class App(WhatsAppMixin, HealthMixin):
         inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
         inner_nb.add(counter_inner, text="Counter Activity")
         inner_nb.add(visits_inner, text="Agency Visits")
+        inner_nb.add(movement_inner, text="Sales Movement")
         inner_nb.add(reports_inner, text="Reports")
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
         self._build_zenith_counter_tab(counter_inner)
         self._build_zenith_visits_tab(visits_inner)
+        self._build_zenith_movement_tab(movement_inner)
         self._build_zenith_reports_tab(reports_inner)
 
         # From here, the existing Customer Lookup form goes into
@@ -7199,6 +7254,337 @@ class App(WhatsAppMixin, HealthMixin):
                        f"  roster unavailable ({type(exc).__name__}); the "
                        f"share of flights changed will be left blank")
             return None
+
+    # ==================================================================
+    # Zenith Sales Movement sub-tab — UI
+    # ==================================================================
+    def _build_zenith_movement_tab(self, parent: ttk.Frame) -> None:
+        """Which agencies grew and which fell away, against their own average.
+
+        Reads the local sales warehouse, so like the Flight History Analyzer
+        this sub-tab works with no Zenith sign-in at all.
+
+        The defaults matter more than the controls here. The period opens on
+        the last COMPLETE calendar month rather than the current one, because
+        the warehouse is loaded mid-month and comparing a part-month against
+        whole ones shows the entire book collapsing.
+        """
+        parent = self._make_scrollable(parent)
+
+        self._section(
+            parent,
+            "Sales Movement  ·  who is up, who is down, and by how much",
+            help_text=(
+                "Compares each agency's sales in a period against an average "
+                "of the periods before it, and lists everyone who moved by "
+                "more than the percentage you set.\n\n"
+                "Why an AVERAGE rather than last month: measured on this "
+                "warehouse, 135 agencies looked like they collapsed in August "
+                "purely because July had been an unusually big month for "
+                "them — 119 of those 135 had a July at least 30% above their "
+                "May–June average. Comparing against three months instead of "
+                "one removes those false alarms and catches 151 real "
+                "decliners that a July-only comparison misses.\n\n"
+                "Customers who stopped buying, and customers who are brand "
+                "new, are listed separately: there is no percentage for "
+                "either, and calling a lapsed agency '-100%' buries the only "
+                "fact that matters."
+            ),
+        )
+
+        # ----- Period -----
+        # Default to the last whole month. Today's month is always partial.
+        _today = date.today()
+        _first_this = _today.replace(day=1)
+        _last_prev = _first_this - timedelta(days=1)
+        self.zenith_sm_from = tk.StringVar(
+            value=str(_last_prev.replace(day=1)))
+        self.zenith_sm_to = tk.StringVar(value=str(_last_prev))
+
+        period_body = self._section(parent, "Period")
+        per_row = ttk.Frame(period_body)
+        ttk.Entry(per_row, textvariable=self.zenith_sm_from,
+                  width=12).pack(side="left")
+        ttk.Label(per_row, text="  to  ").pack(side="left")
+        ttk.Entry(per_row, textvariable=self.zenith_sm_to,
+                  width=12).pack(side="left")
+        ttk.Label(per_row, text="   (a whole calendar month is compared with "
+                                "whole calendar months)",
+                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        self._form_row(period_body, 0, "Look at:", per_row, label_width=18)
+
+        base_row = ttk.Frame(period_body)
+        self.zenith_sm_trailing = tk.IntVar(value=3)
+        ttk.Spinbox(base_row, from_=1, to=12, increment=1, width=4,
+                    textvariable=self.zenith_sm_trailing).pack(side="left")
+        ttk.Label(base_row, text="  preceding period(s), averaged   "
+                                 "(1 = plain previous-period comparison)",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(period_body, 1, "Compare against:", base_row,
+                       label_width=18)
+
+        # ----- What counts as a move -----
+        rule_body = self._section(parent, "What counts as a move")
+        thr_row = ttk.Frame(rule_body)
+        self.zenith_sm_threshold = tk.DoubleVar(value=20.0)
+        ttk.Spinbox(thr_row, from_=5.0, to=100.0, increment=5.0, width=6,
+                    format="%.0f",
+                    textvariable=self.zenith_sm_threshold).pack(side="left")
+        ttk.Label(thr_row, text="%  or more,  ").pack(side="left")
+        self.zenith_sm_direction = tk.StringVar(value="Either way")
+        ttk.Combobox(thr_row, textvariable=self.zenith_sm_direction, width=14,
+                     state="readonly",
+                     values=("Either way", "Dropped only",
+                             "Increased only")).pack(side="left")
+        self._form_row(rule_body, 0, "Moved by:", thr_row, label_width=18)
+
+        floor_row = ttk.Frame(rule_body)
+        self.zenith_sm_floor = tk.StringVar(value=self._SM_FLOOR_MONEY)
+        ttk.Entry(floor_row, textvariable=self.zenith_sm_floor,
+                  width=12).pack(side="left")
+        self.zenith_sm_floor_hint = ttk.Label(
+            floor_row, text="  BDT in the baseline.  Without a floor the list "
+                            "runs to thousands of rows of one-ticket "
+                            "customers.", style="Hint.TLabel")
+        self.zenith_sm_floor_hint.pack(side="left", padx=(4, 0))
+        self._form_row(rule_body, 1, "Ignore below:", floor_row,
+                       label_width=18)
+
+        self.zenith_sm_measure = tk.StringVar(
+            value="Net of refunds and voids")
+        measure_cb = ttk.Combobox(
+            rule_body, textvariable=self.zenith_sm_measure, state="readonly",
+            width=30, values=("Net of refunds and voids",
+                              "Gross ticket sales", "Tickets issued"))
+        # A floor of 500,000 means half a million BDT, or half a million
+        # TICKETS -- which excluded every agency in the book and returned an
+        # empty report. The floor follows the measure.
+        self.zenith_sm_measure.trace_add("write", self._sm_measure_changed)
+        self._form_row(rule_body, 2, "Measure:", measure_cb, label_width=18)
+
+        self.zenith_sm_who = tk.StringVar(value="Agencies only")
+        who_cb = ttk.Combobox(
+            rule_body, textvariable=self.zenith_sm_who, state="readonly",
+            width=30, values=("Agencies only", "All customers"))
+        self._form_row(rule_body, 3, "Who:", who_cb, label_width=18)
+
+        # ----- Output -----
+        out_body = self._section(parent, "Output")
+        self.zenith_sm_output_dir = tk.StringVar(
+            value=str(Path.home() / "Documents"))
+        out_entry = ttk.Entry(out_body, textvariable=self.zenith_sm_output_dir)
+        self._form_row(
+            out_body, 0, "Output folder:", out_entry,
+            suffix=ttk.Button(out_body, text="Browse…",
+                              command=self._sm_pick_output),
+            label_width=18)
+
+        # ----- Controls -----
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 4))
+        self.btn_sm_run = ttk.Button(ctl, text="Find movers",
+                                     style="Primary.TButton",
+                                     command=self._sm_run)
+        self.btn_sm_run.pack(side="left")
+        self.btn_sm_open = ttk.Button(ctl, text="Open workbook",
+                                      command=self._sm_open, state="disabled")
+        self.btn_sm_open.pack(side="left", padx=(8, 0))
+        self.zenith_sm_status = ttk.Label(
+            ctl, text="Reads the local sales warehouse — no sign-in needed.",
+            style="Hint.TLabel")
+        self.zenith_sm_status.pack(side="left", padx=(12, 0))
+
+        # Anything the run could not stand behind goes here, not in a log
+        # nobody scrolls back through.
+        self.zenith_sm_warning = ttk.Label(
+            parent, text="", style="Hint.TLabel", wraplength=900,
+            justify="left", foreground="#B00020")
+        self.zenith_sm_warning.pack(anchor="w", padx=8)
+
+        # ----- Results -----
+        res_body = self._section(parent, "Movers")
+        cols = (("agency", "Agency / customer", 260), ("zone", "Zone", 90),
+                ("rep", "Sales person", 130),
+                ("base", "Baseline average", 130),
+                ("now", "This period", 130), ("chg", "Change", 130),
+                ("pct", "Change %", 80), ("verdict", "Verdict", 120))
+        self.zenith_sm_tree = ttk.Treeview(
+            res_body, columns=[c[0] for c in cols], show="headings", height=16)
+        for cid, label, width in cols:
+            self.zenith_sm_tree.heading(cid, text=label)
+            self.zenith_sm_tree.column(
+                cid, width=width,
+                anchor="e" if cid in ("base", "now", "chg", "pct") else "w")
+        sm_vscroll = ttk.Scrollbar(res_body,
+                                   command=self.zenith_sm_tree.yview)
+        sm_vscroll.pack(side="right", fill="y")
+        sm_hscroll = ttk.Scrollbar(res_body, orient="horizontal",
+                                   command=self.zenith_sm_tree.xview)
+        sm_hscroll.pack(side="bottom", fill="x")
+        self.zenith_sm_tree.pack(fill="both", expand=True, padx=2, pady=4)
+        self.zenith_sm_tree.configure(yscrollcommand=sm_vscroll.set,
+                                      xscrollcommand=sm_hscroll.set)
+        self.zenith_sm_tree.tag_configure("down", foreground="#B00020")
+        self.zenith_sm_tree.tag_configure("up", foreground="#0B6A0B")
+        self._register_result_tree(self.zenith_sm_tree)
+
+        # ----- Worker state -----
+        self._sm_worker: threading.Thread | None = None
+        self._sm_last_path: str = ""
+
+    #: Sensible floors in each unit. Measured: at 500,000 BDT the August
+    #: agency list falls from 3,981 rows to 631; 50 tickets a month is the
+    #: equivalent cut for a volume report.
+    _SM_FLOOR_MONEY = "500000"
+    _SM_FLOOR_TICKETS = "50"
+
+    def _sm_measure_changed(self, *_args) -> None:
+        """Keep the floor and its caption in the unit being measured.
+
+        Only a floor still sitting at the other unit's default is moved --
+        a number the user typed themselves is never overwritten.
+        """
+        tickets = self.zenith_sm_measure.get() == "Tickets issued"
+        current = (self.zenith_sm_floor.get() or "").strip()
+        if tickets and current == self._SM_FLOOR_MONEY:
+            self.zenith_sm_floor.set(self._SM_FLOOR_TICKETS)
+        elif not tickets and current == self._SM_FLOOR_TICKETS:
+            self.zenith_sm_floor.set(self._SM_FLOOR_MONEY)
+        try:
+            self.zenith_sm_floor_hint.configure(
+                text=("  tickets in the baseline.  A ticket count is not an "
+                      "amount of money — the floor is counted in tickets too."
+                      if tickets else
+                      "  BDT in the baseline.  Without a floor the list runs "
+                      "to thousands of rows of one-ticket customers."))
+        except Exception:        # noqa: BLE001 - UI only
+            pass
+
+    def _sm_pick_output(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Where should the Sales Movement workbook go?",
+            initialdir=self.zenith_sm_output_dir.get() or str(Path.home()))
+        if folder:
+            self.zenith_sm_output_dir.set(folder)
+
+    def _sm_log(self, msg: str) -> None:
+        try:
+            self.zenith_sm_status.configure(text=msg)
+        except Exception:        # noqa: BLE001 - UI only
+            pass
+
+    def _sm_open(self) -> None:
+        if not self._sm_last_path:
+            return
+        try:
+            os.startfile(self._sm_last_path)   # noqa: S606 — user asked
+        except Exception as exc:               # noqa: BLE001
+            messagebox.showerror("Sales Movement",
+                                 f"Could not open the workbook:\n{exc}")
+
+    def _sm_settings(self):
+        """Read the form into a Settings, or raise ValueError saying why."""
+        from . import sales_movement as sm
+
+        try:
+            first = date.fromisoformat(self.zenith_sm_from.get().strip())
+            last = date.fromisoformat(self.zenith_sm_to.get().strip())
+        except ValueError:
+            raise ValueError("Write the dates as YYYY-MM-DD, for example "
+                             "2026-08-01.") from None
+        if last < first:
+            raise ValueError("The period ends before it starts.")
+        measure = {"Gross ticket sales": sm.MEASURE_GROSS,
+                   "Tickets issued": sm.MEASURE_TICKETS}.get(
+                       self.zenith_sm_measure.get(), sm.MEASURE_NET)
+        unit = "tickets" if measure == sm.MEASURE_TICKETS else "BDT"
+        try:
+            floor = float((self.zenith_sm_floor.get() or "0")
+                          .replace(",", "").strip() or 0)
+        except ValueError:
+            raise ValueError(f"The floor must be a number of {unit}, for "
+                             f"example {'50' if unit == 'tickets' else '500000'}"
+                             f".") from None
+        # An IntVar/DoubleVar raises tk.TclError -- NOT ValueError -- when its
+        # Spinbox has been cleared or typed into, so catching ValueError alone
+        # let the exception escape the button callback instead of reaching the
+        # message box. The rest of this file pairs the two for the same reason.
+        try:
+            trailing = max(1, int(self.zenith_sm_trailing.get() or 3))
+        except (tk.TclError, ValueError):
+            raise ValueError("'Compare against' must be a whole number of "
+                             "periods, for example 3.") from None
+        try:
+            threshold = max(0.0, float(self.zenith_sm_threshold.get() or 20))
+        except (tk.TclError, ValueError):
+            raise ValueError("'Moved by' must be a percentage, for example "
+                             "20.") from None
+        direction = {"Dropped only": sm.DROPPED,
+                     "Increased only": sm.INCREASED}.get(
+                         self.zenith_sm_direction.get(), sm.EITHER)
+        channels = (sm.AGENCY_CHANNELS
+                    if self.zenith_sm_who.get() == "Agencies only" else ())
+        return sm.Settings(
+            period_from=first, period_to=last, trailing=trailing,
+            threshold=threshold / 100.0,
+            direction=direction, floor=max(0.0, floor), measure=measure,
+            channels=channels)
+
+    def _sm_run(self) -> None:
+        if self._sm_worker is not None and self._sm_worker.is_alive():
+            return
+        try:
+            settings = self._sm_settings()
+        except ValueError as exc:
+            messagebox.showerror("Sales Movement", str(exc))
+            return
+        self.btn_sm_run.configure(state="disabled")
+        self.btn_sm_open.configure(state="disabled")
+        self.zenith_sm_warning.configure(text="")
+        self.zenith_sm_tree.delete(*self.zenith_sm_tree.get_children())
+        self._sm_log("Reading the sales warehouse…")
+        self._sm_worker = threading.Thread(
+            target=self._sm_worker_run,
+            args=(settings,
+                  Path(self.zenith_sm_output_dir.get().strip()
+                       or str(Path.home()))),
+            daemon=True)
+        self._sm_worker.start()
+
+    def _sm_worker_run(self, settings, out_dir: Path) -> None:
+        from . import counter_reconcile as cr
+        from . import sales_movement as sm
+        from . import sales_movement_report as smr
+
+        try:
+            source = cr.find_sales_warehouse()
+            if source is None:
+                raise ValueError(
+                    "No local sales warehouse was found. This report reads "
+                    "the merged sales data (Analysis/gold/sales_bi.parquet); "
+                    "build or mount it first.")
+            self._post(MSG_SM_LOG, f"Reading {source.path.name}…")
+            res = sm.run(source, settings)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / smr.default_filename(settings)
+            smr.build_workbook(res, path)
+            counts = res.counts
+            self._post(MSG_SM_DONE, {
+                "path": str(path),
+                "counts": counts,
+                "reported": [
+                    (m.customer, m.zone, m.sales_person, round(m.baseline),
+                     round(m.current), round(m.change), m.change_pct,
+                     m.verdict, m.bucket)
+                    for m in res.reported],
+                "below_floor": res.below_floor,
+                "money_lost": res.money_lost,
+                "money_gained": res.money_gained,
+                "warnings": list(res.warnings),
+                "describe": res.describe(),
+            })
+        except Exception as exc:                   # noqa: BLE001
+            self._post(MSG_SM_ERROR, str(exc))
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a

@@ -655,9 +655,30 @@ COLS = [
 LAST = COLS[-1][0]
 
 
+#: Characters Excel reads as the start of a formula. A cell whose text begins
+#: with one of these is evaluated, not displayed.
+_FORMULA_LEAD = ("=", "+", "-", "@")
+
+
+def _safe_text(v):
+    """Stop Excel evaluating a name that happens to start like a formula.
+
+    These sheets are built to be forwarded, and the names on them are typed
+    by people: the warehouse already holds '-Ul-Islam Md Armaan', which Excel
+    renders as #NAME? rather than as a name. Prefixing a zero-width-free
+    apostrophe marks the value as literal text; Excel does not display it.
+
+    Only strings that would actually be evaluated are touched, so numbers,
+    dates and ordinary text pass through untouched.
+    """
+    if isinstance(v, str) and v[:1] in _FORMULA_LEAD:
+        return "'" + v
+    return v
+
+
 def _cell(ws, r, c, v, *, bold=False, size=10, color=None, fill=None,
           fmt=None, align=None, wrap=False, border=False):
-    cell = ws.cell(row=r, column=c, value=v)
+    cell = ws.cell(row=r, column=c, value=_safe_text(v))
     cell.font = Font(bold=bold, size=size, color=color or "000000",
                      name="Segoe UI")
     if fill:
