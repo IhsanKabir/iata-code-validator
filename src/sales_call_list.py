@@ -10,13 +10,18 @@ same key the visit master already uses to survive how a name was typed -- 'AB
 Travel' against 'AB Travels', 'CARNIVAL AIR TICKETING LTD.' against the sales
 system's 'Carnival Air Ticketing Ltd. (IATA)'.
 
-Two rules, both because the alternative produces a list that wastes a rep's
-morning:
+Three rules, each because the alternative produces a list that wastes a rep's
+morning or sends them to the wrong company:
 
 * An agency with no contact on file is still on the sheet. Dropping it would
   hide the most important case there is -- an account losing real money that
   nobody has ever visited -- so it is listed with the contact columns empty
   and called out on the summary.
+* A name match is not an identity. Movements are grouped by account number,
+  but a contact can only be found by name, and 80 name keys in this warehouse
+  are shared by two or more Customer IDs, covering 174 of 2,409 agencies.
+  Those rows carry the name the contact was actually filed under, and are
+  marked, rather than being handed somebody else's phone number in silence.
 * The sheet is ranked by money lost, never by percentage, and it carries the
   columns a rep fills in by hand (called on, spoke to, outcome) so it comes
   back as a record rather than as a second spreadsheet.
@@ -38,10 +43,10 @@ WIDTHS = [30, 12, 20, 16, 17, 12, 8, 16, 12, 9, 14, 14, 14,
           22, 12, 14, 12, 16, 22, 10, 10]
 
 HEADERS = ["Agency", "IATA code", "Contact person", "Designation", "Phone",
-           "Zone", "Station", "Sales person", "Last bought", "Days silent",
-           "Baseline", "This period", "Change", "Why they are on this list",
-           "Last visited", "Visited by",
-           "Called on", "Spoke to", "Outcome", "", ""]
+           "Contact is filed under", "Station", "Sales person",
+           "Last bought", "Days silent", "Baseline", "This period",
+           "Change", "Why they are on this list", "Last visited",
+           "Visited by", "Called on", "Spoke to", "Outcome", "", ""]
 
 #: An agency silent for longer than this has stopped being a slow month and
 #: started being a lost account.
@@ -100,6 +105,9 @@ class CallRow:
     movement: object
     contact: Contact
     days_silent: int | None = None
+    #: True when this agency's name key is shared with another account on
+    #: the list, so the contact may belong to the other one.
+    ambiguous: bool = False
 
     @property
     def reachable(self) -> bool:
@@ -118,17 +126,32 @@ class CallRow:
 
 
 def build(res: sm.Result, contacts: dict | None = None) -> list:
-    """Every agency that went backwards, biggest money lost first."""
+    """Every agency that went backwards, biggest money lost first.
+
+    Movements are grouped by account number, but a contact can only be found
+    by NAME, which re-opens the collision the account number closed: measured
+    on August, 80 name keys are shared by two or more Customer IDs, covering
+    174 of 2,409 agencies. Those rows are marked rather than quietly handed
+    somebody else's phone number.
+    """
     from .visit_master import identity
 
     contacts = contacts or {}
     end = res.settings.period_to
+    movers = res.declined + res.lapsed + res.refunded
+    # which name keys cover more than one account in this very list
+    seen: dict = {}
+    for m in movers:
+        seen.setdefault(identity(m.customer), set()).add(
+            m.customer_id or m.customer)
     out = []
-    for m in res.declined + res.lapsed + res.refunded:
-        got = contacts.get(identity(m.customer)) or Contact()
+    for m in movers:
+        key = identity(m.customer)
+        got = contacts.get(key) or Contact()
         silent = ((end - m.last_bought).days
                   if isinstance(m.last_bought, date) else None)
-        out.append(CallRow(movement=m, contact=got, days_silent=silent))
+        out.append(CallRow(movement=m, contact=got, days_silent=silent,
+                           ambiguous=len(seen.get(key, ())) > 1))
     out.sort(key=lambda r: r.movement.change)
     return out
 
@@ -143,6 +166,7 @@ def _prep(ws) -> None:
 def write_call_list(ws, res: sm.Result, rows) -> None:
     s = res.settings
     reachable = sum(1 for r in rows if r.reachable)
+    ambiguous = sum(1 for r in rows if r.ambiguous)
     lost = sum(r.movement.change for r in rows)
 
     ws.merge_cells(f"A1:{LAST}1")
@@ -164,6 +188,8 @@ def write_call_list(ws, res: sm.Result, rows) -> None:
         ("Have a contact", reachable, "#,##0", "006100"),
         ("No contact on file", len(rows) - reachable, "#,##0",
          "C00000" if reachable < len(rows) else None),
+        ("Check the contact", ambiguous, "#,##0",
+         "C00000" if ambiguous else None),
         (f"At stake ({s.unit})", round(lost), MONEY, "C00000"),
     ])
     r += 1
@@ -196,7 +222,10 @@ def _call_row(ws, r: int, row) -> None:
     _cell(ws, r, 4, c.designation or None, size=9, border=True)
     _cell(ws, r, 5, c.phone or None, size=9, border=True,
           fill=None if c.phone else WARN)
-    _cell(ws, r, 6, m.zone or None, size=9, border=True, align="center")
+    # the name the contact was filed under in the visit report. When it is
+    # not this agency's own name, a rep can see the match may be wrong.
+    _cell(ws, r, 6, c.agency or None, size=9, border=True,
+          fill=WARN if row.ambiguous else None)
     _cell(ws, r, 7, m.station or None, size=9, border=True, align="center")
     _cell(ws, r, 8, m.sales_person or None, size=9, border=True)
     _cell(ws, r, 9, m.last_bought, fmt="dd mmm yy", size=9, border=True,
@@ -209,7 +238,10 @@ def _call_row(ws, r: int, row) -> None:
           size=9, border=True, align="right")
     _cell(ws, r, 13, round(m.change), fmt=MONEY, size=10, bold=True,
           border=True, align="right")
-    _cell(ws, r, 14, row.why, size=9, border=True)
+    _cell(ws, r, 14, row.why + (" · CHECK THE CONTACT: another account "
+                                "trades under this name"
+                                if row.ambiguous else ""),
+          size=9, border=True, fill=WARN if row.ambiguous else None)
     _cell(ws, r, 15, c.last_seen, fmt="dd mmm yy", size=9, border=True,
           align="center")
     _cell(ws, r, 16, c.rep or None, size=9, border=True)

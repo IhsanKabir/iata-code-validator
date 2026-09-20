@@ -441,10 +441,91 @@ def test_an_unknown_baseline_mode_is_refused():
                     baseline="vibes")
 
 
-def test_a_last_year_baseline_before_the_data_starts_is_flagged():
+def test_a_last_year_baseline_before_the_data_starts_is_refused_outright():
     """The warehouse begins in May 2025, so asking for early 2026 against
-    last year silently compares with nothing at all."""
+    last year compares with nothing at all.
+
+    Flagging that was not enough: the run still produced a full workbook in
+    which all 788 agencies were 'new' -- confident, complete and meaningless.
+    """
     s = sm.Settings(period_from=date(2026, 2, 1), period_to=date(2026, 2, 28),
                     baseline=sm.BASELINE_LAST_YEAR)
+    res = sm.build([_row("Anyone", 0, 5_000_000)], s,
+                   data_first_day=date(2025, 5, 1))
+    assert res.refused
+    assert "no data for the baseline" in res.refused
+    assert res.movements == []          # nothing is reported at all
+    assert res.counts[sm.NEW] == 0
+
+
+# --------------------------------------------------------------------------
+# where the data runs out, the report refuses or adjusts -- it never guesses
+# --------------------------------------------------------------------------
+def test_a_period_past_the_data_is_shortened_to_match_it():
+    """723 agencies 'down' against 34 up, for a September that had only run
+    to the 19th. Both sides must cover the same number of days."""
+    s = sm.Settings(period_from=date(2026, 9, 1), period_to=date(2026, 9, 30))
+    got, note = sm.clamp_period(s, date(2026, 9, 19))
+    assert got.period_to == date(2026, 9, 19)
+    assert got.period_from == date(2026, 9, 1)
+    assert "19 days" in note
+    # and the baseline windows follow the shortened length
+    assert all((b - a).days + 1 == 19 for a, b in sm.windows(got))
+
+
+def test_a_period_inside_the_data_is_left_alone():
+    got, note = sm.clamp_period(AUG, date(2026, 9, 19))
+    assert got is AUG and note == ""
+
+
+def test_a_period_starting_after_the_data_ends_is_refused():
+    s = sm.Settings(period_from=date(2026, 11, 1), period_to=date(2026, 11, 30))
+    _got, note = sm.clamp_period(s, date(2026, 9, 19))
+    assert note == "none"
+
+
+def test_the_baseline_averages_only_the_windows_the_data_reaches():
+    """Asking for June 2025 against three months, on a warehouse starting
+    that May, divided one month by three and made everyone a hero."""
+    s = sm.Settings(period_from=date(2025, 6, 1), period_to=date(2025, 6, 30),
+                    trailing=3)
+    assert sm.usable_baseline_windows(s, date(2025, 5, 1)) == 1
+    rows = [_row("Alpha", 0, 900_000), _row("Alpha", 1, 1_000_000)]
+    m = sm.build(rows, s, data_first_day=date(2025, 5, 1)).by_name("Alpha")
+    assert m.baseline == pytest.approx(1_000_000)   # not 333,333
+    assert m.trailing == 1
+
+
+def test_trimming_the_baseline_is_said_out_loud():
+    s = sm.Settings(period_from=date(2025, 6, 1), period_to=date(2025, 6, 30),
+                    trailing=3)
     res = sm.build([], s, data_first_day=date(2025, 5, 1))
-    assert res.baseline_truncated is True
+    assert any("1 window(s), not the 3" in w for w in res.warnings)
+
+
+def test_a_full_baseline_is_not_trimmed_and_says_nothing():
+    res = sm.build([], AUG, data_first_day=date(2025, 5, 1))
+    assert not res.refused
+    assert not any("not the 3" in w for w in res.warnings)
+
+
+# --------------------------------------------------------------------------
+# the money neither gross nor net counts
+# --------------------------------------------------------------------------
+def test_the_all_measure_reaches_the_penalty_and_reissue_lines():
+    assert "Penalty" in sm._lines(sm.MEASURE_ALL)
+    assert "Reissuance Adjustment" in sm._lines(sm.MEASURE_ALL)
+    assert "Penalty" not in sm._lines(sm.MEASURE_NET)
+    assert "Penalty" not in sm._lines(sm.MEASURE_GROSS)
+
+
+def test_every_measure_states_what_it_leaves_out():
+    for measure in (sm.MEASURE_GROSS, sm.MEASURE_NET, sm.MEASURE_TICKETS,
+                    sm.MEASURE_ALL):
+        assert sm.EXCLUDES[measure]
+
+
+def test_the_all_measure_names_itself_in_the_sentence():
+    s = sm.Settings(period_from=AUG.period_from, period_to=AUG.period_to,
+                    measure=sm.MEASURE_ALL)
+    assert "penalties and reissue adjustments" in sm.build([], s).describe()

@@ -57,10 +57,27 @@ MEASURE_GROSS = "gross"      # ticket payments only
 MEASURE_NET = "net"          # less refunds and voids
 MEASURE_TICKETS = "tickets"  # volume rather than value
 
+#: Everything, including the lines the other two leave out.
+MEASURE_ALL = "all"
+
 #: Transaction lines behind each measure. Refunds and voids already carry a
 #: negative balance in the warehouse, so netting is a plain sum.
 GROSS_LINES = ("Ticket payment",)
 NET_LINES = ("Ticket payment", "Refund", "Ticket void")
+#: Penalty and Reissuance Adjustment are real money that neither gross nor
+#: net counts -- 1,438.8M and 861.1M across the agency book. In aggregate
+#: that is 2.8%, but 39 of the 820 agencies above a 500k floor carry more
+#: than a tenth of their net in these lines, and for those the verdict can
+#: be wrong in kind rather than in size.
+ALL_LINES = NET_LINES + ("Penalty", "Reissuance Adjustment")
+
+#: What each measure does NOT count, said on the sheet rather than implied.
+EXCLUDES = {
+    MEASURE_GROSS: "refunds, voids, penalties and reissue adjustments",
+    MEASURE_NET: "penalties and reissue adjustments",
+    MEASURE_TICKETS: "value entirely — this counts tickets, not money",
+    MEASURE_ALL: "commission, which is a cost to the airline, not a sale",
+}
 
 # --- what the period is measured against -----------------------------------
 #: An average of the windows immediately before the period.
@@ -295,6 +312,10 @@ class Result:
     warnings: list = field(default_factory=list)
     period_incomplete: bool = False
     baseline_truncated: bool = False
+    #: Set when no answer could honestly be given; nothing else is filled in.
+    refused: str = ""
+    #: Set when the period was cut back to where the data ends.
+    period_clamped: str = ""
     rows_read: int = 0
 
     @property
@@ -372,6 +393,8 @@ class Result:
         against = {DROPPED: "below", INCREASED: "above"}.get(s.direction, "from")
         what = {MEASURE_GROSS: "gross ticket sales",
                 MEASURE_NET: "ticket sales net of refunds and voids",
+                MEASURE_ALL: "ticket sales net of refunds, voids, penalties "
+                             "and reissue adjustments",
                 MEASURE_TICKETS: "tickets issued"}[s.measure]
         who = "Agencies" if s.channels == AGENCY_CHANNELS else "Customers"
         basis = (f"the same period a year earlier ({baseline_label(s)})"
@@ -440,8 +463,51 @@ def _accumulate(rows: "Iterable", res: Result, n: int,
     return acc
 
 
-def build(rows: "Iterable", settings: Settings, *, data_first_day: date | None = None,
-          data_last_day: date | None = None) -> Result:
+def usable_baseline_windows(s: Settings, data_first_day: date | None) -> int:
+    """How many baseline windows the data actually covers.
+
+    The windows run most-recent-first and are contiguous, so the ones the
+    data cannot reach are always the oldest. Dropping those and averaging
+    over what is left beats averaging over windows that are silently zero:
+    asking for June 2025 against three preceding months, on a warehouse that
+    starts that May, divided one month's sales by three and turned 318
+    agencies into heroes.
+    """
+    base = windows(s)[1:]
+    if data_first_day is None:
+        return len(base)
+    return sum(1 for (a, _b) in base if a >= data_first_day)
+
+
+def clamp_period(s: Settings, data_last_day: date | None) -> tuple:
+    """Shorten a period that overruns the data, and say so.
+
+    A part-month against whole months shows the whole book collapsing -- 723
+    agencies down against 34 up, for a September on a warehouse that stops on
+    the 19th. Comparing the same number of days on each side is the only
+    honest answer available, so the period is cut to what exists and the
+    baseline windows follow it.
+
+    Returns (settings, note). The note is "none" when the period starts after
+    the data ends, which the caller turns into a refusal.
+    """
+    if data_last_day is None or s.period_to <= data_last_day:
+        return s, ""
+    if data_last_day < s.period_from:
+        return s, "none"
+    from dataclasses import replace
+    days = (data_last_day - s.period_from).days + 1
+    return replace(s, period_to=data_last_day), (
+        f"You asked for {_dm(s.period_from)} – {_dm(s.period_to)}, but the "
+        f"data ends on {_dm(data_last_day)}. The period was shortened to "
+        f"match, and is compared with windows of the same {days} days — a "
+        f"part-period against whole ones shows every customer falling.")
+
+
+def build(rows: "Iterable", settings: Settings, *,
+          data_first_day: date | None = None,
+          data_last_day: date | None = None,
+          period_clamped: str = "") -> Result:
     """Fold per-customer, per-window totals into buckets.
 
     `rows` are mappings with at least customer, window and amount, where
@@ -449,11 +515,35 @@ def build(rows: "Iterable", settings: Settings, *, data_first_day: date | None =
     aggregation happens in SQL -- this is the part that decides what the
     numbers MEAN, which is why it takes tallies and not eight million rows.
     """
-    res = Result(settings=settings)
+    res = Result(settings=settings, period_clamped=period_clamped)
     # However many baseline windows the mode produced -- three for a
     # trailing average, one for last year. Reading `trailing` directly
     # would divide the last-year comparison by three.
-    n = max(1, len(windows(settings)) - 1)
+    asked = max(1, len(windows(settings)) - 1)
+    n = usable_baseline_windows(settings, data_first_day) or asked
+
+    # A baseline the data cannot reach at all is not a small problem to note
+    # in the margin. Asking for February 2026 against February 2025, on a
+    # warehouse that starts in May 2025, produced a workbook in which all 788
+    # agencies were "new" -- confident, complete, and meaningless. Refuse it.
+    if data_first_day is not None and usable_baseline_windows(
+            settings, data_first_day) == 0:
+        lo, hi = baseline_span(settings)
+        res.refused = (
+            f"There is no data for the baseline at all. It covers "
+            f"{_dm(lo)} to {_dm(hi)}, and the warehouse starts on "
+            f"{_dm(data_first_day)}. Every customer would be reported as "
+            f"new, which says nothing about any of them. Pick a later "
+            f"period, or a baseline that falls inside the data.")
+        return res
+    if n < asked:
+        res.warnings.append(
+            f"The baseline was averaged over {n} window(s), not the {asked} "
+            f"asked for: the warehouse starts on {_dm(data_first_day)} and "
+            f"the older windows fall outside it. Averaging over windows that "
+            f"are silently zero lowers the baseline and flatters everyone.")
+    if period_clamped:
+        res.warnings.append(period_clamped)
 
     if data_last_day and settings.period_to > data_last_day:
         res.period_incomplete = True
@@ -495,8 +585,9 @@ def build(rows: "Iterable", settings: Settings, *, data_first_day: date | None =
 # reading the warehouse
 # --------------------------------------------------------------------------
 def _lines(measure: str) -> tuple:
-    return GROSS_LINES if measure in (MEASURE_GROSS, MEASURE_TICKETS) \
-        else NET_LINES
+    if measure in (MEASURE_GROSS, MEASURE_TICKETS):
+        return GROSS_LINES
+    return ALL_LINES if measure == MEASURE_ALL else NET_LINES
 
 
 def _quoted(values: "Iterable") -> str:
@@ -578,8 +669,21 @@ def fetch(source: "WarehouseSource", settings: Settings, *,
 
 def run(source: "WarehouseSource", settings: Settings, *,
         progress_cb=None) -> Result:
-    """Fetch and fold, carrying the warehouse's coverage into the warnings."""
-    rows = fetch(source, settings, progress_cb=progress_cb)
-    return build(rows, settings,
-                 data_first_day=getattr(source, "first_day", None),
-                 data_last_day=getattr(source, "last_day", None))
+    """Fetch and fold, refusing rather than guessing where the data runs out.
+
+    The period is cut back to what the warehouse actually holds BEFORE the
+    query runs, so both sides of the comparison cover the same number of days.
+    """
+    first = getattr(source, "first_day", None)
+    last = getattr(source, "last_day", None)
+    effective, clamped = clamp_period(settings, last)
+    if clamped == "none":
+        res = Result(settings=settings)
+        res.refused = (
+            f"The period starts after the data ends. The warehouse runs to "
+            f"{_dm(last)}, and nothing has been loaded for "
+            f"{_dm(settings.period_from)} onwards.")
+        return res
+    rows = fetch(source, effective, progress_cb=progress_cb)
+    return build(rows, effective, data_first_day=first, data_last_day=last,
+                 period_clamped=clamped)

@@ -271,3 +271,36 @@ def test_the_windows_table_prints_the_day_count_of_each_window(tmp_path):
     ws = _book(tmp_path)["Summary"]
     days = [v for v in _column(ws, "Days", limit=6) if v]
     assert days[:2] == [31, 31]           # Aug 2026 and Jul 2026
+
+
+# --------------------------------------------------------------------------
+# a refusal is a page saying why, not a workbook of empty tabs
+# --------------------------------------------------------------------------
+def _refused():
+    s = sm.Settings(period_from=date(2026, 2, 1), period_to=date(2026, 2, 28),
+                    baseline=sm.BASELINE_LAST_YEAR)
+    return sm.build([_row("Anyone", 0, 9_000_000)], s,
+                    data_first_day=date(2025, 5, 1))
+
+
+def test_a_refused_run_writes_only_a_page_saying_why(tmp_path):
+    out = tmp_path / "refused.xlsx"
+    smr.build_workbook(_refused(), out)
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["Summary"]          # no bucket tabs at all
+    said = _text(wb["Summary"])
+    assert "no data for the baseline" in said
+    assert "none of it would have been true" in said
+
+
+def test_a_refused_run_has_no_declined_tab_to_misread(tmp_path):
+    """An empty 'Declined' beside a refusal reads as 'nobody declined'."""
+    out = tmp_path / "refused2.xlsx"
+    smr.build_workbook(_refused(), out)
+    assert "Declined" not in load_workbook(out).sheetnames
+
+
+def test_the_summary_states_what_the_measure_leaves_out(tmp_path):
+    said = _text(_book(tmp_path)["Summary"])
+    assert "Not counted here" in said
+    assert "penalties and reissue adjustments" in said
