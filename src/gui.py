@@ -7569,7 +7569,14 @@ class App(WhatsAppMixin, HealthMixin):
                                  "built from that result.")
             return
         self.btn_sm_calls.configure(state="disabled")
-        self._sm_log("Building the call list…")
+        # The grid can be showing risers while this exports fallers. Saying so
+        # costs a line and stops the sheet looking like it ignored the filter.
+        if self.zenith_sm_direction.get() == "Increased only":
+            self._sm_log("Building the call list — note it covers the "
+                         "agencies that went BACKWARDS, not the risers shown "
+                         "above.")
+        else:
+            self._sm_log("Building the call list…")
         self._sm_worker = threading.Thread(
             target=self._sm_calls_worker,
             args=(self._sm_last_result,
