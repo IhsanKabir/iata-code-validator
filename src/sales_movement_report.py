@@ -224,12 +224,25 @@ def write_summary(ws, res: sm.Result) -> None:
         r += 1
     r += 1
 
+    r = _glossary(ws, r, res)
+
+    r = _rollup(ws, r, res, lambda m: m.zone, "BY ZONE",
+                "net movement where the accounts sit")
+    _rollup(ws, r, res, lambda m: m.sales_person, "BY SALES PERSON",
+            "the same money against whoever owns the account")
+
+
+def _glossary(ws, r: int, res: sm.Result) -> int:
+    """What each group means, on the sheet rather than in a docstring."""
+    s = res.settings
+    against = ("the same period a year earlier"
+               if s.baseline == sm.BASELINE_LAST_YEAR else "their own average")
     r = _band(ws, r, "WHAT THE GROUPS MEAN",
               "a percentage is only printed where a denominator exists")
     for label, text in (
         ("Down / Up",
          f"Traded in this period and in the baseline, and moved by "
-         f"{s.threshold:.0%} or more against their own average."),
+         f"{s.threshold:.0%} or more against {against}."),
         ("Stopped buying",
          "Had a baseline and bought nothing at all this period. Shown "
          "separately rather than as '-100%', because the fact that matters "
@@ -249,19 +262,14 @@ def write_summary(ws, res: sm.Result) -> None:
          "windows than they traded."),
         ("Held back by the floor",
          f"{res.below_floor:,} customer(s) fell below the "
-         f"{s.floor:,.0f} BDT floor and are not in this workbook."),
+         f"{s.floor:,.0f} {s.unit} floor and are not in this workbook."),
     ):
         _cell(ws, r, 1, label, bold=True, size=10, align="left")
         ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=21)
         _cell(ws, r, 2, text, size=9, color=GREY, align="left", wrap=True)
         ws.row_dimensions[r].height = 28
         r += 1
-    r += 1
-
-    r = _rollup(ws, r, res, lambda m: m.zone, "BY ZONE",
-                "net movement where the accounts sit")
-    _rollup(ws, r, res, lambda m: m.sales_person, "BY SALES PERSON",
-            "the same money against whoever owns the account")
+    return r + 1
 
 
 def build_workbook(res: sm.Result, out_path) -> None:

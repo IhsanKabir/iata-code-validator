@@ -7,8 +7,12 @@ agencies that traded in both months. Seventy-eight per cent of the book
 "moved". A single prior period is not a baseline; it is another sample of the
 same noise.
 
-So the baseline here is an AVERAGE of several preceding windows, and four
-things are refused outright, each because doing them produced a wrong list:
+So the baseline here is an AVERAGE of several preceding windows -- or, where
+the season is the thing that moves (Hajj, Umrah, the winter peak), the SAME
+PERIOD A YEAR EARLIER, which a trailing average cannot see.
+
+Five things are refused outright, each because doing them produced a wrong
+list:
 
 * A percentage is never invented where there is no denominator. Of 35,130
   customers active across July and August, 15,489 had no July sales at all.
@@ -58,6 +62,14 @@ MEASURE_TICKETS = "tickets"  # volume rather than value
 GROSS_LINES = ("Ticket payment",)
 NET_LINES = ("Ticket payment", "Refund", "Ticket void")
 
+# --- what the period is measured against -----------------------------------
+#: An average of the windows immediately before the period.
+BASELINE_TRAILING = "trailing"
+#: The same period one year earlier. Hajj, Umrah and the winter peak move the
+#: whole book together, and a trailing average cannot see that -- against
+#: July, every agency "collapses" in a month that is quiet every year.
+BASELINE_LAST_YEAR = "last_year"
+
 # --- which way the mover moved ---------------------------------------------
 DROPPED = "dropped"
 INCREASED = "increased"
@@ -92,6 +104,14 @@ def _shift_month(year: int, month: int, delta: int) -> tuple:
     return idx // 12, idx % 12 + 1
 
 
+def a_year_before(d: date) -> date:
+    """The same day one year earlier, stepping 29 Feb back to the 28th."""
+    try:
+        return d.replace(year=d.year - 1)
+    except ValueError:
+        return d.replace(year=d.year - 1, day=28)
+
+
 def is_whole_month(first: date, last: date) -> bool:
     return (first.day == 1
             and (first.year, first.month) == (last.year, last.month)
@@ -111,6 +131,10 @@ class Settings:
     #: How many preceding windows the baseline averages. 1 makes it a plain
     #: previous-period comparison.
     trailing: int = 3
+    #: BASELINE_TRAILING or BASELINE_LAST_YEAR. The last-year mode uses a
+    #: single window and ignores `trailing` -- this warehouse starts in
+    #: May 2025, so there is only one prior year to average over anyway.
+    baseline: str = BASELINE_TRAILING
     #: 0.20 = twenty per cent.
     threshold: float = 0.20
     direction: str = EITHER
@@ -133,6 +157,8 @@ class Settings:
                     f"{type(getattr(self, field_name)).__name__}")
         if self.period_to < self.period_from:
             raise ValueError("period_to falls before period_from")
+        if self.baseline not in (BASELINE_TRAILING, BASELINE_LAST_YEAR):
+            raise ValueError(f"unknown baseline {self.baseline!r}")
 
     @property
     def unit(self) -> str:
@@ -150,6 +176,11 @@ def windows(s: Settings) -> list:
     cent fall against a 31-day January.
     """
     out = [(s.period_from, s.period_to)]
+    if s.baseline == BASELINE_LAST_YEAR:
+        # One window, not an average: the point is to hold the season
+        # constant, and averaging several years would blur it back out.
+        out.append((a_year_before(s.period_from), a_year_before(s.period_to)))
+        return out
     if is_whole_month(s.period_from, s.period_to):
         for i in range(1, max(1, s.trailing) + 1):
             y, m = _shift_month(s.period_from.year, s.period_from.month, -i)
@@ -177,7 +208,8 @@ def period_label(s: Settings) -> str:
 def baseline_label(s: Settings) -> str:
     lo, hi = baseline_span(s)
     if is_whole_month(s.period_from, s.period_to):
-        return (f"{lo:%b %Y}" if s.trailing == 1
+        one_month = (lo.year, lo.month) == (hi.year, hi.month)
+        return (f"{lo:%b %Y}" if one_month
                 else f"{lo:%b %Y} to {hi:%b %Y}")
     return f"{_dm(lo)} to {_dm(hi)}"
 
@@ -342,9 +374,11 @@ class Result:
                 MEASURE_NET: "ticket sales net of refunds and voids",
                 MEASURE_TICKETS: "tickets issued"}[s.measure]
         who = "Agencies" if s.channels == AGENCY_CHANNELS else "Customers"
+        basis = (f"the same period a year earlier ({baseline_label(s)})"
+                 if s.baseline == BASELINE_LAST_YEAR
+                 else f"their own average for {baseline_label(s)}")
         said = (f"{who} whose {what} in {period_label(s)} {moved} "
-                f"{s.threshold:.0%} or more {against} their own average for "
-                f"{baseline_label(s)}")
+                f"{s.threshold:.0%} or more {against} {basis}")
         if s.floor > 0:
             said += f", ignoring anyone below {s.floor:,.0f} {s.unit}"
         return said + "."
@@ -416,7 +450,10 @@ def build(rows: "Iterable", settings: Settings, *, data_first_day: date | None =
     numbers MEAN, which is why it takes tallies and not eight million rows.
     """
     res = Result(settings=settings)
-    n = max(1, settings.trailing)
+    # However many baseline windows the mode produced -- three for a
+    # trailing average, one for last year. Reading `trailing` directly
+    # would divide the last-year comparison by three.
+    n = max(1, len(windows(settings)) - 1)
 
     if data_last_day and settings.period_to > data_last_day:
         res.period_incomplete = True
@@ -466,21 +503,14 @@ def _quoted(values: "Iterable") -> str:
     return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
 
 
-def fetch(source: "WarehouseSource", settings: Settings, *,
-          progress_cb=None) -> list:
-    """Per-customer, per-window tallies straight out of the warehouse.
+def _sql(settings: Settings, target: str) -> str:
+    """The one query, shaped for the chosen windows, measure and channels.
 
-    Eight million rows are reduced to a few thousand by the query; nothing
-    larger ever reaches Python.
+    Everything spliced in is a `date` (guarded at `Settings`), an internal
+    constant, or the escaped warehouse path. Nothing the operator types
+    reaches this as text.
     """
-    from . import counter_reconcile as cr
-    duckdb = cr._duckdb()
-    if duckdb is None:
-        raise ValueError("duckdb is not available in this build, so sales "
-                         "movement cannot be measured.")
     wins = windows(settings)
-    target = (source.path.as_posix() if source.kind == "gold"
-              else source.path.as_posix() + "/**/*.parquet").replace("'", "''")
     case = "\n".join(
         f"          when \"Pure Date\" between DATE '{a}' and DATE '{b}' "
         f"then {i}" for i, (a, b) in enumerate(wins))
@@ -515,6 +545,24 @@ def fetch(source: "WarehouseSource", settings: Settings, *,
           and "Transaction" in ({_quoted(_lines(settings.measure))})
 {where_channel}        group by customer_id, win
     """
+    return sql
+
+
+def fetch(source: "WarehouseSource", settings: Settings, *,
+          progress_cb=None) -> list:
+    """Per-customer, per-window tallies straight out of the warehouse.
+
+    Eight million rows are reduced to a few thousand by the query; nothing
+    larger ever reaches Python.
+    """
+    from . import counter_reconcile as cr
+    duckdb = cr._duckdb()
+    if duckdb is None:
+        raise ValueError("duckdb is not available in this build, so sales "
+                         "movement cannot be measured.")
+    target = (source.path.as_posix() if source.kind == "gold"
+              else source.path.as_posix() + "/**/*.parquet").replace("'", "''")
+    sql = _sql(settings, target)
     if progress_cb is not None:
         progress_cb(0)
     con = duckdb.connect()

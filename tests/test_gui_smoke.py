@@ -291,3 +291,60 @@ def test_sales_movement_says_what_a_bad_date_should_look_like(app):
     with _pytest.raises(ValueError, match="YYYY-MM-DD"):
         app._sm_settings()
     app.zenith_sm_from.set("2026-08-01")
+
+
+def test_sales_movement_reads_the_baseline_mode_from_the_form(app):
+    from src import sales_movement as sm
+    _sm_app(app)
+    app.zenith_sm_baseline.set("The same period a year earlier")
+    s = app._sm_settings()
+    assert s.baseline == sm.BASELINE_LAST_YEAR
+    app.zenith_sm_baseline.set("An average of the periods before it")
+    assert app._sm_settings().baseline == sm.BASELINE_TRAILING
+
+
+def test_the_period_count_is_greyed_out_when_there_is_nothing_to_average(app):
+    """Last-year is a single window on purpose; leaving the spinbox live
+    invites someone to set it to 6 and wonder why nothing changes."""
+    _sm_app(app)
+    app.zenith_sm_baseline.set("The same period a year earlier")
+    assert str(app.zenith_sm_trailing_box.cget("state")) == "disabled"
+    app.zenith_sm_baseline.set("An average of the periods before it")
+    assert str(app.zenith_sm_trailing_box.cget("state")) == "normal"
+
+
+def test_the_floor_follows_the_measure_between_money_and_tickets(app):
+    """500,000 meant half a million TICKETS and excluded every agency."""
+    _sm_app(app)
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    app.zenith_sm_floor.set(app._SM_FLOOR_MONEY)
+    app.zenith_sm_measure.set("Tickets issued")
+    assert app.zenith_sm_floor.get() == app._SM_FLOOR_TICKETS
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    assert app.zenith_sm_floor.get() == app._SM_FLOOR_MONEY
+
+
+def test_a_floor_the_user_typed_is_never_overwritten(app):
+    _sm_app(app)
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    app.zenith_sm_floor.set("750000")
+    app.zenith_sm_measure.set("Tickets issued")
+    assert app.zenith_sm_floor.get() == "750000"
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    app.zenith_sm_floor.set(app._SM_FLOOR_MONEY)
+
+
+def test_the_call_list_button_waits_for_a_result(app):
+    _sm_app(app)
+    assert str(app.btn_sm_calls.cget("state")) == "disabled"
+    assert app._sm_last_result is None
+
+
+def test_an_emptied_spinbox_reaches_the_error_box_not_the_traceback(app):
+    """IntVar.get() raises tk.TclError, which `except ValueError` misses."""
+    import pytest as _pytest
+    _sm_app(app)
+    app.zenith_sm_trailing_box.delete(0, "end")
+    with _pytest.raises(ValueError, match="whole number of"):
+        app._sm_settings()
+    app.zenith_sm_trailing.set(3)

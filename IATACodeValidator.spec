@@ -46,6 +46,7 @@ hiddenimports = [
     "src.report_templates",
     "src.sales_movement",
     "src.sales_movement_report",
+    "src.sales_call_list",
     # Reached the same deferred way and previously left to PyInstaller's own
     # analysis. Listed now so the whole class is covered rather than the ones
     # somebody remembered; tests/test_build_spec.py keeps this in step with
