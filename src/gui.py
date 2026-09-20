@@ -7350,8 +7350,9 @@ class App(WhatsAppMixin, HealthMixin):
             value="An average of the periods before it")
         ttk.Combobox(
             base_row, textvariable=self.zenith_sm_baseline, state="readonly",
-            width=34, values=("An average of the periods before it",
-                              "The same period a year earlier"),
+            width=40, values=("An average of the periods before it",
+                              "The same period a year earlier",
+                              "Both — the average AND a year earlier"),
         ).pack(side="left")
         self.zenith_sm_trailing = tk.IntVar(value=3)
         self.zenith_sm_trailing_box = ttk.Spinbox(
@@ -7509,15 +7510,22 @@ class App(WhatsAppMixin, HealthMixin):
     _SM_FLOOR_TICKETS = "50"
 
     def _sm_baseline_changed(self, *_args) -> None:
-        """Grey out the count of periods when it has nothing to average."""
-        last_year = self.zenith_sm_baseline.get() == \
-            "The same period a year earlier"
+        """Grey out the count of periods only when nothing is averaged.
+
+        Under BOTH the average is still one of the two comparisons, so the
+        count very much applies -- disabling it there would be wrong.
+        """
+        chosen = self.zenith_sm_baseline.get()
+        last_year = chosen == "The same period a year earlier"
+        both = chosen.startswith("Both")
         try:
             self.zenith_sm_trailing_box.configure(
                 state="disabled" if last_year else "normal")
             self.zenith_sm_trailing_hint.configure(
                 text=("  — one window; averaging years would blur the season"
                       if last_year else
+                      "  period(s) averaged, shown beside the year-earlier "
+                      "figure" if both else
                       "  period(s), averaged  (1 = plain previous-period "
                       "comparison)"))
         except Exception:        # noqa: BLE001 - UI only
@@ -7673,9 +7681,10 @@ class App(WhatsAppMixin, HealthMixin):
                          self.zenith_sm_direction.get(), sm.EITHER)
         channels = (sm.AGENCY_CHANNELS
                     if self.zenith_sm_who.get() == "Agencies only" else ())
-        baseline = (sm.BASELINE_LAST_YEAR
-                    if self.zenith_sm_baseline.get() ==
-                    "The same period a year earlier" else sm.BASELINE_TRAILING)
+        baseline = {
+            "The same period a year earlier": sm.BASELINE_LAST_YEAR,
+            "Both — the average AND a year earlier": sm.BASELINE_BOTH,
+        }.get(self.zenith_sm_baseline.get(), sm.BASELINE_TRAILING)
         return sm.Settings(
             period_from=first, period_to=last, trailing=trailing,
             baseline=baseline, threshold=threshold / 100.0,

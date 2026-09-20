@@ -529,3 +529,103 @@ def test_the_all_measure_names_itself_in_the_sentence():
     s = sm.Settings(period_from=AUG.period_from, period_to=AUG.period_to,
                     measure=sm.MEASURE_ALL)
     assert "penalties and reissue adjustments" in sm.build([], s).describe()
+
+
+# --------------------------------------------------------------------------
+# both baselines at once -- the two answer different questions, and on
+# August 2026 they agreed on barely a fifth of the names either flagged
+# --------------------------------------------------------------------------
+BOTH = sm.Settings(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+                   baseline=sm.BASELINE_BOTH, trailing=3, threshold=0.20)
+
+
+def test_both_puts_the_year_window_after_the_averaged_ones():
+    got = sm.windows(BOTH)
+    assert got[0] == (date(2026, 8, 1), date(2026, 8, 31))
+    assert got[1] == (date(2026, 7, 1), date(2026, 7, 31))
+    assert got[3] == (date(2026, 5, 1), date(2026, 5, 31))
+    assert got[4] == (date(2025, 8, 1), date(2025, 8, 31))
+    assert sm.year_index(BOTH) == 4
+
+
+def test_both_keeps_the_two_baselines_apart():
+    rows = [_row("Alpha", 0, 900_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 2_000_000)]
+    m = sm.build(rows, BOTH).by_name("Alpha")
+    assert m.baseline == pytest.approx(1_000_000)      # averaged, not 1.25M
+    assert m.baseline_year == pytest.approx(2_000_000)
+    assert m.year_known is True
+
+
+def test_the_averaged_baseline_does_not_swallow_the_year_window():
+    """Dividing four windows by three would inflate every baseline."""
+    rows = [_row("Alpha", 0, 900_000)] + \
+        [_row("Alpha", i, 1_200_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 9_000_000)]
+    m = sm.build(rows, BOTH).by_name("Alpha")
+    assert m.baseline == pytest.approx(1_200_000)
+    assert m.trailing == 3
+
+
+def test_the_year_comparison_has_its_own_change_and_percentage():
+    rows = [_row("Alpha", 0, 900_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 1_800_000)]
+    m = sm.build(rows, BOTH).by_name("Alpha")
+    assert m.change == pytest.approx(-100_000)
+    assert m.change_year == pytest.approx(-900_000)
+    assert m.change_pct_year == pytest.approx(-0.5)
+
+
+def test_down_on_both_is_named_as_such():
+    rows = [_row("Alpha", 0, 500_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 1_000_000)]
+    assert sm.build(rows, BOTH).by_name("Alpha").agreement == "down on both"
+
+
+def test_down_against_recent_months_only_is_distinguished():
+    """The blip: below the recent average, level against last year."""
+    rows = [_row("Alpha", 0, 500_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 500_000)]
+    assert sm.build(rows, BOTH).by_name("Alpha").agreement == \
+        "down vs recent only"
+
+
+def test_down_against_last_year_only_is_distinguished():
+    """The slow slide: level lately, well below where they were."""
+    rows = [_row("Alpha", 0, 1_000_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)] + \
+        [_row("Alpha", 4, 3_000_000)]
+    assert sm.build(rows, BOTH).by_name("Alpha").agreement == \
+        "down vs last year only"
+
+
+def test_a_customer_with_no_sales_a_year_ago_says_so_rather_than_zero():
+    rows = [_row("Alpha", 0, 900_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)]
+    m = sm.build(rows, BOTH).by_name("Alpha")
+    assert m.year_known is False
+    assert m.change_year is None
+    assert m.change_pct_year is None
+    assert m.agreement == ""
+
+
+def test_the_trailing_mode_carries_no_year_figures_at_all():
+    rows = [_row("Alpha", 0, 900_000)] + \
+        [_row("Alpha", i, 1_000_000) for i in (1, 2, 3)]
+    m = sm.build(rows, AUG).by_name("Alpha")
+    assert m.year_known is False and m.agreement == ""
+
+
+def test_the_baseline_span_of_both_covers_only_the_averaged_windows():
+    """Folding the year window in would print a range spanning 12 months."""
+    assert sm.baseline_span(BOTH) == (date(2026, 5, 1), date(2026, 7, 31))
+
+
+def test_the_sentence_mentions_both_comparisons():
+    said = sm.build([], BOTH).describe()
+    assert "May 2026 to Jul 2026" in said
+    assert "Aug 2025" in said
