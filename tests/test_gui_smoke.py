@@ -42,7 +42,8 @@ def test_all_lazy_tabs_build_without_errors(app):
     # Key widgets from each tab exist afterwards (incl. WhatsApp + Health):
     for attr in ("log_text", "bd_log_text", "mail_tree", "zenith_bulk_log",
                  "btn_zenith_fh_inspect", "oep_tree", "wa_tree", "btn_wa_send",
-                 "health_tree", "btn_health_run"):
+                 "health_tree", "btn_health_run",
+                 "zenith_sm_tree", "btn_sm_run"):
         assert hasattr(app, attr), f"missing {attr} after full build"
     # Mixin dispatch: unknown kinds return False (not swallowed).
     assert app._wa_handle_msg("wa_unknown", None) is False
@@ -219,3 +220,74 @@ def test_an_extra_report_format_still_finishes_the_run(app, monkeypatch, tmp_pat
     from src.gui import MSG_ZENITH_FL_DONE
     assert MSG_ZENITH_FL_DONE in posted     # the run reports that it finished
     assert app._zenith_fl_last_rows == rows  # and the rows are still usable
+
+
+# --------------------------------------------------------------------------
+# Sales Movement — the form is the only place a wrong setting can enter, and
+# a silently misread one changes every number on the sheet.
+# --------------------------------------------------------------------------
+def _sm_app(app):
+    app._ensure_tab_built(app._tab_widgets["zenith"])
+    return app
+
+
+def test_sales_movement_defaults_to_the_last_complete_month(app):
+    """Today's month is always partial in the warehouse, and a part-month
+    against whole ones shows the whole book collapsing."""
+    from datetime import date
+    _sm_app(app)
+    s = app._sm_settings()
+    today = date.today()
+    assert s.period_from.day == 1
+    assert (s.period_to < today.replace(day=1))
+    assert s.period_from.month == s.period_to.month
+
+
+def test_sales_movement_reads_the_form_into_settings(app):
+    from src import sales_movement as sm
+    _sm_app(app)
+    app.zenith_sm_from.set("2026-08-01")
+    app.zenith_sm_to.set("2026-08-31")
+    app.zenith_sm_trailing.set(6)
+    app.zenith_sm_threshold.set(35.0)
+    app.zenith_sm_direction.set("Dropped only")
+    app.zenith_sm_floor.set("1,500,000")          # typed with separators
+    app.zenith_sm_measure.set("Gross ticket sales")
+    app.zenith_sm_who.set("All customers")
+    s = app._sm_settings()
+    assert s.trailing == 6
+    assert s.threshold == 0.35                    # per cent -> fraction
+    assert s.direction == sm.DROPPED
+    assert s.floor == 1_500_000
+    assert s.measure == sm.MEASURE_GROSS
+    assert s.channels == ()                       # no channel filter at all
+
+
+def test_sales_movement_defaults_to_agencies_and_net(app):
+    from src import sales_movement as sm
+    _sm_app(app)
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    app.zenith_sm_who.set("Agencies only")
+    s = app._sm_settings()
+    assert s.channels == sm.AGENCY_CHANNELS
+    assert s.measure == sm.MEASURE_NET
+
+
+def test_sales_movement_refuses_a_backwards_period(app):
+    import pytest as _pytest
+    _sm_app(app)
+    app.zenith_sm_from.set("2026-08-31")
+    app.zenith_sm_to.set("2026-08-01")
+    with _pytest.raises(ValueError, match="ends before it starts"):
+        app._sm_settings()
+    app.zenith_sm_from.set("2026-08-01")
+    app.zenith_sm_to.set("2026-08-31")
+
+
+def test_sales_movement_says_what_a_bad_date_should_look_like(app):
+    import pytest as _pytest
+    _sm_app(app)
+    app.zenith_sm_from.set("01/08/2026")
+    with _pytest.raises(ValueError, match="YYYY-MM-DD"):
+        app._sm_settings()
+    app.zenith_sm_from.set("2026-08-01")

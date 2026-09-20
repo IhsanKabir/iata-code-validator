@@ -44,6 +44,18 @@ hiddenimports = [
     "src.counter_blocks",
     "src.visit_master",
     "src.report_templates",
+    "src.sales_movement",
+    "src.sales_movement_report",
+    # Reached the same deferred way and previously left to PyInstaller's own
+    # analysis. Listed now so the whole class is covered rather than the ones
+    # somebody remembered; tests/test_build_spec.py keeps this in step with
+    # what src/gui.py actually imports.
+    "src.flight_load_diagnostics",
+    "src.natta_client",
+    "src.zenith_history_downloader",
+    "src.zenith_history_parser",
+    "src.zenith_pnr_client",
+    "src.zenith_pnr_history_downloader",
     # Lazy-imported only when the user opens the time-series view on the
     # OEP tab; PyInstaller's static analyzer can't see the deferred import.
     "matplotlib",
