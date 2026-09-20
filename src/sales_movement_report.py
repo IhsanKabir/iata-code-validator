@@ -193,23 +193,43 @@ def write_summary(ws, res: sm.Result) -> None:
         (f"Lost ({s.unit})", round(res.money_lost), _fmt(s), "C00000"),
         (f"Gained ({s.unit})", round(res.money_gained), _fmt(s), "006100"),
     ])
-    r += 1
+    r = _read_this_first(ws, r + 1, res)
+    r = _windows_table(ws, r, s)
+    r = _glossary(ws, r, res)
 
-    if res.warnings:
-        r = _band(ws, r, "READ THIS FIRST")
-        for w in res.warnings:
-            ws.merge_cells(f"A{r}:{LAST}{r}")
-            _cell(ws, r, 1, f"  {w}", size=10, fill=WARN, align="left",
-                  wrap=True)
-            ws.row_dimensions[r].height = 30
-            r += 1
+    r = _rollup(ws, r, res, lambda m: m.zone, "BY ZONE",
+                "net movement where the accounts sit")
+    _rollup(ws, r, res, lambda m: m.sales_person, "BY SALES PERSON",
+            "the same money against whoever owns the account")
+
+
+def _read_this_first(ws, r: int, res: sm.Result) -> int:
+    """Anything the run could not stand behind, above the numbers."""
+    if not res.warnings:
+        return r
+    r = _band(ws, r, "READ THIS FIRST")
+    for w in res.warnings:
+        ws.merge_cells(f"A{r}:{LAST}{r}")
+        _cell(ws, r, 1, f"  {w}", size=10, fill=WARN, align="left", wrap=True)
+        ws.row_dimensions[r].height = 30
         r += 1
+    return r + 1
 
+
+def _windows_table(ws, r: int, s: sm.Settings) -> int:
+    """The windows actually compared, with their real day counts.
+
+    The day count is on the sheet because it is the thing that silently
+    invalidates a comparison -- a 19-day period against a 31-day one.
+    """
     r = _band(ws, r, "WHAT WAS COMPARED")
-    wins = sm.windows(s)
     r = _headers(ws, r, ["Window", "From", "To", "Days", "Role", "", "", "",
                          "", "", "", "", "", "", "", "", "", "", "", "", ""])
-    for i, (a, b) in enumerate(wins):
+    # "averaged into the baseline" is a lie when there is only one window
+    other = ("the same period a year earlier"
+             if s.baseline == sm.BASELINE_LAST_YEAR
+             else "averaged into the baseline")
+    for i, (a, b) in enumerate(sm.windows(s)):
         _cell(ws, r, 1, "This period" if i == 0 else f"Baseline {i}",
               bold=(i == 0), size=10, border=True)
         _cell(ws, r, 2, a, fmt="dd mmm yyyy", size=9, border=True,
@@ -217,19 +237,12 @@ def write_summary(ws, res: sm.Result) -> None:
         _cell(ws, r, 3, b, fmt="dd mmm yyyy", size=9, border=True,
               align="center")
         _cell(ws, r, 4, (b - a).days + 1, size=9, border=True, align="center")
-        _cell(ws, r, 5, "measured" if i == 0 else "averaged into the baseline",
-              size=9, color=GREY, border=True)
+        _cell(ws, r, 5, "measured" if i == 0 else other, size=9, color=GREY,
+              border=True)
         for j in range(6, 22):
             _cell(ws, r, j, None, border=True)
         r += 1
-    r += 1
-
-    r = _glossary(ws, r, res)
-
-    r = _rollup(ws, r, res, lambda m: m.zone, "BY ZONE",
-                "net movement where the accounts sit")
-    _rollup(ws, r, res, lambda m: m.sales_person, "BY SALES PERSON",
-            "the same money against whoever owns the account")
+    return r + 1
 
 
 def _glossary(ws, r: int, res: sm.Result) -> int:
