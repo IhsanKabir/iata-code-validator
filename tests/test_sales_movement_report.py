@@ -206,13 +206,29 @@ def test_the_tickets_summary_does_not_say_money(tmp_path):
 # these sheets are built to be forwarded, and the names on them are typed by
 # people -- the warehouse already holds one starting with a minus sign
 # --------------------------------------------------------------------------
-def test_a_name_that_starts_like_a_formula_is_not_evaluated_by_excel(tmp_path):
+def test_a_name_starting_with_a_dash_survives_exactly_as_written(tmp_path):
+    """In an .xlsx a cell carries its own type, and '-Ul-Islam Md Armaan' is
+    written as typed text, which Excel displays and never evaluates. So it
+    must come back byte for byte -- an apostrophe bolted on the front would
+    be stored IN the string and read back by everyone."""
     rows = [_row("-Ul-Islam Md Armaan", 0, 100_000)] + \
         [_row("-Ul-Islam Md Armaan", i, 4_000_000) for i in (1, 2, 3)]
     ws = _book(tmp_path, sm.build(rows, AUG))["Declined"]
-    got = _column(ws, "Agency / customer")[0]
-    assert got.startswith("'"), "Excel would evaluate this as a formula"
-    assert "Ul-Islam Md Armaan" in got
+    assert _column(ws, "Agency / customer")[0] == "-Ul-Islam Md Armaan"
+
+
+def test_a_name_starting_with_equals_is_text_not_a_live_formula(tmp_path):
+    """'=' is the one lead character openpyxl turns into <f>."""
+    rows = [_row("=SUM(A1:A9) Travels", 0, 100_000)] + \
+        [_row("=SUM(A1:A9) Travels", i, 4_000_000) for i in (1, 2, 3)]
+    ws = _book(tmp_path, sm.build(rows, AUG))["Declined"]
+    cell = None
+    for r in range(1, ws.max_row + 1):
+        if str(ws.cell(row=r, column=1).value or "").startswith("=SUM"):
+            cell = ws.cell(row=r, column=1)
+    assert cell is not None, "the name was not written at all"
+    assert cell.value == "=SUM(A1:A9) Travels"      # intact, not mangled
+    assert cell.data_type == "s"                    # text, not a formula
 
 
 def test_an_ordinary_name_is_left_exactly_as_it_is(tmp_path):
@@ -220,11 +236,15 @@ def test_an_ordinary_name_is_left_exactly_as_it_is(tmp_path):
     assert _column(ws, "Agency / customer")[0] == "Falling"
 
 
-def test_numbers_and_dates_are_not_touched_by_the_guard(tmp_path):
-    from src.counter_master import _safe_text
-    assert _safe_text(-4_000_000) == -4_000_000
-    assert _safe_text(None) is None
-    assert _safe_text(date(2026, 8, 31)) == date(2026, 8, 31)
+def test_a_phone_number_keeps_its_plus(tmp_path):
+    """+880... is already safe as typed text. Mangling it would corrupt
+    every number on the call list."""
+    from openpyxl import Workbook
+
+    from src.counter_master import _cell
+    ws = Workbook().active
+    _cell(ws, 1, 1, "+8801711000000")
+    assert ws.cell(row=1, column=1).value == "+8801711000000"
 
 
 def test_the_windows_table_does_not_say_averaged_when_nothing_is_averaged(
