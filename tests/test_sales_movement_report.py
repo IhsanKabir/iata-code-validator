@@ -225,3 +225,29 @@ def test_numbers_and_dates_are_not_touched_by_the_guard(tmp_path):
     assert _safe_text(-4_000_000) == -4_000_000
     assert _safe_text(None) is None
     assert _safe_text(date(2026, 8, 31)) == date(2026, 8, 31)
+
+
+def test_the_windows_table_does_not_say_averaged_when_nothing_is_averaged(
+        tmp_path):
+    """Last-year is a single window. Labelling it 'averaged into the
+    baseline' describes an arithmetic that did not happen."""
+    s = sm.Settings(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+                    baseline=sm.BASELINE_LAST_YEAR)
+    ws = _book(tmp_path, sm.build([], s))["Summary"]
+    roles = [v for v in _column(ws, "Role", limit=4) if v]
+    assert roles == ["measured", "the same period a year earlier"]
+
+
+def test_the_windows_table_still_says_averaged_for_a_trailing_baseline(
+        tmp_path):
+    ws = _book(tmp_path)["Summary"]
+    roles = [v for v in _column(ws, "Role", limit=6) if v]
+    assert roles[1] == "averaged into the baseline"
+
+
+def test_the_windows_table_prints_the_day_count_of_each_window(tmp_path):
+    """A 19-day period against a 31-day one is the comparison that quietly
+    invalidates itself, so the day counts are on the sheet."""
+    ws = _book(tmp_path)["Summary"]
+    days = [v for v in _column(ws, "Days", limit=6) if v]
+    assert days[:2] == [31, 31]           # Aug 2026 and Jul 2026
