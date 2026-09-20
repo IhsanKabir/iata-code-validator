@@ -655,30 +655,30 @@ COLS = [
 LAST = COLS[-1][0]
 
 
-#: Characters Excel reads as the start of a formula. A cell whose text begins
-#: with one of these is evaluated, not displayed.
-_FORMULA_LEAD = ("=", "+", "-", "@")
+def _force_text(cell) -> None:
+    """Keep a value that starts with '=' from becoming a live formula.
 
+    Only '=' needs this. In an .xlsx a cell carries its own type, and
+    openpyxl already writes '+880...', '-Ul-Islam Md Armaan' and '@here' as
+    t="inlineStr" -- typed text, which Excel displays and never evaluates.
+    A leading '=' is the one case openpyxl turns into <f>, so that cell is
+    retyped as a string and flagged with Excel's quote prefix.
 
-def _safe_text(v):
-    """Stop Excel evaluating a name that happens to start like a formula.
-
-    These sheets are built to be forwarded, and the names on them are typed
-    by people: the warehouse already holds '-Ul-Islam Md Armaan', which Excel
-    renders as #NAME? rather than as a name. Prefixing a zero-width-free
-    apostrophe marks the value as literal text; Excel does not display it.
-
-    Only strings that would actually be evaluated are touched, so numbers,
-    dates and ordinary text pass through untouched.
+    Prepending an apostrophe instead, as CSV advice suggests, is wrong here:
+    the apostrophe is escaping only while a person types it into the grid.
+    Written through openpyxl it becomes part of the stored string, so every
+    reader -- Excel, this app, anyone's parser -- gets a name with a stray
+    quote on the front.
     """
-    if isinstance(v, str) and v[:1] in _FORMULA_LEAD:
-        return "'" + v
-    return v
+    if isinstance(cell.value, str) and cell.value.startswith("="):
+        cell.data_type = "s"
+        cell.quotePrefix = True
 
 
 def _cell(ws, r, c, v, *, bold=False, size=10, color=None, fill=None,
           fmt=None, align=None, wrap=False, border=False):
-    cell = ws.cell(row=r, column=c, value=_safe_text(v))
+    cell = ws.cell(row=r, column=c, value=v)
+    _force_text(cell)
     cell.font = Font(bold=bold, size=size, color=color or "000000",
                      name="Segoe UI")
     if fill:
