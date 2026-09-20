@@ -144,6 +144,7 @@ MSG_ZENITH_FL_ERROR = "zenith_fl_error"
 MSG_SM_LOG = "sm_log"               # payload: str
 MSG_SM_DONE = "sm_done"             # payload: dict(summary + rows + path)
 MSG_SM_ERROR = "sm_error"           # payload: str
+MSG_SM_CALLS_DONE = "sm_calls_done"  # payload: dict(path, rows, reachable)
 # Zenith Flight Schedule History sub-tab
 MSG_FSH_PROGRESS = "fsh_progress"   # (done, total, filename)
 MSG_FSH_LOG = "fsh_log"             # payload: str
@@ -4330,6 +4331,9 @@ class App(WhatsAppMixin, HealthMixin):
             # openable, so the button goes back to whatever it was.
             self.btn_sm_open.configure(
                 state="normal" if self._sm_last_path else "disabled")
+            self.btn_sm_calls.configure(
+                state="normal" if self._sm_last_result is not None
+                else "disabled")
             messagebox.showerror("Sales Movement", str(payload))
         elif kind == MSG_SM_DONE:
             info = payload if isinstance(payload, dict) else {}
@@ -4367,6 +4371,25 @@ class App(WhatsAppMixin, HealthMixin):
             self.btn_sm_run.configure(state="normal")
             self.btn_sm_open.configure(state="normal" if self._sm_last_path
                                        else "disabled")
+            self.btn_sm_calls.configure(
+                state="normal" if self._sm_last_result is not None
+                else "disabled")
+        elif kind == MSG_SM_CALLS_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            self._sm_last_calls = info.get("path", "")
+            self.btn_sm_calls.configure(state="normal")
+            n, reach = info.get("rows", 0), info.get("reachable", 0)
+            gap = n - reach
+            self._sm_log(
+                f"Call list: {n:,} agency(ies) to ring, {reach:,} with a "
+                f"contact on file." + (f"  {gap:,} have nobody — those are "
+                f"accounts losing money that no rep has visited."
+                if gap else ""))
+            if self._sm_last_calls:
+                try:
+                    os.startfile(self._sm_last_calls)  # noqa: S606
+                except Exception:                      # noqa: BLE001
+                    pass
         elif kind == MSG_FSH_ERROR:
             self._fsh_log(f"ERROR: {payload}")
             self.fsh_progress_label.configure(text="Failed.")
@@ -7314,12 +7337,25 @@ class App(WhatsAppMixin, HealthMixin):
         self._form_row(period_body, 0, "Look at:", per_row, label_width=18)
 
         base_row = ttk.Frame(period_body)
+        self.zenith_sm_baseline = tk.StringVar(
+            value="An average of the periods before it")
+        ttk.Combobox(
+            base_row, textvariable=self.zenith_sm_baseline, state="readonly",
+            width=34, values=("An average of the periods before it",
+                              "The same period a year earlier"),
+        ).pack(side="left")
         self.zenith_sm_trailing = tk.IntVar(value=3)
-        ttk.Spinbox(base_row, from_=1, to=12, increment=1, width=4,
-                    textvariable=self.zenith_sm_trailing).pack(side="left")
-        ttk.Label(base_row, text="  preceding period(s), averaged   "
-                                 "(1 = plain previous-period comparison)",
-                  style="Hint.TLabel").pack(side="left")
+        self.zenith_sm_trailing_box = ttk.Spinbox(
+            base_row, from_=1, to=12, increment=1, width=4,
+            textvariable=self.zenith_sm_trailing)
+        self.zenith_sm_trailing_box.pack(side="left", padx=(8, 0))
+        self.zenith_sm_trailing_hint = ttk.Label(
+            base_row, text="  period(s), averaged  (1 = plain "
+                           "previous-period comparison)", style="Hint.TLabel")
+        self.zenith_sm_trailing_hint.pack(side="left")
+        # Last-year is a single window on purpose: averaging several years
+        # blurs out the very season it was chosen to hold constant.
+        self.zenith_sm_baseline.trace_add("write", self._sm_baseline_changed)
         self._form_row(period_body, 1, "Compare against:", base_row,
                        label_width=18)
 
@@ -7379,6 +7415,22 @@ class App(WhatsAppMixin, HealthMixin):
                               command=self._sm_pick_output),
             label_width=18)
 
+        # The warehouse holds no contact details. The visit reports do, so
+        # the call list joins the two -- optional, because the list is still
+        # worth having without them.
+        self.zenith_sm_visits = tk.StringVar(value="")
+        visits_entry = ttk.Entry(out_body, textvariable=self.zenith_sm_visits)
+        self._form_row(
+            out_body, 1, "Visit reports:", visits_entry,
+            suffix=ttk.Button(out_body, text="Browse…",
+                              command=self._sm_pick_visits),
+            label_width=18)
+        ttk.Label(out_body,
+                  text="optional — a folder of agency visit reports. Supplies "
+                       "the contact person and phone number on the call list.",
+                  style="Hint.TLabel").grid(row=2, column=1, sticky="w",
+                                            padx=(0, 4))
+
         # ----- Controls -----
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -7389,6 +7441,10 @@ class App(WhatsAppMixin, HealthMixin):
         self.btn_sm_open = ttk.Button(ctl, text="Open workbook",
                                       command=self._sm_open, state="disabled")
         self.btn_sm_open.pack(side="left", padx=(8, 0))
+        self.btn_sm_calls = ttk.Button(
+            ctl, text="Export call list…", command=self._sm_call_list,
+            state="disabled")
+        self.btn_sm_calls.pack(side="left", padx=(8, 0))
         self.zenith_sm_status = ttk.Label(
             ctl, text="Reads the local sales warehouse — no sign-in needed.",
             style="Hint.TLabel")
@@ -7431,12 +7487,31 @@ class App(WhatsAppMixin, HealthMixin):
         # ----- Worker state -----
         self._sm_worker: threading.Thread | None = None
         self._sm_last_path: str = ""
+        self._sm_last_calls: str = ""
+        #: The last Result, kept so "Export call list" does not re-query
+        #: eight million rows to answer the same question again.
+        self._sm_last_result = None
 
     #: Sensible floors in each unit. Measured: at 500,000 BDT the August
     #: agency list falls from 3,981 rows to 631; 50 tickets a month is the
     #: equivalent cut for a volume report.
     _SM_FLOOR_MONEY = "500000"
     _SM_FLOOR_TICKETS = "50"
+
+    def _sm_baseline_changed(self, *_args) -> None:
+        """Grey out the count of periods when it has nothing to average."""
+        last_year = self.zenith_sm_baseline.get() == \
+            "The same period a year earlier"
+        try:
+            self.zenith_sm_trailing_box.configure(
+                state="disabled" if last_year else "normal")
+            self.zenith_sm_trailing_hint.configure(
+                text=("  — one window; averaging years would blur the season"
+                      if last_year else
+                      "  period(s), averaged  (1 = plain previous-period "
+                      "comparison)"))
+        except Exception:        # noqa: BLE001 - UI only
+            pass
 
     def _sm_measure_changed(self, *_args) -> None:
         """Keep the floor and its caption in the unit being measured.
@@ -7466,6 +7541,62 @@ class App(WhatsAppMixin, HealthMixin):
             initialdir=self.zenith_sm_output_dir.get() or str(Path.home()))
         if folder:
             self.zenith_sm_output_dir.set(folder)
+
+    def _sm_pick_visits(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Folder of agency visit reports (for contact details)",
+            initialdir=self.zenith_sm_visits.get() or str(Path.home()))
+        if folder:
+            self.zenith_sm_visits.set(folder)
+
+    def _sm_call_list(self) -> None:
+        """Turn the decline list into something a rep can ring down."""
+        if self._sm_worker is not None and self._sm_worker.is_alive():
+            return
+        if self._sm_last_result is None:
+            messagebox.showerror("Call list",
+                                 "Run 'Find movers' first — the call list is "
+                                 "built from that result.")
+            return
+        self.btn_sm_calls.configure(state="disabled")
+        self._sm_log("Building the call list…")
+        self._sm_worker = threading.Thread(
+            target=self._sm_calls_worker,
+            args=(self._sm_last_result,
+                  (self.zenith_sm_visits.get() or "").strip(),
+                  Path(self.zenith_sm_output_dir.get().strip()
+                       or str(Path.home()))),
+            daemon=True)
+        self._sm_worker.start()
+
+    def _sm_calls_worker(self, res, visits_sel: str, out_dir: Path) -> None:
+        from . import sales_call_list as scl
+        from . import visit_master as vm
+
+        try:
+            contacts: dict = {}
+            if visits_sel:
+                paths = vm.resolve_visit_inputs(visits_sel)
+                if not paths:
+                    raise ValueError(
+                        f"No .xlsx visit reports found in {visits_sel}. Leave "
+                        f"the box empty to build the list without contacts.")
+                self._post(MSG_SM_LOG,
+                           f"Reading {len(paths)} visit report(s)…")
+                # the month is voted from the files, never defaulted to today's
+                month, year, _votes, _agree = vm.detect_period(paths)
+                data = vm.read_all(paths, month=month, year=year)
+                contacts = scl.contacts_from_visits(data)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / scl.default_filename(res.settings)
+            rows = scl.build_workbook(res, path, contacts)
+            self._post(MSG_SM_CALLS_DONE, {
+                "path": str(path), "rows": len(rows),
+                "reachable": sum(1 for r in rows if r.reachable),
+                "contacts": len(contacts),
+            })
+        except Exception as exc:                   # noqa: BLE001
+            self._post(MSG_SM_ERROR, str(exc))
 
     def _sm_log(self, msg: str) -> None:
         try:
@@ -7524,9 +7655,12 @@ class App(WhatsAppMixin, HealthMixin):
                          self.zenith_sm_direction.get(), sm.EITHER)
         channels = (sm.AGENCY_CHANNELS
                     if self.zenith_sm_who.get() == "Agencies only" else ())
+        baseline = (sm.BASELINE_LAST_YEAR
+                    if self.zenith_sm_baseline.get() ==
+                    "The same period a year earlier" else sm.BASELINE_TRAILING)
         return sm.Settings(
             period_from=first, period_to=last, trailing=trailing,
-            threshold=threshold / 100.0,
+            baseline=baseline, threshold=threshold / 100.0,
             direction=direction, floor=max(0.0, floor), measure=measure,
             channels=channels)
 
@@ -7540,6 +7674,7 @@ class App(WhatsAppMixin, HealthMixin):
             return
         self.btn_sm_run.configure(state="disabled")
         self.btn_sm_open.configure(state="disabled")
+        self.btn_sm_calls.configure(state="disabled")
         self.zenith_sm_warning.configure(text="")
         self.zenith_sm_tree.delete(*self.zenith_sm_tree.get_children())
         self._sm_log("Reading the sales warehouse…")
@@ -7565,6 +7700,7 @@ class App(WhatsAppMixin, HealthMixin):
                     "build or mount it first.")
             self._post(MSG_SM_LOG, f"Reading {source.path.name}…")
             res = sm.run(source, settings)
+            self._sm_last_result = res
             out_dir.mkdir(parents=True, exist_ok=True)
             path = out_dir / smr.default_filename(settings)
             smr.build_workbook(res, path)

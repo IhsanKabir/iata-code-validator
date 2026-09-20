@@ -263,6 +263,13 @@ _CONSOLE_TOPICS: tuple[Topic, ...] = (
             S("📈", "Flight loads, history & inspection",
               "Pull flight loads, run the Flight History Analyzer, and Inspect load "
               "factor to see WHY a flight filled the way it did — all to Excel."),
+            S("📉", "Sales Movement — who is up and who is down",
+              "Lists the agencies that moved against their own trailing average, or "
+              "against the same period a year earlier. Needs no sign-in: it reads "
+              "the local sales warehouse. Stopped-buying and refunded-more-than-sold "
+              "get their own sheets, because no percentage describes them. "
+              "‘Export call list’ joins the fallers to the contacts in your visit "
+              "reports, ready for the reps."),
         ),
         callouts=(C("tip", "Skip-cached is on by default, so re-running a bulk job only "
                           "retries what failed."),),

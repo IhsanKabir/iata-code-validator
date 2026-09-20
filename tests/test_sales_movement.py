@@ -385,3 +385,66 @@ def test_the_unit_is_bdt_for_both_money_measures():
         s = sm.Settings(period_from=AUG.period_from, period_to=AUG.period_to,
                         measure=measure)
         assert s.unit == "BDT"
+
+
+# --------------------------------------------------------------------------
+# the same period a year earlier -- Hajj, Umrah and the winter peak move the
+# whole book together, and a trailing average cannot see that
+# --------------------------------------------------------------------------
+LAST_YEAR = sm.Settings(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+                        baseline=sm.BASELINE_LAST_YEAR, trailing=3)
+
+
+def test_last_year_compares_with_the_same_month_a_year_before():
+    got = sm.windows(LAST_YEAR)
+    assert got[0] == (date(2026, 8, 1), date(2026, 8, 31))
+    assert got[1] == (date(2025, 8, 1), date(2025, 8, 31))
+    assert len(got) == 2               # one window, never an average of years
+
+
+def test_last_year_ignores_the_trailing_setting_when_dividing():
+    """Reading `trailing` directly would divide one window's total by three
+    and make every agency look like it tripled."""
+    rows = [_row("Alpha", 0, 900_000), _row("Alpha", 1, 1_000_000)]
+    m = sm.build(rows, LAST_YEAR).by_name("Alpha")
+    assert m.baseline == pytest.approx(1_000_000)
+    assert m.trailing == 1
+    assert m.thin_baseline is False
+
+
+def test_last_year_on_an_arbitrary_range_shifts_both_ends():
+    s = sm.Settings(period_from=date(2026, 8, 10), period_to=date(2026, 8, 19),
+                    baseline=sm.BASELINE_LAST_YEAR)
+    assert sm.windows(s)[1] == (date(2025, 8, 10), date(2025, 8, 19))
+
+
+def test_a_leap_day_steps_back_to_the_twenty_eighth():
+    s = sm.Settings(period_from=date(2028, 2, 29), period_to=date(2028, 2, 29),
+                    baseline=sm.BASELINE_LAST_YEAR)
+    assert sm.windows(s)[1] == (date(2027, 2, 28), date(2027, 2, 28))
+
+
+def test_the_last_year_sentence_does_not_claim_an_average():
+    said = sm.build([], LAST_YEAR).describe()
+    assert "same period a year earlier" in said
+    assert "Aug 2025" in said
+    assert "average" not in said
+
+
+def test_the_trailing_sentence_still_says_average():
+    assert "own average for" in sm.build([], AUG).describe()
+
+
+def test_an_unknown_baseline_mode_is_refused():
+    with pytest.raises(ValueError, match="unknown baseline"):
+        sm.Settings(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+                    baseline="vibes")
+
+
+def test_a_last_year_baseline_before_the_data_starts_is_flagged():
+    """The warehouse begins in May 2025, so asking for early 2026 against
+    last year silently compares with nothing at all."""
+    s = sm.Settings(period_from=date(2026, 2, 1), period_to=date(2026, 2, 28),
+                    baseline=sm.BASELINE_LAST_YEAR)
+    res = sm.build([], s, data_first_day=date(2025, 5, 1))
+    assert res.baseline_truncated is True
