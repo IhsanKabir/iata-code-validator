@@ -145,6 +145,7 @@ MSG_SM_LOG = "sm_log"               # payload: str
 MSG_SM_DONE = "sm_done"             # payload: dict(summary + rows + path)
 MSG_SM_ERROR = "sm_error"           # payload: str
 MSG_SM_CALLS_DONE = "sm_calls_done"  # payload: dict(path, rows, reachable)
+MSG_SM_REFUSED = "sm_refused"       # payload: str (why no answer exists)
 # Zenith Flight Schedule History sub-tab
 MSG_FSH_PROGRESS = "fsh_progress"   # (done, total, filename)
 MSG_FSH_LOG = "fsh_log"             # payload: str
@@ -4374,6 +4375,14 @@ class App(WhatsAppMixin, HealthMixin):
             self.btn_sm_calls.configure(
                 state="normal" if self._sm_last_result is not None
                 else "disabled")
+        elif kind == MSG_SM_REFUSED:
+            self.zenith_sm_tree.delete(*self.zenith_sm_tree.get_children())
+            self._sm_log("No report — see below.")
+            self.zenith_sm_warning.configure(text=str(payload))
+            self.btn_sm_run.configure(state="normal")
+            self.btn_sm_open.configure(
+                state="normal" if self._sm_last_path else "disabled")
+            self.btn_sm_calls.configure(state="disabled")
         elif kind == MSG_SM_CALLS_DONE:
             info = payload if isinstance(payload, dict) else {}
             self._sm_last_calls = info.get("path", "")
@@ -7390,7 +7399,8 @@ class App(WhatsAppMixin, HealthMixin):
             value="Net of refunds and voids")
         measure_cb = ttk.Combobox(
             rule_body, textvariable=self.zenith_sm_measure, state="readonly",
-            width=30, values=("Net of refunds and voids",
+            width=34, values=("Net of refunds and voids",
+                              "Net, plus penalties and reissues",
                               "Gross ticket sales", "Tickets issued"))
         # A floor of 500,000 means half a million BDT, or half a million
         # TICKETS -- which excluded every agency in the book and returned an
@@ -7626,7 +7636,8 @@ class App(WhatsAppMixin, HealthMixin):
         if last < first:
             raise ValueError("The period ends before it starts.")
         measure = {"Gross ticket sales": sm.MEASURE_GROSS,
-                   "Tickets issued": sm.MEASURE_TICKETS}.get(
+                   "Tickets issued": sm.MEASURE_TICKETS,
+                   "Net, plus penalties and reissues": sm.MEASURE_ALL}.get(
                        self.zenith_sm_measure.get(), sm.MEASURE_NET)
         unit = "tickets" if measure == sm.MEASURE_TICKETS else "BDT"
         try:
@@ -7700,6 +7711,12 @@ class App(WhatsAppMixin, HealthMixin):
                     "build or mount it first.")
             self._post(MSG_SM_LOG, f"Reading {source.path.name}…")
             res = sm.run(source, settings)
+            if res.refused:
+                # No workbook at all. A file on disk gets forwarded and
+                # read as an answer, whatever the Summary tab says.
+                self._sm_last_result = None
+                self._post(MSG_SM_REFUSED, res.refused)
+                return
             self._sm_last_result = res
             out_dir.mkdir(parents=True, exist_ok=True)
             path = out_dir / smr.default_filename(settings)

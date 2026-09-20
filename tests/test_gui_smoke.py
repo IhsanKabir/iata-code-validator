@@ -348,3 +348,12 @@ def test_an_emptied_spinbox_reaches_the_error_box_not_the_traceback(app):
     with _pytest.raises(ValueError, match="whole number of"):
         app._sm_settings()
     app.zenith_sm_trailing.set(3)
+
+
+def test_sales_movement_offers_the_measure_that_counts_penalties(app):
+    from src import sales_movement as sm
+    _sm_app(app)
+    app.zenith_sm_measure.set("Net, plus penalties and reissues")
+    assert app._sm_settings().measure == sm.MEASURE_ALL
+    app.zenith_sm_measure.set("Net of refunds and voids")
+    assert app._sm_settings().measure == sm.MEASURE_NET

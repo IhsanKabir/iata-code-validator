@@ -197,3 +197,55 @@ def test_an_empty_list_says_so_rather_than_printing_a_bare_grid(tmp_path):
 
 def test_the_filename_names_the_period():
     assert scl.default_filename(AUG) == "Call_List_Aug2026.xlsx"
+
+
+# --------------------------------------------------------------------------
+# a name match is not an identity -- 80 keys in this warehouse cover two or
+# more accounts, so a silent match can send a rep to the wrong company
+# --------------------------------------------------------------------------
+def _twins():
+    rows = []
+    for cid in ("C-1", "C-2"):
+        rows += [_row("Sky Travels", 0, 1_000_000, customer_id=cid)] + \
+            [_row("Sky Travels", i, 9_000_000, customer_id=cid)
+             for i in (1, 2, 3)]
+    rows += [_row("Solo Tours", 0, 100_000, customer_id="C-3")] + \
+        [_row("Solo Tours", i, 900_000, customer_id="C-3") for i in (1, 2, 3)]
+    return sm.build(rows, AUG)
+
+
+def test_two_accounts_under_one_name_are_both_marked_for_checking():
+    rows = scl.build(_twins(), {})
+    sky = [r for r in rows if r.movement.customer == "Sky Travels"]
+    assert len(sky) == 2
+    assert all(r.ambiguous for r in sky)
+
+
+def test_an_unambiguous_agency_is_not_marked():
+    rows = scl.build(_twins(), {})
+    solo = next(r for r in rows if r.movement.customer == "Solo Tours")
+    assert solo.ambiguous is False
+
+
+def test_the_reason_column_tells_the_rep_to_check(tmp_path):
+    out = tmp_path / "twins.xlsx"
+    scl.build_workbook(_twins(), out, {})
+    ws = load_workbook(out)["Call list"]
+    why = [v for v in _column(ws, "Why they are on this list") if v]
+    assert any("CHECK THE CONTACT" in str(v) for v in why)
+
+
+def test_the_sheet_shows_which_agency_the_contact_was_filed_under(tmp_path):
+    """'AB Travel' in the visit report against 'AB Travels' in the sales
+    system is a good match; seeing the other name is how a rep spots a bad
+    one."""
+    ws = _book(tmp_path)["Call list"]
+    filed = [v for v in _column(ws, "Contact is filed under") if v]
+    assert "AB Travel" in filed
+
+
+def test_the_ambiguous_count_is_on_the_header_tiles(tmp_path):
+    out = tmp_path / "twins2.xlsx"
+    scl.build_workbook(_twins(), out, {})
+    said = _text(load_workbook(out)["Call list"])
+    assert "CHECK THE CONTACT" in said.upper()

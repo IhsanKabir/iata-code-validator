@@ -172,7 +172,21 @@ def _rollup(ws, r, res: sm.Result, key, heading: str, note: str) -> int:
     return r + 1
 
 
+def write_refusal(ws, res: sm.Result) -> None:
+    """A page saying why there is no answer, instead of a confident wrong one."""
+    _prep(ws)
+    ws.freeze_panes = "A4"
+    _title(ws, f"SALES MOVEMENT  ·  {sm.period_label(res.settings)}",
+           "No report was produced, because none of it would have been true.")
+    ws.merge_cells(f"A4:{LAST}8")
+    _cell(ws, 4, 1, f"  {res.refused}", size=12, fill=WARN, align="left",
+          wrap=True)
+
+
 def write_summary(ws, res: sm.Result) -> None:
+    if res.refused:
+        write_refusal(ws, res)
+        return
     _prep(ws)
     ws.freeze_panes = "A4"
     s = res.settings
@@ -276,6 +290,13 @@ def _glossary(ws, r: int, res: sm.Result) -> int:
         ("Held back by the floor",
          f"{res.below_floor:,} customer(s) fell below the "
          f"{s.floor:,.0f} {s.unit} floor and are not in this workbook."),
+        # the money this measure does NOT count, stated rather than implied
+        ("Not counted here",
+         f"This measure leaves out {sm.EXCLUDES[s.measure]}. Across the "
+         f"agency book that is small, but 39 of the 820 agencies above a "
+         f"500k floor carry more than a tenth of their net in penalties and "
+         f"reissue adjustments alone — for those, choose the measure that "
+         f"includes them."),
     ):
         _cell(ws, r, 1, label, bold=True, size=10, align="left")
         ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=21)
@@ -290,6 +311,11 @@ def build_workbook(res: sm.Result, out_path) -> None:
     wb = Workbook()
     write_summary(wb.active, res)
     wb.active.title = "Summary"
+    if res.refused:
+        # No bucket sheets at all. An empty "Declined" tab beside a refusal
+        # invites someone to read it as "nobody declined".
+        wb.save(str(out_path))
+        return
     s = res.settings
     period, base = sm.period_label(s), sm.baseline_label(s)
     for name, rows, note in (
