@@ -31,6 +31,14 @@ from .counter_master import (BAD, GOOD, GREY, LAST, MONEY, NAVY, PAPER, PCT,
 #: columns than the counter sheets do.
 WIDTHS = [30, 13, 18, 12, 8, 15, 15, 15, 9, 9, 9, 11, 12, 10, 10,
           7, 7, 7, 7, 7, 22]
+#: When a year-earlier comparison is asked for, three of the spare columns
+#: carry it instead of sitting blank.
+YEAR_WIDTHS = {16: 15, 17: 11, 18: 24}
+
+
+def _has_year(settings: sm.Settings) -> bool:
+    """True when the sheet carries a year-earlier column beside the average."""
+    return settings.baseline == sm.BASELINE_BOTH
 
 
 def headers(settings: sm.Settings) -> list:
@@ -41,11 +49,17 @@ def headers(settings: sm.Settings) -> list:
     through the workbook.
     """
     unit = settings.unit
-    return ["Agency / customer", "IATA code", "Sales person", "Zone",
-            "Station", f"Baseline average ({unit})", f"This period ({unit})",
-            f"Change ({unit})", "Change %", "Tickets avg", "Tickets now",
-            "Months traded", "Last bought", "Agent type", "Channel",
-            "", "", "", "", "", "Verdict"]
+    out = ["Agency / customer", "IATA code", "Sales person", "Zone",
+           "Station", f"Baseline average ({unit})", f"This period ({unit})",
+           f"Change ({unit})", "Change %", "Tickets avg", "Tickets now",
+           "Months traded", "Last bought", "Agent type", "Channel"]
+    if _has_year(settings):
+        year = f"{sm.a_year_before(settings.period_from):%b %Y}"
+        out += [f"{year} ({unit})", "vs last year %", "Do the two agree?",
+                "", ""]
+    else:
+        out += ["", "", "", "", ""]
+    return out + ["Verdict"]
 
 
 def _fmt(settings: sm.Settings) -> str:
@@ -53,8 +67,10 @@ def _fmt(settings: sm.Settings) -> str:
     return "#,##0" if settings.measure == sm.MEASURE_TICKETS else MONEY
 
 
-def _prep(ws) -> None:
+def _prep(ws, settings: sm.Settings | None = None) -> None:
     for i, width in enumerate(WIDTHS, start=1):
+        if settings is not None and _has_year(settings):
+            width = YEAR_WIDTHS.get(i, width)
         ws.column_dimensions[chr(64 + i)].width = width
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A5"
@@ -81,7 +97,7 @@ def _tone(m) -> str | None:
 
 def write_movers(ws, res: sm.Result, movements, title: str, note: str) -> None:
     """One bucket, ranked by money. The percentage is a filter, not a sort."""
-    _prep(ws)
+    _prep(ws, res.settings)
     _title(ws, title, note)
     money = _fmt(res.settings)
     r = 4
@@ -122,8 +138,20 @@ def write_movers(ws, res: sm.Result, movements, title: str, note: str) -> None:
               align="center")
         _cell(ws, r, 15, m.channel or None, size=9, border=True,
               align="center")
-        for j in range(16, 21):
-            _cell(ws, r, j, None, border=True)
+        if _has_year(res.settings):
+            # A blank here means the customer did not exist a year ago,
+            # which is a fact about them, not a gap in the data.
+            _cell(ws, r, 16, round(m.baseline_year) or None, fmt=money,
+                  size=9, border=True, align="right")
+            _cell(ws, r, 17, m.change_pct_year, fmt=PCT, size=9,
+                  border=True, align="center")
+            _cell(ws, r, 18, m.agreement or None, size=9, border=True,
+                  fill=BAD if m.agreement == "down on both" else None)
+            for j in (19, 20):
+                _cell(ws, r, j, None, border=True)
+        else:
+            for j in range(16, 21):
+                _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, m.verdict, bold=True, size=9, fill=_tone(m),
               border=True, align="center")
         r += 1
@@ -208,6 +236,7 @@ def write_summary(ws, res: sm.Result) -> None:
         (f"Gained ({s.unit})", round(res.money_gained), _fmt(s), "006100"),
     ])
     r = _read_this_first(ws, r + 1, res)
+    r = _agreement_table(ws, r, res)
     r = _windows_table(ws, r, s)
     r = _glossary(ws, r, res)
 
@@ -215,6 +244,44 @@ def write_summary(ws, res: sm.Result) -> None:
                 "net movement where the accounts sit")
     _rollup(ws, r, res, lambda m: m.sales_person, "BY SALES PERSON",
             "the same money against whoever owns the account")
+
+
+def _agreement_table(ws, r: int, res: sm.Result) -> int:
+    """Where the two comparisons agree, and where they do not.
+
+    This is the whole reason for running both. On August 2026 the trailing
+    average and the year-earlier comparison agreed on 145 agencies being
+    down, while 206 were down only against recent months and 39 only against
+    last year -- three different stories that one baseline cannot separate.
+    """
+    if not _has_year(res.settings):
+        return r
+    counts: dict = defaultdict(int)
+    money: dict = defaultdict(float)
+    for m in res.movements:
+        counts[m.agreement or "no sales a year ago"] += 1
+        money[m.agreement or "no sales a year ago"] += m.change
+    r = _band(ws, r, "DO THE TWO COMPARISONS AGREE?",
+              "down on both is a real decline; down on one is a blip, or a "
+              "season")
+    r = _headers(ws, r, ["Verdict", "Customers", f"Net ({res.settings.unit})",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "",
+                         "", "", "", "", ""])
+    order = ["down on both", "down vs recent only", "down vs last year only",
+             "steady on both", "up vs recent only", "up vs last year only",
+             "up on both", "only one side comparable", "no sales a year ago"]
+    for name in order:
+        if name not in counts:
+            continue
+        _cell(ws, r, 1, name, bold=True, size=10, border=True,
+              fill=BAD if name == "down on both" else None)
+        _cell(ws, r, 2, counts[name], size=9, border=True, align="center")
+        _cell(ws, r, 3, round(money[name]), fmt=_fmt(res.settings), size=9,
+              border=True, align="right")
+        for j in range(4, 22):
+            _cell(ws, r, j, None, border=True)
+        r += 1
+    return r + 1
 
 
 def _read_this_first(ws, r: int, res: sm.Result) -> int:

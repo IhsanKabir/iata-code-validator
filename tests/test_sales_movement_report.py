@@ -304,3 +304,55 @@ def test_the_summary_states_what_the_measure_leaves_out(tmp_path):
     said = _text(_book(tmp_path)["Summary"])
     assert "Not counted here" in said
     assert "penalties and reissue adjustments" in said
+
+
+# --------------------------------------------------------------------------
+# both baselines on one sheet
+# --------------------------------------------------------------------------
+BOTH = sm.Settings(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+                   baseline=sm.BASELINE_BOTH, trailing=3, threshold=0.20,
+                   floor=500_000)
+
+
+def _both_result():
+    rows = []
+    rows += [_row("BothDown", 0, 2_000_000)] + \
+        [_row("BothDown", i, 9_000_000) for i in (1, 2, 3)] + \
+        [_row("BothDown", 4, 8_000_000)]
+    rows += [_row("BlipOnly", 0, 3_000_000)] + \
+        [_row("BlipOnly", i, 9_000_000) for i in (1, 2, 3)] + \
+        [_row("BlipOnly", 4, 3_000_000)]
+    return sm.build(rows, BOTH)
+
+
+def test_the_year_column_is_headed_with_the_year_it_holds(tmp_path):
+    ws = _book(tmp_path, _both_result())["Declined"]
+    assert _column(ws, "Aug 2025 (BDT)")[0] == 8_000_000
+
+
+def test_the_sheet_carries_both_percentages_side_by_side(tmp_path):
+    ws = _book(tmp_path, _both_result())["Declined"]
+    assert _column(ws, "Change %")[0] is not None
+    assert _column(ws, "vs last year %")[0] is not None
+
+
+def test_the_agreement_column_separates_a_real_decline_from_a_blip(tmp_path):
+    ws = _book(tmp_path, _both_result())["Declined"]
+    names = _column(ws, "Agency / customer")
+    agree = _column(ws, "Do the two agree?")
+    got = dict(zip(names, agree))
+    assert got["BothDown"] == "down on both"
+    assert got["BlipOnly"] == "down vs recent only"
+
+
+def test_the_summary_tallies_the_agreement(tmp_path):
+    said = _text(_book(tmp_path, _both_result())["Summary"])
+    assert "DO THE TWO COMPARISONS AGREE?" in said
+    assert "down on both" in said
+    assert "down vs recent only" in said
+
+
+def test_a_trailing_only_run_has_no_year_columns(tmp_path):
+    ws = _book(tmp_path)["Declined"]
+    assert "vs last year %" not in _text(ws)
+    assert "DO THE TWO COMPARISONS AGREE?" not in _text(_book(tmp_path)["Summary"])

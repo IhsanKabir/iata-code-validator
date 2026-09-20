@@ -357,3 +357,14 @@ def test_sales_movement_offers_the_measure_that_counts_penalties(app):
     assert app._sm_settings().measure == sm.MEASURE_ALL
     app.zenith_sm_measure.set("Net of refunds and voids")
     assert app._sm_settings().measure == sm.MEASURE_NET
+
+
+def test_sales_movement_can_ask_for_both_baselines_at_once(app):
+    from src import sales_movement as sm
+    _sm_app(app)
+    app.zenith_sm_baseline.set("Both — the average AND a year earlier")
+    s = app._sm_settings()
+    assert s.baseline == sm.BASELINE_BOTH
+    # the period count still matters under BOTH, so it must stay editable
+    assert str(app.zenith_sm_trailing_box.cget("state")) == "normal"
+    app.zenith_sm_baseline.set("An average of the periods before it")

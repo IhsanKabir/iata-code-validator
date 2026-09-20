@@ -86,6 +86,11 @@ BASELINE_TRAILING = "trailing"
 #: whole book together, and a trailing average cannot see that -- against
 #: July, every agency "collapses" in a month that is quiet every year.
 BASELINE_LAST_YEAR = "last_year"
+#: Both at once. An agency down against recent months AND against last
+#: year is in real decline; down against only one is a blip or a season.
+#: Measured on August 2026, the two lists agreed on just 122 of the 559
+#: agencies either of them flagged.
+BASELINE_BOTH = "both"
 
 # --- which way the mover moved ---------------------------------------------
 DROPPED = "dropped"
@@ -174,13 +179,50 @@ class Settings:
                     f"{type(getattr(self, field_name)).__name__}")
         if self.period_to < self.period_from:
             raise ValueError("period_to falls before period_from")
-        if self.baseline not in (BASELINE_TRAILING, BASELINE_LAST_YEAR):
+        if self.baseline not in (BASELINE_TRAILING, BASELINE_LAST_YEAR,
+                                 BASELINE_BOTH):
             raise ValueError(f"unknown baseline {self.baseline!r}")
 
     @property
     def unit(self) -> str:
         """What the figures are counted in -- money, or tickets."""
         return "tickets" if self.measure == MEASURE_TICKETS else "BDT"
+
+
+def _year_window(s: Settings) -> tuple:
+    return (a_year_before(s.period_from), a_year_before(s.period_to))
+
+
+def _trailing_windows(s: Settings) -> list:
+    """The windows immediately before the period, most recent first."""
+    if is_whole_month(s.period_from, s.period_to):
+        out = []
+        for i in range(1, max(1, s.trailing) + 1):
+            y, m = _shift_month(s.period_from.year, s.period_from.month, -i)
+            out.append((date(y, m, 1), date(y, m, monthrange(y, m)[1])))
+        return out
+    span = (s.period_to - s.period_from).days + 1
+    return [(s.period_from - timedelta(days=i * span),
+             s.period_from - timedelta(days=i * span) + timedelta(days=span - 1))
+            for i in range(1, max(1, s.trailing) + 1)]
+
+
+def averaged_count(s: Settings) -> int:
+    """How many windows go into the averaged baseline."""
+    return 1 if s.baseline == BASELINE_LAST_YEAR else max(1, s.trailing)
+
+
+def year_index(s: Settings) -> int | None:
+    """Where the year-earlier window sits in `windows()`, if there is one.
+
+    Under BOTH it is the last window, after the averaged ones, so the two
+    comparisons never draw on the same index.
+    """
+    if s.baseline == BASELINE_LAST_YEAR:
+        return 1
+    if s.baseline == BASELINE_BOTH:
+        return averaged_count(s) + 1
+    return None
 
 
 def windows(s: Settings) -> list:
@@ -191,29 +233,32 @@ def windows(s: Settings) -> list:
     reads as a bug. Any other range is compared with windows of exactly the
     same length, which is the only way a 28-day February is not a ten per
     cent fall against a 31-day January.
+
+    Under BOTH the averaged windows come first and the year-earlier one last,
+    because the two answer different questions and an agency can easily be
+    down against one and level against the other.
     """
     out = [(s.period_from, s.period_to)]
     if s.baseline == BASELINE_LAST_YEAR:
         # One window, not an average: the point is to hold the season
         # constant, and averaging several years would blur it back out.
-        out.append((a_year_before(s.period_from), a_year_before(s.period_to)))
+        out.append(_year_window(s))
         return out
-    if is_whole_month(s.period_from, s.period_to):
-        for i in range(1, max(1, s.trailing) + 1):
-            y, m = _shift_month(s.period_from.year, s.period_from.month, -i)
-            out.append((date(y, m, 1), date(y, m, monthrange(y, m)[1])))
-        return out
-    span = (s.period_to - s.period_from).days + 1
-    for i in range(1, max(1, s.trailing) + 1):
-        start = s.period_from - timedelta(days=i * span)
-        out.append((start, start + timedelta(days=span - 1)))
+    out.extend(_trailing_windows(s))
+    if s.baseline == BASELINE_BOTH:
+        out.append(_year_window(s))
     return out
 
 
 def baseline_span(s: Settings) -> tuple:
-    """First and last day the baseline average is drawn from."""
-    w = windows(s)
-    return (w[-1][0], w[1][1])
+    """First and last day the AVERAGED baseline is drawn from.
+
+    The year-earlier window is deliberately not included: under BOTH it
+    sits a year away, and folding it into one span would print a range
+    covering twelve months nobody asked about.
+    """
+    w = windows(s)[1:1 + averaged_count(s)]
+    return (w[-1][0], w[0][1])
 
 
 def period_label(s: Settings) -> str:
@@ -250,6 +295,9 @@ class Movement:
     #: How many of the baseline windows this customer actually bought in.
     windows_traded: int = 0
     trailing: int = 1
+    #: The same period a year earlier, when that comparison was asked for.
+    baseline_year: float = 0.0
+    year_known: bool = False
     threshold: float = 0.20
     last_bought: date | None = None
 
@@ -287,6 +335,51 @@ class Movement:
         if pct >= self.threshold:
             return GREW
         return STABLE
+
+    @property
+    def change_year(self) -> float | None:
+        """Movement against the same period a year earlier."""
+        if not self.year_known:
+            return None
+        return self.current - self.baseline_year
+
+    @property
+    def change_pct_year(self) -> float | None:
+        """None wherever a percentage would be a lie, as for the average."""
+        if not self.year_known or self.baseline_year <= 0 or self.current <= 0:
+            return None
+        return (self.current - self.baseline_year) / self.baseline_year
+
+    @property
+    def agreement(self) -> str:
+        """Whether the two comparisons tell the same story.
+
+        This is the reason for running both. An agency down against recent
+        months AND against last year is in real decline. Down against only
+        one of them is a blip, or a season -- and on August 2026 the two
+        lists agreed on barely a fifth of the names either flagged.
+        """
+        if not self.year_known:
+            return ""
+        a, b = self.change_pct, self.change_pct_year
+        if a is None or b is None:
+            return "only one side comparable"
+        t = self.threshold
+        down = (a <= -t, b <= -t)
+        up = (a >= t, b >= t)
+        if all(down):
+            return "down on both"
+        if all(up):
+            return "up on both"
+        if down[0]:
+            return "down vs recent only"
+        if down[1]:
+            return "down vs last year only"
+        if up[0]:
+            return "up vs recent only"
+        if up[1]:
+            return "up vs last year only"
+        return "steady on both"
 
     @property
     def thin_baseline(self) -> bool:
@@ -397,9 +490,14 @@ class Result:
                              "and reissue adjustments",
                 MEASURE_TICKETS: "tickets issued"}[s.measure]
         who = "Agencies" if s.channels == AGENCY_CHANNELS else "Customers"
-        basis = (f"the same period a year earlier ({baseline_label(s)})"
-                 if s.baseline == BASELINE_LAST_YEAR
-                 else f"their own average for {baseline_label(s)}")
+        year = f"{_year_window(s)[0]:%b %Y}"
+        if s.baseline == BASELINE_LAST_YEAR:
+            basis = f"the same period a year earlier ({year})"
+        elif s.baseline == BASELINE_BOTH:
+            basis = (f"their own average for {baseline_label(s)}, with "
+                     f"{year} shown beside it")
+        else:
+            basis = f"their own average for {baseline_label(s)}"
         said = (f"{who} whose {what} in {period_label(s)} {moved} "
                 f"{s.threshold:.0%} or more {against} {basis}")
         if s.floor > 0:
@@ -421,8 +519,8 @@ def _identity(row: dict) -> tuple:
     return (cid or f"name:{name.upper()}", name)
 
 
-def _accumulate(rows: "Iterable", res: Result, n: int,
-                threshold: float) -> dict:
+def _accumulate(rows: "Iterable", res: Result, n: int, threshold: float,
+                yi: int | None = None, max_window: int | None = None) -> dict:
     """Per-customer running totals, current window against the baseline ones."""
     acc: dict = {}
     for r in rows:
@@ -434,7 +532,7 @@ def _accumulate(rows: "Iterable", res: Result, n: int,
             w = int(r.get("window"))
         except (TypeError, ValueError):
             continue
-        if w < 0 or w > n:
+        if w < 0 or w > (max_window if max_window is not None else n):
             continue
         m = acc.get(key)
         if m is None:
@@ -455,7 +553,14 @@ def _accumulate(rows: "Iterable", res: Result, n: int,
         if w == 0:
             m.current += amount
             m.tickets_current += tickets
-        else:
+            continue
+        # Under BOTH the year-earlier window sits past the averaged ones, so
+        # it feeds only its own total. Under LAST_YEAR it is index 1 and is
+        # both -- the averaged baseline there IS the year.
+        if yi is not None and w == yi:
+            m.baseline_year += amount
+            m.year_known = True
+        if 1 <= w <= n:
             m.baseline += amount
             m.tickets_baseline += tickets
             if amount:
@@ -473,10 +578,19 @@ def usable_baseline_windows(s: Settings, data_first_day: date | None) -> int:
     starts that May, divided one month's sales by three and turned 318
     agencies into heroes.
     """
-    base = windows(s)[1:]
+    base = windows(s)[1:1 + averaged_count(s)]
     if data_first_day is None:
         return len(base)
     return sum(1 for (a, _b) in base if a >= data_first_day)
+
+
+def year_available(s: Settings, data_first_day: date | None) -> bool:
+    """Whether the data reaches the year-earlier window at all."""
+    if year_index(s) is None:
+        return False
+    if data_first_day is None:
+        return True
+    return _year_window(s)[0] >= data_first_day
 
 
 def clamp_period(s: Settings, data_last_day: date | None) -> tuple:
@@ -519,7 +633,10 @@ def build(rows: "Iterable", settings: Settings, *,
     # However many baseline windows the mode produced -- three for a
     # trailing average, one for last year. Reading `trailing` directly
     # would divide the last-year comparison by three.
-    asked = max(1, len(windows(settings)) - 1)
+    # Only the AVERAGED windows count towards the divisor. Reading the whole
+    # window list would include the year-earlier one under BOTH and divide a
+    # three-month average by four.
+    asked = averaged_count(settings)
     n = usable_baseline_windows(settings, data_first_day) or asked
 
     # A baseline the data cannot reach at all is not a small problem to note
@@ -536,7 +653,7 @@ def build(rows: "Iterable", settings: Settings, *,
             f"new, which says nothing about any of them. Pick a later "
             f"period, or a baseline that falls inside the data.")
         return res
-    if n < asked:
+    if n < asked and data_first_day is not None:
         res.warnings.append(
             f"The baseline was averaged over {n} window(s), not the {asked} "
             f"asked for: the warehouse starts on {_dm(data_first_day)} and "
@@ -560,7 +677,9 @@ def build(rows: "Iterable", settings: Settings, *,
             f"{_dm(data_first_day)}. The missing windows count as zero, which "
             f"lowers the average and flatters everyone.")
 
-    acc = _accumulate(rows, res, n, settings.threshold)
+    yi = year_index(settings)
+    acc = _accumulate(rows, res, n, settings.threshold, yi=yi,
+                      max_window=len(windows(settings)) - 1)
 
     for m in acc.values():
         # the divisor is the windows ASKED FOR, not the ones they traded in
