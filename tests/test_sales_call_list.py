@@ -249,3 +249,19 @@ def test_the_ambiguous_count_is_on_the_header_tiles(tmp_path):
     scl.build_workbook(_twins(), out, {})
     said = _text(load_workbook(out)["Call list"])
     assert "CHECK THE CONTACT" in said.upper()
+
+
+def test_the_call_list_covers_fallers_whatever_the_direction_filter_says():
+    """The grid can be showing risers; the call list is inherently about
+    the agencies going backwards, so it must not quietly follow `direction`
+    and come out empty."""
+    rows = []
+    rows += [_row("Falling", 0, 1_000_000)] + \
+        [_row("Falling", i, 9_000_000) for i in (1, 2, 3)]
+    rows += [_row("Rising", 0, 9_000_000)] + \
+        [_row("Rising", i, 1_000_000) for i in (1, 2, 3)]
+    up_only = sm.Settings(period_from=AUG.period_from, period_to=AUG.period_to,
+                          trailing=3, threshold=0.20, direction=sm.INCREASED)
+    res = sm.build(rows, up_only)
+    assert [m.customer for m in res.reported] == ["Rising"]      # the grid
+    assert [r.movement.customer for r in scl.build(res, {})] == ["Falling"]
