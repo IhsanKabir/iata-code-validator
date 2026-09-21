@@ -265,3 +265,48 @@ def test_the_call_list_covers_fallers_whatever_the_direction_filter_says():
     res = sm.build(rows, up_only)
     assert [m.customer for m in res.reported] == ["Rising"]      # the grid
     assert [r.movement.customer for r in scl.build(res, {})] == ["Falling"]
+
+
+# --------------------------------------------------------------------------
+# a grouped agency opens to its accounts here too
+# --------------------------------------------------------------------------
+class _M:
+    """A movement carrying accounts, as sales_movement now produces."""
+
+    def __init__(self):
+        self.customer, self.customer_id = "BE FRESH LIMITED", "10000277"
+        self.iata = self.zone = self.station = self.sales_person = ""
+        self.bucket, self.baseline, self.current = sm.DECLINED, 900.0, 100.0
+        self.change_pct, self.last_bought = -0.89, date(2026, 8, 20)
+        self.accounts = [("10000277", "BE FRESH LIMITED", 60.0, 500.0),
+                         ("11662412", "Be Fresh Limited (IATA)", 40.0, 400.0)]
+        self.is_group = True
+
+    @property
+    def change(self):
+        return self.current - self.baseline
+
+
+class _Res:
+    settings = AUG
+    declined = [_M()]
+    lapsed: list = []
+    refunded: list = []
+
+
+def test_the_accounts_open_under_the_agency_on_the_call_list(tmp_path):
+    out = tmp_path / "calls.xlsx"
+    scl.build_workbook(_Res(), out, {})
+    ws = load_workbook(out)["Call list"]
+    header = None
+    for r in range(1, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value == "Agency":
+            header = r
+    assert str(ws.cell(row=header + 1, column=1).value).startswith(
+        "BE FRESH LIMITED")
+    child = header + 2
+    assert str(ws.cell(row=child, column=1).value).strip() == "BE FRESH LIMITED"
+    assert ws.cell(row=child, column=2).value == "10000277"
+    assert ws.row_dimensions[child].outlineLevel == 1
+    assert ws.row_dimensions[child].hidden is True
+    assert ws.sheet_properties.outlinePr.summaryBelow is False
