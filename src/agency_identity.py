@@ -105,8 +105,12 @@ def resolve(rows) -> tuple:
     ordered biggest first, and skipped lists identifiers that are not agency
     accounts -- reported rather than silently folded in.
     """
+    from collections import defaultdict
+
     groups: dict = {}
     skipped: list = []
+    seen: dict = defaultdict(dict)      # key -> {customer_id: value}
+    names: dict = defaultdict(dict)     # key -> {customer_id: name}
     for r in rows:
         cid = str(r.get("customer_id") or "").strip()
         name = str(r.get("customer") or "").strip()
@@ -118,12 +122,19 @@ def resolve(rows) -> tuple:
         g = groups.get(key)
         if g is None:
             g = groups[key] = AgencyGroup(key=key)
-        value = float(r.get("value") or 0.0)
-        g.members.append((cid, name, value))
+        # One row per ACCOUNT, however many times it is fed in. Callers
+        # resolve over two windows at once so an agency that changed account
+        # between them stays one business, and that hands the same account
+        # in twice -- appending blindly listed it twice and doubled the total.
+        seen[key][cid] = (seen[key].get(cid, 0.0)
+                          + float(r.get("value") or 0.0))
+        names[key][cid] = name or names[key].get(cid, "")
         code = clean_iata(r.get("iata"))
         if code:
             g.codes.add(code)
-    for g in groups.values():
+    for key, g in groups.items():
+        g.members = [(cid, names[key][cid], value)
+                     for cid, value in seen[key].items()]
         g.members.sort(key=lambda m: -m[2])
         # the name the biggest account trades under, so the sheet shows the
         # one a reader will recognise
