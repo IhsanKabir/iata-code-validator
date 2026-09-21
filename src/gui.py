@@ -7430,6 +7430,59 @@ class App(WhatsAppMixin, HealthMixin):
         self._form_row(period_body, 1, "Compare against:", base_row,
                        label_width=18)
 
+        # ----- Agency scorecard -----
+        # Same warehouse, a different question: not "who moved" but "where
+        # does this one agency stand". It lives here rather than in a tab
+        # of its own because it shares the warehouse and the output folder.
+        card_body = self._section(
+            parent, "Agency scorecard  ·  where one agency stands with BS",
+            help_text=(
+                "Market share, growth and ranking for one agency, this "
+                "period against the same period a year earlier.\n\n"
+                "Growth is split by accreditation, because Agent Type is a "
+                "property of the ACCOUNT: Be Fresh trades through a "
+                "Non-IATA account and two BSP ones, and grew 32.5% overall "
+                "while its BSP arm grew 5.5%.\n\n"
+                "Accounts are grouped into the business first — 147 "
+                "agencies hold 333 accounts between them, and left apart "
+                "they are misplaced by as much as 491 ranks."))
+        card_row = ttk.Frame(card_body)
+        self.zenith_sc_term = tk.StringVar(value="")
+        entry = ttk.Entry(card_row, textvariable=self.zenith_sc_term,
+                          width=34)
+        entry.pack(side="left")
+        entry.bind("<Return>", lambda _e: self._sc_run())
+        self.btn_sc_run = ttk.Button(card_row, text="Look up",
+                                     command=self._sc_run)
+        self.btn_sc_run.pack(side="left", padx=(8, 0))
+        ttk.Label(card_row, text="  agency name or account number — the "
+                                 "period above is used",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(card_body, 0, "Agency:", card_row, label_width=18)
+        self.zenith_sc_status = ttk.Label(
+            card_body,
+            text=("Type an agency name or account number above and "
+                  "press Enter. Nothing else on this tab needs to be "
+                  "run first — only the period is used."),
+            style="Hint.TLabel", wraplength=880, justify="left")
+        self.zenith_sc_status.grid(row=1, column=1, sticky="w")
+        cols = (("metric", "Metric", 300), ("now", "This period", 150),
+                ("before", "A year earlier", 150), ("move", "Change", 160))
+        self.zenith_sc_tree = ttk.Treeview(
+            card_body, columns=[c[0] for c in cols], show="headings",
+            height=9)
+        for cid, label, width in cols:
+            self.zenith_sc_tree.heading(cid, text=label)
+            self.zenith_sc_tree.column(
+                cid, width=width,
+                anchor="e" if cid != "metric" else "w")
+        self.zenith_sc_tree.grid(row=2, column=0, columnspan=3,
+                                 sticky="ew", pady=(6, 2))
+        self.zenith_sc_tree.tag_configure("head", font=("Segoe UI", 9, "bold"))
+        self.zenith_sc_tree.bind("<Double-1>", self._sc_pick)
+        self._register_result_tree(self.zenith_sc_tree)
+        self._sc_candidates: list = []
+
         # ----- What counts as a move -----
         rule_body = self._section(parent, "What counts as a move")
         thr_row = ttk.Frame(rule_body)
@@ -7555,56 +7608,6 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_sm_tree.tag_configure("down", foreground="#B00020")
         self.zenith_sm_tree.tag_configure("up", foreground="#0B6A0B")
         self._register_result_tree(self.zenith_sm_tree)
-
-        # ----- Agency scorecard -----
-        # Same warehouse, a different question: not "who moved" but "where
-        # does this one agency stand". It lives here rather than in a tab
-        # of its own because it shares the warehouse and the output folder.
-        card_body = self._section(
-            parent, "Agency scorecard  ·  where one agency stands with BS",
-            help_text=(
-                "Market share, growth and ranking for one agency, this "
-                "period against the same period a year earlier.\n\n"
-                "Growth is split by accreditation, because Agent Type is a "
-                "property of the ACCOUNT: Be Fresh trades through a "
-                "Non-IATA account and two BSP ones, and grew 32.5% overall "
-                "while its BSP arm grew 5.5%.\n\n"
-                "Accounts are grouped into the business first — 147 "
-                "agencies hold 333 accounts between them, and left apart "
-                "they are misplaced by as much as 491 ranks."))
-        card_row = ttk.Frame(card_body)
-        self.zenith_sc_term = tk.StringVar(value="")
-        entry = ttk.Entry(card_row, textvariable=self.zenith_sc_term,
-                          width=34)
-        entry.pack(side="left")
-        entry.bind("<Return>", lambda _e: self._sc_run())
-        self.btn_sc_run = ttk.Button(card_row, text="Look up",
-                                     command=self._sc_run)
-        self.btn_sc_run.pack(side="left", padx=(8, 0))
-        ttk.Label(card_row, text="  agency name or account number — the "
-                                 "period above is used",
-                  style="Hint.TLabel").pack(side="left")
-        self._form_row(card_body, 0, "Agency:", card_row, label_width=18)
-        self.zenith_sc_status = ttk.Label(card_body, text="",
-                                          style="Hint.TLabel",
-                                          wraplength=880, justify="left")
-        self.zenith_sc_status.grid(row=1, column=1, sticky="w")
-        cols = (("metric", "Metric", 300), ("now", "This period", 150),
-                ("before", "A year earlier", 150), ("move", "Change", 160))
-        self.zenith_sc_tree = ttk.Treeview(
-            card_body, columns=[c[0] for c in cols], show="headings",
-            height=9)
-        for cid, label, width in cols:
-            self.zenith_sc_tree.heading(cid, text=label)
-            self.zenith_sc_tree.column(
-                cid, width=width,
-                anchor="e" if cid != "metric" else "w")
-        self.zenith_sc_tree.grid(row=2, column=0, columnspan=3,
-                                 sticky="ew", pady=(6, 2))
-        self.zenith_sc_tree.tag_configure("head", font=("Segoe UI", 9, "bold"))
-        self.zenith_sc_tree.bind("<Double-1>", self._sc_pick)
-        self._register_result_tree(self.zenith_sc_tree)
-        self._sc_candidates: list = []
 
         # ----- Worker state -----
         self._sm_worker: threading.Thread | None = None
