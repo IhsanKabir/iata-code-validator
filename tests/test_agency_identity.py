@@ -162,3 +162,24 @@ def test_searching_a_member_account_name_finds_the_group():
 def test_an_empty_search_returns_nothing_rather_than_everything():
     groups, _ = ai.resolve(BE_FRESH)
     assert ai.find(groups, "  ") == []
+
+
+# --------------------------------------------------------------------------
+# the same account fed in twice is still one account
+# --------------------------------------------------------------------------
+def test_an_account_seen_in_two_windows_is_listed_once():
+    """Callers resolve over both windows at once so an agency that changed
+    account between them stays one business. Appending blindly listed every
+    account twice and doubled the group total."""
+    rows = BE_FRESH + BE_FRESH
+    g = next(iter(ai.resolve(rows)[0].values()))
+    assert sorted(g.ids) == ["10000277", "10469441", "11662412"]
+    assert len(g.members) == 3
+
+
+def test_the_two_windows_are_summed_not_duplicated():
+    this_year = [_row("1", "Solo Tours", "0", 100)]
+    last_year = [_row("1", "Solo Tours", "0", 40)]
+    g = next(iter(ai.resolve(this_year + last_year)[0].values()))
+    assert g.value == 140
+    assert len(g.members) == 1
