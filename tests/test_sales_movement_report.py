@@ -356,3 +356,66 @@ def test_a_trailing_only_run_has_no_year_columns(tmp_path):
     ws = _book(tmp_path)["Declined"]
     assert "vs last year %" not in _text(ws)
     assert "DO THE TWO COMPARISONS AGREE?" not in _text(_book(tmp_path)["Summary"])
+
+
+# --------------------------------------------------------------------------
+# one row per AGENCY, its accounts one click away
+# --------------------------------------------------------------------------
+def _grouped():
+    """Two accounts of one agency, plus a single-account agency."""
+    rows = []
+    for cid in ("10000277", "11662412"):
+        rows += [_row("BE FRESH LIMITED", 0, 1_000_000, customer_id=cid)] + \
+            [_row("BE FRESH LIMITED", i, 5_000_000, customer_id=cid)
+             for i in (1, 2, 3)]
+    rows += [_row("Solo Tours", 0, 100_000, customer_id="999")] + \
+        [_row("Solo Tours", i, 900_000, customer_id="999") for i in (1, 2, 3)]
+    by_account = {"10000277": _G("befreshlimited", "BE FRESH LIMITED"),
+                  "11662412": _G("befreshlimited", "BE FRESH LIMITED"),
+                  "999": _G("solotours", "Solo Tours")}
+    return sm.build(rows, AUG, by_account=by_account)
+
+
+class _G:
+    def __init__(self, key, name):
+        self.key, self.name = key, name
+
+
+def test_the_group_is_one_row_naming_its_account_count(tmp_path):
+    ws = _book(tmp_path, _grouped())["Declined"]
+    names = [v for v in _column(ws, "Agency / customer") if v]
+    assert names[0] == "BE FRESH LIMITED  (2 accounts)"
+
+
+def test_the_group_total_is_the_sum_of_its_accounts(tmp_path):
+    ws = _book(tmp_path, _grouped())["Declined"]
+    assert _column(ws, "This period (BDT)")[0] == 2_000_000     # 2 x 1,000,000
+
+
+def test_the_accounts_sit_under_the_total_collapsed(tmp_path):
+    """Excel's own outlining: the sheet opens on one row per agency and the
+    accounts are behind a '+'."""
+    ws = _book(tmp_path, _grouped())["Declined"]
+    header = None
+    for r in range(1, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value == "Agency / customer":
+            header = r
+    child = ws.cell(row=header + 2, column=1).value
+    assert str(child).strip() == "BE FRESH LIMITED"
+    assert ws.row_dimensions[header + 2].outlineLevel == 1
+    assert ws.row_dimensions[header + 2].hidden is True
+    assert ws.cell(row=header + 2, column=2).value in ("10000277", "11662412")
+
+
+def test_the_summary_row_sits_above_its_detail(tmp_path):
+    ws = _book(tmp_path, _grouped())["Declined"]
+    assert ws.sheet_properties.outlinePr.summaryBelow is False
+
+
+def test_a_single_account_agency_has_no_child_rows(tmp_path):
+    ws = _book(tmp_path, _grouped())["Declined"]
+    levels = [ws.row_dimensions[r].outlineLevel
+              for r in range(1, ws.max_row + 1)
+              if str(ws.cell(row=r, column=1).value or "").strip()
+              == "Solo Tours"]
+    assert levels and all(v in (0, None) for v in levels)

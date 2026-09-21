@@ -146,6 +146,9 @@ MSG_SM_DONE = "sm_done"             # payload: dict(summary + rows + path)
 MSG_SM_ERROR = "sm_error"           # payload: str
 MSG_SM_CALLS_DONE = "sm_calls_done"  # payload: dict(path, rows, reachable)
 MSG_SM_REFUSED = "sm_refused"       # payload: str (why no answer exists)
+MSG_SC_DONE = "sc_done"             # payload: dict (one agency scorecard)
+MSG_SC_CHOOSE = "sc_choose"         # payload: list (ambiguous candidates)
+MSG_SC_ERROR = "sc_error"           # payload: str
 # Zenith Flight Schedule History sub-tab
 MSG_FSH_PROGRESS = "fsh_progress"   # (done, total, filename)
 MSG_FSH_LOG = "fsh_log"             # payload: str
@@ -4383,6 +4386,64 @@ class App(WhatsAppMixin, HealthMixin):
             self.btn_sm_open.configure(
                 state="normal" if self._sm_last_path else "disabled")
             self.btn_sm_calls.configure(state="disabled")
+        elif kind == MSG_SC_ERROR:
+            self._sc_log("Failed.")
+            self.btn_sc_run.configure(state="normal")
+            messagebox.showerror("Agency scorecard", str(payload))
+        elif kind == MSG_SC_CHOOSE:
+            rows = payload if isinstance(payload, list) else []
+            self._sc_candidates = [r[2] for r in rows]
+            self.zenith_sc_tree.delete(*self.zenith_sc_tree.get_children())
+            for label, value, _acct in rows:
+                self.zenith_sc_tree.insert(
+                    "", "end", values=(label, f"{value:,.0f}", "", ""))
+            self.btn_sc_run.configure(state="normal")
+            # never a silent pick: 'TRAVELS' matches 1,825 agency names
+            self._sc_log(
+                f"{len(rows):,} agencies match that. Double-click the one you "
+                f"mean, or type its account number."
+                if rows else "Nothing matched that name or account number.")
+        elif kind == MSG_SC_DONE:
+            d = payload if isinstance(payload, dict) else {}
+            t = self.zenith_sc_tree
+            t.delete(*t.get_children())
+
+            def pct(v):
+                return "" if v is None else f"{v:+.1%}"
+
+            def share(v):
+                # blank, not 0%, where the agency was not in the market
+                return "" if v is None else f"{v * 100:.3f}%"
+
+            def add(metric, now, before, move, head=False):
+                t.insert("", "end", values=(metric, now, before, move),
+                         tags=("head",) if head else ())
+
+            add("Market share with BS", share(d.get("share_now")),
+                share(d.get("share_before")),
+                "" if d.get("share_move") is None
+                else f"{d['share_move'] * 100:+.3f} pts", head=True)
+            add("Sales with BS", f"{d.get('sales_now', 0):,.0f}",
+                f"{d.get('sales_before', 0):,.0f}", pct(d.get("growth")),
+                head=True)
+            add("   └ BSP accounts", f"{d.get('bsp_now', 0):,.0f}",
+                f"{d.get('bsp_before', 0):,.0f}", pct(d.get("growth_bsp")))
+            add("   └ Non-IATA accounts", f"{d.get('other_now', 0):,.0f}",
+                f"{d.get('other_before', 0):,.0f}", pct(d.get("growth_other")))
+            rn, rb = d.get("rank_now"), d.get("rank_before")
+            add("Ranking with BS",
+                f"{rn:,} of {d.get('n_now', 0):,}" if rn else "",
+                f"{rb:,} of {d.get('n_before', 0):,}" if rb else "",
+                "" if d.get("rank_move") is None
+                else f"{d['rank_move']:+d} places", head=True)
+            add("   └ where that sits", d.get("band_now", ""),
+                d.get("band_before", ""), "")
+            for cid, nm, val in d.get("accounts", ()):
+                add(f"   account {cid}  {nm}", f"{val:,.0f}", "", "")
+            self.btn_sc_run.configure(state="normal")
+            self._sc_candidates = []
+            notes = " ".join(d.get("warnings", ()))
+            self._sc_log(f"{d.get('span', '')}.  {notes}".strip())
         elif kind == MSG_SM_CALLS_DONE:
             info = payload if isinstance(payload, dict) else {}
             self._sm_last_calls = info.get("path", "")
@@ -7495,6 +7556,56 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_sm_tree.tag_configure("up", foreground="#0B6A0B")
         self._register_result_tree(self.zenith_sm_tree)
 
+        # ----- Agency scorecard -----
+        # Same warehouse, a different question: not "who moved" but "where
+        # does this one agency stand". It lives here rather than in a tab
+        # of its own because it shares the warehouse and the output folder.
+        card_body = self._section(
+            parent, "Agency scorecard  ·  where one agency stands with BS",
+            help_text=(
+                "Market share, growth and ranking for one agency, this "
+                "period against the same period a year earlier.\n\n"
+                "Growth is split by accreditation, because Agent Type is a "
+                "property of the ACCOUNT: Be Fresh trades through a "
+                "Non-IATA account and two BSP ones, and grew 32.5% overall "
+                "while its BSP arm grew 5.5%.\n\n"
+                "Accounts are grouped into the business first — 147 "
+                "agencies hold 333 accounts between them, and left apart "
+                "they are misplaced by as much as 491 ranks."))
+        card_row = ttk.Frame(card_body)
+        self.zenith_sc_term = tk.StringVar(value="")
+        entry = ttk.Entry(card_row, textvariable=self.zenith_sc_term,
+                          width=34)
+        entry.pack(side="left")
+        entry.bind("<Return>", lambda _e: self._sc_run())
+        self.btn_sc_run = ttk.Button(card_row, text="Look up",
+                                     command=self._sc_run)
+        self.btn_sc_run.pack(side="left", padx=(8, 0))
+        ttk.Label(card_row, text="  agency name or account number — the "
+                                 "period above is used",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(card_body, 0, "Agency:", card_row, label_width=18)
+        self.zenith_sc_status = ttk.Label(card_body, text="",
+                                          style="Hint.TLabel",
+                                          wraplength=880, justify="left")
+        self.zenith_sc_status.grid(row=1, column=1, sticky="w")
+        cols = (("metric", "Metric", 300), ("now", "This period", 150),
+                ("before", "A year earlier", 150), ("move", "Change", 160))
+        self.zenith_sc_tree = ttk.Treeview(
+            card_body, columns=[c[0] for c in cols], show="headings",
+            height=9)
+        for cid, label, width in cols:
+            self.zenith_sc_tree.heading(cid, text=label)
+            self.zenith_sc_tree.column(
+                cid, width=width,
+                anchor="e" if cid != "metric" else "w")
+        self.zenith_sc_tree.grid(row=2, column=0, columnspan=3,
+                                 sticky="ew", pady=(6, 2))
+        self.zenith_sc_tree.tag_configure("head", font=("Segoe UI", 9, "bold"))
+        self.zenith_sc_tree.bind("<Double-1>", self._sc_pick)
+        self._register_result_tree(self.zenith_sc_tree)
+        self._sc_candidates: list = []
+
         # ----- Worker state -----
         self._sm_worker: threading.Thread | None = None
         self._sm_last_path: str = ""
@@ -7754,6 +7865,87 @@ class App(WhatsAppMixin, HealthMixin):
             })
         except Exception as exc:                   # noqa: BLE001
             self._post(MSG_SM_ERROR, str(exc))
+
+    # ------------------------------------------------------------------
+    # Agency scorecard
+    # ------------------------------------------------------------------
+    def _sc_log(self, msg: str) -> None:
+        try:
+            self.zenith_sc_status.configure(text=msg)
+        except Exception:        # noqa: BLE001 - UI only
+            pass
+
+    def _sc_pick(self, _event=None) -> None:
+        """Double-clicking a candidate looks that one up."""
+        sel = self.zenith_sc_tree.selection()
+        if not sel or not self._sc_candidates:
+            return
+        idx = self.zenith_sc_tree.index(sel[0])
+        if 0 <= idx < len(self._sc_candidates):
+            self.zenith_sc_term.set(self._sc_candidates[idx])
+            self._sc_run()
+
+    def _sc_run(self) -> None:
+        term = (self.zenith_sc_term.get() or "").strip()
+        if not term:
+            messagebox.showerror("Agency scorecard",
+                                 "Type an agency name or an account number.")
+            return
+        try:
+            settings = self._sm_settings()
+        except ValueError as exc:
+            messagebox.showerror("Agency scorecard", str(exc))
+            return
+        if self._sm_worker is not None and self._sm_worker.is_alive():
+            return
+        self.btn_sc_run.configure(state="disabled")
+        self.zenith_sc_tree.delete(*self.zenith_sc_tree.get_children())
+        self._sc_log("Reading the sales warehouse…")
+        self._sm_worker = threading.Thread(
+            target=self._sc_worker, args=(term, settings), daemon=True)
+        self._sm_worker.start()
+
+    def _sc_worker(self, term: str, settings) -> None:
+        from . import agency_scorecard as asc
+        from . import counter_reconcile as cr
+        from . import sales_movement as sm
+
+        try:
+            source = cr.find_sales_warehouse()
+            if source is None:
+                raise ValueError(
+                    "No local sales warehouse was found, so the scorecard "
+                    "cannot be built.")
+            cards, candidates, _notes = asc.run(
+                source, term, settings.period_from, settings.period_to,
+                measure_lines=sm._lines(settings.measure),
+                channels=settings.channels or ("AGENCY",))
+            if not cards:
+                self._post(MSG_SC_CHOOSE, [
+                    (g.label(), g.value, g.ids[0] if g.ids else "")
+                    for g in candidates])
+                return
+            c = cards[0]
+            self._post(MSG_SC_DONE, {
+                "name": c.agency.label(), "span": c.span_label(),
+                "share_now": c.share_now, "share_before": c.share_before,
+                "share_move": c.share_move,
+                "sales_now": c.now.sales, "sales_before": c.before.sales,
+                "growth": c.growth,
+                "bsp_now": c.now.bsp, "bsp_before": c.before.bsp,
+                "growth_bsp": c.growth_bsp,
+                "other_now": c.now.non_iata, "other_before": c.before.non_iata,
+                "growth_other": c.growth_non_iata,
+                "rank_now": c.rank_now, "rank_before": c.rank_before,
+                "n_now": c.now.agencies, "n_before": c.before.agencies,
+                "band_now": c.now.rank_band, "band_before": c.before.rank_band,
+                "rank_move": c.rank_move,
+                "accounts": list(c.agency.members),
+                "warnings": list(c.warnings),
+                "headline": c.headline(),
+            })
+        except Exception as exc:                   # noqa: BLE001
+            self._post(MSG_SC_ERROR, str(exc))
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a

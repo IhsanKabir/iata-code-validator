@@ -213,7 +213,9 @@ def write_call_list(ws, res: sm.Result, rows) -> None:
 def _call_row(ws, r: int, row) -> None:
     """One agency, with the three right-hand columns left for the rep."""
     m, c = row.movement, row.contact
-    _cell(ws, r, 1, m.customer, bold=True, size=10, border=True)
+    _cell(ws, r, 1, (f"{m.customer}  ({len(m.accounts)} accounts)"
+                     if getattr(m, "is_group", False) else m.customer),
+          bold=True, size=10, border=True)
     _cell(ws, r, 2, m.iata or None, size=9, border=True, align="center")
     # an agency nobody has a number for is the point of the list, not a
     # row to hide -- it is marked instead
