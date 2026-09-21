@@ -684,14 +684,52 @@ def test_a_moved_date_still_counts_but_is_shown():
     assert a.omitted == 0            # it was not lost, only relocated
 
 
-def test_rows_written_accounts_for_everything():
+def test_rows_written_counts_what_was_written():
     a = vm.day_audit(_data(
         [_V("Karim", "A", date(2026, 8, 3)), _V("Karim", "B")],
         [("Karim", "no_date", "B"), ("Karim", "duplicate", "C")]
     ))["Karim"]
     assert a.dated == 1 and a.undated == 1
-    assert a.rows_written == a.dated + a.omitted
-    assert a.accounted is True
+    assert a.omitted == 2                 # the undated one and the duplicate
+    assert a.rows_written == 3
+
+
+def test_a_blank_form_line_is_not_a_row_the_rep_lost():
+    """The printed form carries a serial on every line, so an untouched line
+    looks exactly like a row somebody wrote and mislaid. Counting it made a
+    rep who filled 8 of 18 lines look like they lost 10."""
+    a = vm.day_audit(_data(
+        [_V("Karim", "A", date(2026, 8, 3))],
+        [("Karim", "blank_row", "Sheet1 row 9"),
+         ("Karim", "blank_row", "Sheet1 row 10")]
+    ))["Karim"]
+    assert a.blank_rows == 2
+    assert a.omitted == 0                 # nothing was written, nothing lost
+    assert a.rows_written == 1
+
+
+def test_a_missing_agency_beside_filled_columns_is_still_an_omission():
+    a = vm.day_audit(_data(
+        [], [("Karim", "no_agency", "Sheet1 row 4")]))["Karim"]
+    assert a.omitted == 1
+    assert a.blank_rows == 0
+
+
+def test_days_out_resting_on_a_moved_date_is_flagged():
+    """39 rows in blocks dated 9 January all moved to 9 September and became
+    ONE day out -- true of the arithmetic, false about the rep."""
+    visits = [_V("Karim", f"A{i}", date(2026, 9, 9), moved=True)
+              for i in range(5)]
+    a = vm.day_audit(_data(visits))["Karim"]
+    assert a.days_out == 1
+    assert a.moved == 5
+    assert a.days_are_moved is True
+
+
+def test_a_rep_whose_dates_are_their_own_is_not_flagged():
+    visits = [_V("Karim", "A", date(2026, 9, 1)),
+              _V("Karim", "B", date(2026, 9, 2))]
+    assert vm.day_audit(_data(visits))["Karim"].days_are_moved is False
 
 
 def test_reps_are_ordered_with_the_worst_first():
