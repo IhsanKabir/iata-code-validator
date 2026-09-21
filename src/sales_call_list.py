@@ -197,7 +197,7 @@ def write_call_list(ws, res: sm.Result, rows) -> None:
 
     for row in rows:
         _call_row(ws, r, row)
-        r += 1
+        r = _account_rows(ws, r + 1, row.movement)
 
     if not rows:
         _cell(ws, r, 1, "Nobody went backwards this period.", size=10,
@@ -208,6 +208,35 @@ def write_call_list(ws, res: sm.Result, rows) -> None:
           f"'Days silent' counts from the last ticket to {sm.period_label(s)}"
           f"'s end; amber contact columns mean the visit reports hold no "
           f"number, which is itself worth knowing")
+
+
+def _account_rows(ws, r: int, m) -> int:
+    """The accounts behind a grouped agency, collapsed under a '+'.
+
+    A rep ringing one business needs its total, but the account numbers
+    are what the sales system will show them when they check -- so they
+    are one click away rather than absent.
+    """
+    accounts = getattr(m, "accounts", ()) or ()
+    if len(accounts) < 2:
+        return r
+    ws.sheet_properties.outlinePr.summaryBelow = False
+    for cid, name, current, baseline in accounts:
+        _cell(ws, r, 1, f"      {name}", size=9, color=GREY, border=True)
+        _cell(ws, r, 2, cid, size=9, color=GREY, border=True,
+              align="center")
+        _cell(ws, r, 11, round(baseline) or None, fmt=MONEY, size=9,
+              color=GREY, border=True, align="right")
+        _cell(ws, r, 12, round(current) if current else None, fmt=MONEY,
+              size=9, color=GREY, border=True, align="right")
+        _cell(ws, r, 13, round(current - baseline), fmt=MONEY, size=9,
+              color=GREY, border=True, align="right")
+        for j in (3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21):
+            _cell(ws, r, j, None, border=True)
+        ws.row_dimensions[r].outlineLevel = 1
+        ws.row_dimensions[r].hidden = True
+        r += 1
+    return r
 
 
 def _call_row(ws, r: int, row) -> None:
