@@ -183,7 +183,16 @@ def test_the_workbook_leaves_blank_columns_for_the_rep_to_fill(tmp_path):
 
 def test_the_header_says_how_many_can_actually_be_rung(tmp_path):
     said = _text(_book(tmp_path)["Call list"])
-    assert "2 of 3 have someone to ring" in said.replace("\n", " ")
+    assert "2 of 3 have a phone number" in said.replace("\n", " ")
+
+
+def test_a_contact_name_without_a_number_is_not_someone_to_ring():
+    """'phone or contact' counted a name on its own as reachable -- a caption
+    this data happened to satisfy today and would not have tomorrow."""
+    got = scl.Contact(agency="A", contact="Mr Rahman", phone="")
+    assert got.reachable is False
+    assert got.named is True
+    assert scl.Contact(agency="A", phone="01711000000").reachable is True
 
 
 def test_an_empty_list_says_so_rather_than_printing_a_bare_grid(tmp_path):

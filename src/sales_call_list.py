@@ -66,7 +66,18 @@ class Contact:
 
     @property
     def reachable(self) -> bool:
-        return bool(self.phone or self.contact)
+        """A number to ring. A name on its own is not one.
+
+        This accepted `phone or contact`, so an agency with a contact name
+        and no number counted towards "have someone to ring" -- a caption
+        the data happened to satisfy today and would not have tomorrow.
+        """
+        return bool(self.phone)
+
+    @property
+    def named(self) -> bool:
+        """Someone is on file, whether or not a number is."""
+        return bool(self.contact)
 
 
 def contacts_from_visits(data) -> dict:
@@ -178,15 +189,15 @@ def write_call_list(ws, res: sm.Result, rows) -> None:
           f"  Every agency that went backwards in {sm.period_label(s)}, "
           f"biggest loss first.   Contact details come from the visit "
           f"reports, matched on the agency name — {reachable:,} of "
-          f"{len(rows):,} have someone to ring.   The last three columns are "
+          f"{len(rows):,} have a phone number.   The last three columns are "
           f"for the rep to fill in.", size=9, color=GREY, fill=PAPER,
           align="left", wrap=True)
     ws.row_dimensions[2].height = 30
 
     r = _kpi_strip(ws, 4, [
         ("Agencies to call", len(rows), "#,##0", "C00000"),
-        ("Have a contact", reachable, "#,##0", "006100"),
-        ("No contact on file", len(rows) - reachable, "#,##0",
+        ("Have a number", reachable, "#,##0", "006100"),
+        ("No number on file", len(rows) - reachable, "#,##0",
          "C00000" if reachable < len(rows) else None),
         ("Check the contact", ambiguous, "#,##0",
          "C00000" if ambiguous else None),
