@@ -105,6 +105,9 @@ def canonical_people(names) -> dict:
     return canon
 PHONE_RE = re.compile(r"\d{6,}")
 ZONE_RE = re.compile(r"zone\s*[#:]?\s*(\d+)", re.I)
+#: An ISO date, optionally with a time: what openpyxl hands over when a
+#: real date cell is stringified before it reaches the parser.
+ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]|$)")
 DATE_RE = re.compile(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})")
 
 # how the same column gets typed across blocks
@@ -175,6 +178,17 @@ def parse_visit_date(text: str, *, month=None, year=None):
         d = text.date() if isinstance(text, datetime) else text
         return d
     raw = _n(text)
+    # A real date cell that reached us as TEXT: '2026-09-01 00:00:00'. Read
+    # right to left as day-month-year it becomes 26 September 2001 -- the last
+    # two digits of the year taken for the day -- which then reads as a date
+    # from another month and collapses a rep's whole month onto the 26th.
+    iso = ISO_DATE_RE.match(raw)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)),
+                        int(iso.group(3)))
+        except ValueError:
+            return None
     # "2 Aug, Sunday" and "03 Aug, Monday" carry no year, so the caller's does
     named = DAY_MONTH_RE.search(raw)
     if named and not DATE_RE.search(raw):
@@ -457,6 +471,14 @@ def read_all(selection, *, month=None, year=None, progress_cb=None,
             key = (person_key(v.rep), v.day, identity(v.agency), v.phone)
             if key in seen:
                 total.duplicates += 1
+                # Recorded against the rep, not just tallied. A dropped row is
+                # an input the rep wrote that did not reach their Days out,
+                # and "why not" is only answerable if we keep who and what.
+                total.issues.append(VisitIssue(
+                    v.rep, "duplicate",
+                    f"{v.agency}"
+                    + (f" on {v.day:%d %b}" if v.day else " (no date)")
+                    + f" — also in {p.stem}"))
                 continue
             seen.add(key)
             total.visits.append(v)
@@ -801,6 +823,11 @@ def build_master(selection, out_path, *, month: int, year: int,
     r += 1
 
     # ---- zones -----------------------------------------------------------
+    # Days out counts DATES, not rows. The reconciliation sits here,
+    # immediately under the column it explains, rather than on a sheet
+    # of its own that nobody opens.
+    r = write_day_audit(ws, r, data)
+
     r = _band(ws, r, "ZONE COVERAGE",
               "a zone nobody wrote down cannot be assigned to anyone")
     r = _headers(ws, r, ["Zone", "Visits", "Agencies", "Reps working it",
@@ -1489,3 +1516,185 @@ def write_impact(ws, res: "ImpactResult", *, month: int, year: int) -> None:
     ws.freeze_panes = "A9"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
+
+
+# --------------------------------------------------------------------------
+# why a day did not count
+# --------------------------------------------------------------------------
+#: What each omission means, in the words the sheet prints. The order is the
+#: order they are shown: the ones that cost a day first.
+OMISSION_REASONS = (
+    ("no_date", "No date written",
+     "The rep filled the row but left the date blank, so there is no day to "
+     "count. The visit is still counted as a visit."),
+    ("duplicate", "Duplicate row dropped",
+     "The same rep, agency, date and phone already came in from another "
+     "file — a Downloads folder routinely holds 'report.xlsx' and "
+     "'report (1).xlsx'. Counting both would double the day."),
+    ("no_agency", "No agency name",
+     "The row had a serial number but no agency, so there was nothing to "
+     "record a visit against. It never became a visit."),
+    ("date_outside_month", "Date from another month",
+     "The rep wrote a date in a different month — usually last month's "
+     "template copied forward. The DAY is kept and the month is taken from "
+     "this report, so it still counts, but the day it counts on was moved."),
+)
+
+
+@dataclass
+class DayAudit:
+    """Every input one rep wrote, and whether it reached their Days out."""
+
+    rep: str
+    days_out: int = 0
+    dated: int = 0                  # visits carrying a usable date
+    undated: int = 0                # visits with no date at all
+    moved: int = 0                  # date rewritten into this month
+    by_reason: dict = field(default_factory=dict)
+    details: list = field(default_factory=list)   # (reason label, detail)
+
+    @property
+    def omitted(self) -> int:
+        """Inputs that did not contribute a day, however they were lost."""
+        return (self.undated + self.by_reason.get("duplicate", 0)
+                + self.by_reason.get("no_agency", 0))
+
+    @property
+    def rows_written(self) -> int:
+        """What the rep actually wrote, before anything was dropped."""
+        return self.dated + self.omitted
+
+    @property
+    def accounted(self) -> bool:
+        """Whether every row written is explained by a counted day or a reason.
+
+        The sheet says so out loud. A reconciliation that does not balance is
+        worth more as a visible gap than as a silent one.
+        """
+        return self.rows_written == self.dated + self.omitted
+
+
+def day_audit(data: VisitData) -> dict:
+    """Per rep: what reached Days out, and why the rest did not.
+
+    Days out counts distinct DATES, so it is not the number of rows a rep
+    wrote and was never meant to be. This reconciles the two, so a rep with
+    forty rows and nine days can see where the other rows went instead of
+    being left to assume the report lost them.
+    """
+    canon = canonical_people({v.rep for v in data.visits}
+                             | {i.rep for i in data.issues})
+    out: dict = {}
+
+    def get(rep: str) -> DayAudit:
+        name = canon.get(rep, rep)
+        got = out.get(name)
+        if got is None:
+            got = out[name] = DayAudit(rep=name)
+        return got
+
+    for v in data.visits:
+        a = get(v.rep)
+        if v.day:
+            a.dated += 1
+        else:
+            a.undated += 1
+        if v.date_moved:
+            a.moved += 1
+    for rep, audit in out.items():
+        audit.days_out = len({v.day for v in data.visits
+                              if canon.get(v.rep, v.rep) == rep and v.day})
+    labels = dict((k, lab) for k, lab, _why in OMISSION_REASONS)
+    for issue in data.issues:
+        if issue.kind not in labels:
+            continue
+        a = get(issue.rep)
+        a.by_reason[issue.kind] = a.by_reason.get(issue.kind, 0) + 1
+        a.details.append((labels[issue.kind], issue.detail))
+    return dict(sorted(out.items(), key=lambda kv: -kv[1].omitted))
+
+
+def write_day_audit(ws, r: int, data: VisitData) -> int:
+    """The 'Days out' reconciliation: every row written, and where it went."""
+    from .counter_master import (BAD, GOOD, GREY, LAST, PAPER, WARN, _band,
+                                 _cell, _headers)
+
+    audits = day_audit(data)
+    r = _band(ws, r, "DAYS OUT — WHY A ROW DID NOT COUNT",
+              "most unexplained rows first")
+    ws.merge_cells(f"A{r}:{LAST}{r}")
+    _cell(ws, r, 1,
+          "  'Days out' above counts the distinct DATES a rep filed a usable "
+          "visit for — not how many rows they wrote, which it was never meant "
+          "to. This reconciles the two, so a rep with forty rows and nine days "
+          "can see where the other rows went rather than assume the report "
+          "lost them. Every row written is either counted or given a reason.",
+          size=9, color=GREY, fill=PAPER, align="left", wrap=True)
+    ws.row_dimensions[r].height = 28
+    r += 1
+    r = _headers(ws, r, [
+        "Sales rep", "Days out", "Rows with a date", "No date written",
+        "Duplicate dropped", "No agency name", "Date moved into this month",
+        "Rows written", "Reached Days out", "", "", "", "", "", "", "", "",
+        "", "", "", "Verdict"])
+    for a in audits.values():
+        dup = a.by_reason.get("duplicate", 0)
+        noag = a.by_reason.get("no_agency", 0)
+        if a.undated > max(1, a.rows_written * 0.25):
+            verdict, tone = "DATES MISSING", WARN
+        elif a.omitted == 0:
+            verdict, tone = "ALL ACCOUNTED FOR", GOOD
+        else:
+            verdict, tone = "SOME ROWS LOST", None
+        _cell(ws, r, 1, a.rep, bold=True, size=10, border=True)
+        _cell(ws, r, 2, a.days_out or None, bold=True, size=10, border=True,
+              align="center")
+        _cell(ws, r, 3, a.dated or None, size=9, border=True, align="center")
+        _cell(ws, r, 4, a.undated or None, size=9, border=True, align="center",
+              fill=BAD if a.undated else None)
+        _cell(ws, r, 5, dup or None, size=9, border=True, align="center")
+        _cell(ws, r, 6, noag or None, size=9, border=True, align="center")
+        # moved rows DID count -- shown so the day they landed on is checkable
+        _cell(ws, r, 7, a.moved or None, size=9, border=True, align="center",
+              fill=WARN if a.moved else None)
+        _cell(ws, r, 8, a.rows_written or None, size=9, border=True,
+              align="center")
+        _cell(ws, r, 9, a.dated / a.rows_written if a.rows_written else None,
+              fmt="0%", size=9, border=True, align="center")
+        for j in range(10, 21):
+            _cell(ws, r, j, None, border=True)
+        _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
+              align="center")
+        r += 1
+    r += 1
+
+    r = _band(ws, r, "WHAT EACH REASON MEANS")
+    for _kind, label, why in OMISSION_REASONS:
+        _cell(ws, r, 1, label, bold=True, size=10)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=21)
+        _cell(ws, r, 2, why, size=9, color=GREY, wrap=True)
+        ws.row_dimensions[r].height = 26
+        r += 1
+    r += 1
+
+    r = _band(ws, r, "EVERY OMITTED ROW",
+              "so it can be checked against the file, and fixed next month")
+    r = _headers(ws, r, ["Sales rep", "Why it did not count", "What was written",
+                         "", "", "", "", "", "", "", "", "", "", "", "", "",
+                         "", "", "", "", ""])
+    listed = 0
+    for a in audits.values():
+        for label, detail in a.details:
+            _cell(ws, r, 1, a.rep, size=9, border=True)
+            _cell(ws, r, 2, label, size=9, border=True)
+            ws.merge_cells(start_row=r, start_column=3, end_row=r,
+                           end_column=21)
+            _cell(ws, r, 3, detail or "—", size=9, color=GREY, border=True)
+            r += 1
+            listed += 1
+    if not listed:
+        _cell(ws, r, 1,
+              "Nothing was omitted: every row written reached a day.",
+              size=10, color=GREY)
+        r += 1
+    return r + 1

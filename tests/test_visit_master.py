@@ -610,3 +610,145 @@ def test_the_share_of_moved_dates_cannot_exceed_everything(tmp_path):
     data = vm.read_all([src], month=9, year=2026)
     dated = [v for v in data.visits if v.day]
     assert sum(1 for v in dated if v.date_moved) <= len(dated)
+
+
+# --------------------------------------------------------------------------
+# Days out counts DATES, so the rows it does not count need a reason
+# --------------------------------------------------------------------------
+class _V:
+    def __init__(self, rep, agency, day=None, moved=False, phone=""):
+        self.rep, self.agency, self.day = rep, agency, day
+        self.date_moved, self.phone = moved, phone
+        self.sheet = self.zone = self.contact = ""
+        self.designation = self.location = self.routes = self.remarks = ""
+        self.productivity = None
+
+
+def _data(visits, issues=()):
+    d = vm.VisitData()
+    d.visits = list(visits)
+    d.issues = [vm.VisitIssue(*i) for i in issues]
+    return d
+
+
+def test_a_dated_row_reaches_days_out():
+    a = vm.day_audit(_data([_V("Karim", "Alpha", date(2026, 8, 3))]))["Karim"]
+    assert a.dated == 1 and a.undated == 0
+    assert a.days_out == 1
+    assert a.omitted == 0
+
+
+def test_two_rows_on_one_date_are_one_day_but_two_rows():
+    """Days out is not a row count and was never meant to be."""
+    a = vm.day_audit(_data([_V("Karim", "Alpha", date(2026, 8, 3)),
+                            _V("Karim", "Beta", date(2026, 8, 3))]))["Karim"]
+    assert a.days_out == 1
+    assert a.dated == 2
+    assert a.omitted == 0            # nothing was lost; they share a day
+
+
+def test_a_row_with_no_date_is_counted_and_explained():
+    a = vm.day_audit(_data([_V("Karim", "Alpha")],
+                           [("Karim", "no_date", "Alpha")]))["Karim"]
+    assert a.days_out == 0
+    assert a.undated == 1
+    assert a.by_reason["no_date"] == 1
+    assert ("No date written", "Alpha") in a.details
+
+
+def test_a_dropped_duplicate_is_attributed_to_the_rep_who_wrote_it():
+    a = vm.day_audit(_data(
+        [_V("Karim", "Alpha", date(2026, 8, 3))],
+        [("Karim", "duplicate", "Alpha on 03 Aug — also in report (1)")]
+    ))["Karim"]
+    assert a.by_reason["duplicate"] == 1
+    assert a.omitted == 1
+    assert any("also in report (1)" in d for _lab, d in a.details)
+
+
+def test_a_row_with_no_agency_never_became_a_visit_and_says_so():
+    a = vm.day_audit(_data([], [("Karim", "no_agency", "Sheet1 row 4")]))["Karim"]
+    assert a.by_reason["no_agency"] == 1
+    assert a.dated == 0
+
+
+def test_a_moved_date_still_counts_but_is_shown():
+    """The day is kept and the month taken from the report, so it counts --
+    but the day it landed on is worth checking."""
+    a = vm.day_audit(_data(
+        [_V("Karim", "Alpha", date(2026, 8, 3), moved=True)],
+        [("Karim", "date_outside_month", "Alpha: written 03 Mar 2026")]
+    ))["Karim"]
+    assert a.days_out == 1
+    assert a.moved == 1
+    assert a.omitted == 0            # it was not lost, only relocated
+
+
+def test_rows_written_accounts_for_everything():
+    a = vm.day_audit(_data(
+        [_V("Karim", "A", date(2026, 8, 3)), _V("Karim", "B")],
+        [("Karim", "no_date", "B"), ("Karim", "duplicate", "C")]
+    ))["Karim"]
+    assert a.dated == 1 and a.undated == 1
+    assert a.rows_written == a.dated + a.omitted
+    assert a.accounted is True
+
+
+def test_reps_are_ordered_with_the_worst_first():
+    got = vm.day_audit(_data(
+        [_V("Clean", "A", date(2026, 8, 1)), _V("Messy", "B")],
+        [("Messy", "no_date", "B"), ("Messy", "duplicate", "C")]))
+    assert list(got) == ["Messy", "Clean"]
+
+
+def test_the_section_lands_on_the_visits_sheet_with_its_reasons(tmp_path):
+    folder = tmp_path / "reports"
+    folder.mkdir()
+    _report(folder / "aug.xlsx", {
+        "rep1": [("05/08/2026", "Zone # 1", "ALEX ROY", [ROW_A, ROW_B])]})
+    out = tmp_path / "m.xlsx"
+    vm.build_master(folder, out, month=8, year=2026)
+    book = load_workbook(out)
+    assert book.sheetnames == ["Visits"]          # still one sheet
+    text = "\n".join(str(c.value) for row in book["Visits"].iter_rows()
+                     for c in row if c.value is not None)
+    assert "DAYS OUT — WHY A ROW DID NOT COUNT" in text
+    assert "WHAT EACH REASON MEANS" in text
+    assert "counts the distinct DATES" in text
+    book.close()
+
+
+# --------------------------------------------------------------------------
+# a real date cell that reached the parser as text
+# --------------------------------------------------------------------------
+def test_an_iso_date_is_read_as_written_not_back_to_front():
+    """openpyxl gives '2026-09-01 00:00:00' for a real date cell. Read right
+    to left as day-month-year that became 26 September 2001 -- the last two
+    digits of the YEAR taken for the day -- which then read as a date from
+    another month and collapsed a whole month onto the 26th."""
+    assert vm.parse_visit_date("2026-09-01 00:00:00", month=9, year=2026) == \
+        date(2026, 9, 1)
+    assert vm.parse_visit_date("2026-09-15", month=9, year=2026) == \
+        date(2026, 9, 15)
+
+
+def test_the_ordinary_day_first_format_is_untouched():
+    assert vm.parse_visit_date("01/09/2026", month=9, year=2026) == \
+        date(2026, 9, 1)
+    assert vm.parse_visit_date("09/01/2026", month=9, year=2026) == \
+        date(2026, 1, 9)
+
+
+def test_a_named_month_is_untouched():
+    assert vm.parse_visit_date("1 Sep, Tuesday", month=9, year=2026) == \
+        date(2026, 9, 1)
+
+
+def test_an_impossible_iso_date_is_refused_rather_than_shifted():
+    assert vm.parse_visit_date("2026-02-29", month=2, year=2026) is None
+
+
+def test_a_real_datetime_object_still_goes_straight_through():
+    from datetime import datetime
+    assert vm.parse_visit_date(datetime(2026, 9, 1), month=9, year=2026) == \
+        date(2026, 9, 1)
