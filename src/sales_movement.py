@@ -298,6 +298,9 @@ class Movement:
     #: The same period a year earlier, when that comparison was asked for.
     baseline_year: float = 0.0
     year_known: bool = False
+    #: The accounts this agency trades under, when rows were grouped by
+    #: business rather than by account: (id, name, current, baseline).
+    accounts: list = field(default_factory=list)
     threshold: float = 0.20
     last_bought: date | None = None
 
@@ -380,6 +383,11 @@ class Movement:
         if up[1]:
             return "up vs last year only"
         return "steady on both"
+
+    @property
+    def is_group(self) -> bool:
+        """More than one account, so the sheet offers a '+' to expand."""
+        return len(self.accounts) > 1
 
     @property
     def thin_baseline(self) -> bool:
@@ -505,7 +513,7 @@ class Result:
         return said + "."
 
 
-def _identity(row: dict) -> tuple:
+def _identity(row: dict, by_account: dict | None = None) -> tuple:
     """What makes two rows the same customer.
 
     The account number, not the trading name. 281 agency names in this
@@ -516,16 +524,25 @@ def _identity(row: dict) -> tuple:
     """
     cid = str(row.get("customer_id") or "").strip()
     name = str(row.get("customer") or "").strip()
+    if by_account:
+        # One business, however many accounts it trades under. 147 agencies
+        # hold 333 accounts between them, and reported per account they
+        # understate the agency and misplace it in every ranking.
+        group = by_account.get(cid)
+        if group is not None:
+            return (group.key, group.name)
     return (cid or f"name:{name.upper()}", name)
 
 
 def _accumulate(rows: "Iterable", res: Result, n: int, threshold: float,
-                yi: int | None = None, max_window: int | None = None) -> dict:
+                yi: int | None = None, max_window: int | None = None,
+                by_account: dict | None = None) -> dict:
     """Per-customer running totals, current window against the baseline ones."""
     acc: dict = {}
+    sub: dict = {}
     for r in rows:
         res.rows_read += 1
-        key, name = _identity(r)
+        key, name = _identity(r, by_account)
         if not name and not key:
             continue
         try:
@@ -550,6 +567,14 @@ def _accumulate(rows: "Iterable", res: Result, n: int, threshold: float,
                 m.customer = name        # the name they trade under now
         amount = float(r.get("amount") or 0.0)
         tickets = int(r.get("tickets") or 0)
+        if by_account:
+            cid = str(r.get("customer_id") or "").strip()
+            acct = sub.setdefault(key, {}).setdefault(
+                cid, [cid, str(r.get("customer") or "").strip(), 0.0, 0.0])
+            if w == 0:
+                acct[2] += amount
+            elif 1 <= w <= n:
+                acct[3] += amount
         if w == 0:
             m.current += amount
             m.tickets_current += tickets
@@ -565,6 +590,15 @@ def _accumulate(rows: "Iterable", res: Result, n: int, threshold: float,
             m.tickets_baseline += tickets
             if amount:
                 m.windows_traded += 1
+    for key, accounts in sub.items():
+        m = acc.get(key)
+        if m is None:
+            continue
+        # the divisor is applied to the group total later, so the member
+        # baselines are averaged here to match
+        m.accounts = sorted(
+            ((cid, nm, cur, base / n) for cid, nm, cur, base
+             in accounts.values()), key=lambda a: -(a[2] + a[3]))
     return acc
 
 
@@ -621,7 +655,8 @@ def clamp_period(s: Settings, data_last_day: date | None) -> tuple:
 def build(rows: "Iterable", settings: Settings, *,
           data_first_day: date | None = None,
           data_last_day: date | None = None,
-          period_clamped: str = "") -> Result:
+          period_clamped: str = "",
+          by_account: dict | None = None) -> Result:
     """Fold per-customer, per-window totals into buckets.
 
     `rows` are mappings with at least customer, window and amount, where
@@ -679,7 +714,8 @@ def build(rows: "Iterable", settings: Settings, *,
 
     yi = year_index(settings)
     acc = _accumulate(rows, res, n, settings.threshold, yi=yi,
-                      max_window=len(windows(settings)) - 1)
+                      max_window=len(windows(settings)) - 1,
+                      by_account=by_account)
 
     for m in acc.values():
         # the divisor is the windows ASKED FOR, not the ones they traded in
@@ -787,7 +823,7 @@ def fetch(source: "WarehouseSource", settings: Settings, *,
 
 
 def run(source: "WarehouseSource", settings: Settings, *,
-        progress_cb=None) -> Result:
+        progress_cb=None, group_accounts: bool = True) -> Result:
     """Fetch and fold, refusing rather than guessing where the data runs out.
 
     The period is cut back to what the warehouse actually holds BEFORE the
@@ -804,5 +840,17 @@ def run(source: "WarehouseSource", settings: Settings, *,
             f"{_dm(settings.period_from)} onwards.")
         return res
     rows = fetch(source, effective, progress_cb=progress_cb)
+    # Group the accounts into businesses before anything is measured.
+    # 147 agencies hold 333 accounts between them, and left apart they
+    # understate the agency and misplace it by as much as 491 ranks.
+    by_account = None
+    if group_accounts:
+        from . import agency_identity as ai
+        groups, _skipped = ai.resolve(
+            {"customer_id": r.get("customer_id"),
+             "customer": r.get("customer"), "iata": r.get("iata"),
+             "value": abs(float(r.get("amount") or 0.0))}
+            for r in rows)
+        by_account = {cid: g for g in groups.values() for cid in g.ids}
     return build(rows, effective, data_first_day=first, data_last_day=last,
-                 period_clamped=clamped)
+                 period_clamped=clamped, by_account=by_account)

@@ -368,3 +368,74 @@ def test_sales_movement_can_ask_for_both_baselines_at_once(app):
     # the period count still matters under BOTH, so it must stay editable
     assert str(app.zenith_sm_trailing_box.cget("state")) == "normal"
     app.zenith_sm_baseline.set("An average of the periods before it")
+
+
+def test_the_scorecard_section_is_on_the_sales_movement_tab(app):
+    """Same warehouse, a different question -- it shares the period and the
+    output folder, so it does not need a tab of its own."""
+    _sm_app(app)
+    assert hasattr(app, "zenith_sc_tree")
+    assert hasattr(app, "btn_sc_run")
+    assert hasattr(app, "zenith_sc_term")
+
+
+def test_the_scorecard_refuses_an_empty_search(app, monkeypatch):
+    _sm_app(app)
+    app.zenith_sc_term.set("   ")
+    shown = {}
+    monkeypatch.setattr("src.gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app._sc_run()
+    assert "account number" in shown.get("msg", "")
+
+
+def test_ambiguous_candidates_are_listed_rather_than_picked(app):
+    """'TRAVELS' matches 1,825 agency names in the real data."""
+    _sm_app(app)
+    app._handle_msg("sc_choose", [("Alpha Travels", 900.0, "1"),
+                                  ("Beta Travels", 100.0, "2")])
+    rows = app.zenith_sc_tree.get_children()
+    assert len(rows) == 2
+    assert app._sc_candidates == ["1", "2"]
+    assert "Double-click" in str(app.zenith_sc_status.cget("text"))
+
+
+def test_a_scorecard_shows_the_bsp_split_under_the_total(app):
+    _sm_app(app)
+    app._handle_msg("sc_done", {
+        "name": "BE FRESH LIMITED  (2 accounts)", "span": "1 May to 19 Sep",
+        "share_now": 0.02292, "share_before": 0.01948, "share_move": 0.00344,
+        "sales_now": 668982748, "sales_before": 504774230, "growth": 0.325,
+        "bsp_now": 86948326, "bsp_before": 82437721, "growth_bsp": 0.055,
+        "other_now": 582034422, "other_before": 422336509,
+        "growth_other": 0.378,
+        "rank_now": 7, "rank_before": 13, "n_now": 3238, "n_before": 2441,
+        "band_now": "top 1%", "band_before": "top 1%", "rank_move": 6,
+        "accounts": [("10000277", "BE FRESH LIMITED", 1004370931.0)],
+        "warnings": [], "headline": "x"})
+    vals = [app.zenith_sc_tree.item(i, "values")
+            for i in app.zenith_sc_tree.get_children()]
+    metrics = [v[0] for v in vals]
+    assert "Market share with BS" in metrics
+    assert any("BSP accounts" in m for m in metrics)
+    assert any("Non-IATA accounts" in m for m in metrics)
+    # the share renders as a percentage, not a fraction
+    assert vals[0][1] == "2.292%"
+    assert vals[0][3] == "+0.344 pts"
+
+
+def test_a_missing_last_year_leaves_the_cell_blank_not_zero(app):
+    _sm_app(app)
+    app._handle_msg("sc_done", {
+        "name": "Brand New Co", "span": "x", "share_now": 0.01,
+        "share_before": None, "share_move": None,
+        "sales_now": 5, "sales_before": 0, "growth": None,
+        "bsp_now": 0, "bsp_before": 0, "growth_bsp": None,
+        "other_now": 5, "other_before": 0, "growth_other": None,
+        "rank_now": 4, "rank_before": None, "n_now": 9, "n_before": 0,
+        "band_now": "top half", "band_before": "", "rank_move": None,
+        "accounts": [], "warnings": ["no sales last year"], "headline": "x"})
+    vals = [app.zenith_sc_tree.item(i, "values")
+            for i in app.zenith_sc_tree.get_children()]
+    assert vals[0][2] == ""          # last-year share blank, not 0.000%
+    assert vals[0][3] == ""

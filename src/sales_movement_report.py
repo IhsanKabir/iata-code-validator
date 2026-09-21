@@ -67,6 +67,35 @@ def _fmt(settings: sm.Settings) -> str:
     return "#,##0" if settings.measure == sm.MEASURE_TICKETS else MONEY
 
 
+def _accounts(ws, r: int, m, money: str) -> int:
+    """The accounts behind a group total, collapsed under a '+'.
+
+    Excel's own row outlining, so the sheet opens showing one row per
+    AGENCY and the accounts are one click away. summaryBelow is off
+    because the total is written above its detail, not under it.
+    """
+    if not m.is_group:
+        return r
+    ws.sheet_properties.outlinePr.summaryBelow = False
+    for cid, name, current, baseline in m.accounts:
+        _cell(ws, r, 1, f"      {name}", size=9, color=GREY, border=True)
+        _cell(ws, r, 2, cid, size=9, color=GREY, border=True,
+              align="center")
+        _cell(ws, r, 6, round(baseline) or None, fmt=money, size=9,
+              color=GREY, border=True, align="right")
+        _cell(ws, r, 7, round(current) if current else None, fmt=money,
+              size=9, color=GREY, border=True, align="right")
+        _cell(ws, r, 8, round(current - baseline), fmt=money, size=9,
+              color=GREY, border=True, align="right")
+        for j in (3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                  21):
+            _cell(ws, r, j, None, border=True)
+        ws.row_dimensions[r].outlineLevel = 1
+        ws.row_dimensions[r].hidden = True
+        r += 1
+    return r
+
+
 def _prep(ws, settings: sm.Settings | None = None) -> None:
     for i, width in enumerate(WIDTHS, start=1):
         if settings is not None and _has_year(settings):
@@ -106,7 +135,9 @@ def write_movers(ws, res: sm.Result, movements, title: str, note: str) -> None:
         _cell(ws, r, 1, "Nobody fell into this group.", size=10, color=GREY)
         return
     for m in movements:
-        _cell(ws, r, 1, m.customer, bold=True, size=10, border=True)
+        _cell(ws, r, 1, (f"{m.customer}  ({len(m.accounts)} accounts)"
+                         if m.is_group else m.customer),
+              bold=True, size=10, border=True)
         _cell(ws, r, 2, m.iata or None, size=9, border=True, align="center")
         _cell(ws, r, 3, m.sales_person or None, size=9, border=True)
         _cell(ws, r, 4, m.zone or None, size=9, border=True, align="center")
@@ -154,7 +185,7 @@ def write_movers(ws, res: sm.Result, movements, title: str, note: str) -> None:
                 _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, m.verdict, bold=True, size=9, fill=_tone(m),
               border=True, align="center")
-        r += 1
+        r = _accounts(ws, r + 1, m, money)
 
 
 def _rollup(ws, r, res: sm.Result, key, heading: str, note: str) -> int:
