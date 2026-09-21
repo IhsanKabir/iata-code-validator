@@ -333,8 +333,16 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                         got[name] = cells[j]
                 agency = got.get("agency", "")
                 if not agency:
-                    data.issues.append(VisitIssue(rep or ws.title, "no_agency",
-                                                  f"{ws.title} row {cells[0]}"))
+                    # The blank forms carry pre-printed serials, so an
+                    # untouched line looks exactly like a row somebody
+                    # wrote and lost. It is not one: nothing was written,
+                    # and counting it makes a rep who filled 8 of 18 lines
+                    # look like they mislaid 10.
+                    kind = ("no_agency" if any(got.values())
+                            else "blank_row")
+                    data.issues.append(VisitIssue(
+                        rep or ws.title, kind,
+                        f"{ws.title} row {cells[0]}"))
                     continue
                 day = parse_visit_date(raw_day, month=month, year=year)
                 if day is None:
@@ -1534,6 +1542,10 @@ OMISSION_REASONS = (
     ("no_agency", "No agency name",
      "The row had a serial number but no agency, so there was nothing to "
      "record a visit against. It never became a visit."),
+    ("blank_row", "Form line never filled in",
+     "The printed form carries a serial on every line, so an untouched "
+     "line has a number and nothing else. Nothing was written here, so "
+     "nothing was lost — it is counted separately from the rows that were."),
     ("date_outside_month", "Date from another month",
      "The rep wrote a date in a different month — usually last month's "
      "template copied forward. The DAY is kept and the month is taken from "
@@ -1554,8 +1566,17 @@ class DayAudit:
     details: list = field(default_factory=list)   # (reason label, detail)
 
     @property
+    def blank_rows(self) -> int:
+        """Printed form lines nobody filled in. Not lost input."""
+        return self.by_reason.get("blank_row", 0)
+
+    @property
     def omitted(self) -> int:
-        """Inputs that did not contribute a day, however they were lost."""
+        """Rows somebody WROTE that did not contribute a day.
+
+        Blank form lines are deliberately not here. Counting them made a
+        rep who filled 8 of 18 printed lines look like they mislaid 10.
+        """
         return (self.undated + self.by_reason.get("duplicate", 0)
                 + self.by_reason.get("no_agency", 0))
 
@@ -1565,13 +1586,19 @@ class DayAudit:
         return self.dated + self.omitted
 
     @property
-    def accounted(self) -> bool:
-        """Whether every row written is explained by a counted day or a reason.
+    def moved_share(self) -> float:
+        """How much of their Days out rests on a date taken from elsewhere."""
+        return (self.moved / self.dated) if self.dated else 0.0
 
-        The sheet says so out loud. A reconciliation that does not balance is
-        worth more as a visible gap than as a silent one.
+    @property
+    def days_are_moved(self) -> bool:
+        """Their Days out is mostly an artefact of a stale template date.
+
+        One rep wrote 39 rows in blocks dated 9 January. Every one was moved
+        to 9 September, so 39 rows became ONE day out -- a number that is
+        true of the arithmetic and false about the rep.
         """
-        return self.rows_written == self.dated + self.omitted
+        return self.moved_share >= 0.5 and self.moved > 1
 
 
 def day_audit(data: VisitData) -> dict:
@@ -1635,12 +1662,15 @@ def write_day_audit(ws, r: int, data: VisitData) -> int:
     r = _headers(ws, r, [
         "Sales rep", "Days out", "Rows with a date", "No date written",
         "Duplicate dropped", "No agency name", "Date moved into this month",
-        "Rows written", "Reached Days out", "", "", "", "", "", "", "", "",
-        "", "", "", "Verdict"])
+        "Rows written", "Reached Days out", "Blank form lines", "", "",
+        "", "", "", "", "", "", "", "", "Verdict"])
     for a in audits.values():
         dup = a.by_reason.get("duplicate", 0)
         noag = a.by_reason.get("no_agency", 0)
-        if a.undated > max(1, a.rows_written * 0.25):
+        if a.days_are_moved:
+            # the number is true of the arithmetic and false about the rep
+            verdict, tone = "DAYS OUT IS A MOVED DATE", BAD
+        elif a.undated > max(1, a.rows_written * 0.25):
             verdict, tone = "DATES MISSING", WARN
         elif a.omitted == 0:
             verdict, tone = "ALL ACCOUNTED FOR", GOOD
@@ -1661,12 +1691,31 @@ def write_day_audit(ws, r: int, data: VisitData) -> int:
               align="center")
         _cell(ws, r, 9, a.dated / a.rows_written if a.rows_written else None,
               fmt="0%", size=9, border=True, align="center")
-        for j in range(10, 21):
+        # shown, but deliberately outside "rows written": nothing was
+        # written on a line nobody touched
+        _cell(ws, r, 10, a.blank_rows or None, size=9, color=GREY,
+              border=True, align="center")
+        for j in range(11, 21):
             _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
               align="center")
         r += 1
     r += 1
+
+    shaky = [a for a in audits.values() if a.days_are_moved]
+    if shaky:
+        ws.merge_cells(f"A{r}:{LAST}{r}")
+        _cell(ws, r, 1,
+              "  " + "; ".join(
+                  f"{a.rep} wrote {a.dated} dated row(s), {a.moved} of them "
+                  f"in blocks dated another month" for a in shaky)
+              + ". Those rows all take their day from this report, so they "
+                "land together and the Days out beside them counts that one "
+                "day. Fix the date in the source file and the figure "
+                "corrects itself.",
+              size=9, fill=BAD, align="left", wrap=True)
+        ws.row_dimensions[r].height = 30
+        r += 2
 
     r = _band(ws, r, "WHAT EACH REASON MEANS")
     for _kind, label, why in OMISSION_REASONS:
