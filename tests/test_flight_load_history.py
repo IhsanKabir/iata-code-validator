@@ -173,3 +173,61 @@ def test_the_summary_line_says_what_was_read():
     said = h.summary()
     assert "1 operated flight-leg" in said
     assert "1 route" in said
+
+
+# --------------------------------------------------------------------------
+# later blocks carry Sold instead of Flown, and they are not the same thing
+# --------------------------------------------------------------------------
+def test_a_block_with_flown_reports_its_basis_as_flown():
+    ws = _sheet(["03/02/2026 (Tuesday)"], [
+        ("BS101", "DAC-CGP", [(72, "07:10", 70)]),
+    ])
+    h = flh.LoadHistory()
+    flh.parse_sheet(ws, h)
+    assert h.legs[0].basis == "flown"
+    assert h.legs[0].load_factor == pytest.approx(70 / 72)
+
+
+def test_a_block_with_only_sold_falls_back_and_says_so():
+    """From 20 Apr 2026 the sheet stops carrying Flown. Sold is before
+    no-shows, so it is used but never silently called flown."""
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["", "", "03/02/2026 (Tuesday)", "", ""])
+    ws.append(["Flight", "Leg/Sector", "Capacity", "Sold", "Load Factor"])
+    ws.append(["BS101", "DAC-CGP", 72, 66, ""])
+    h = flh.LoadHistory()
+    flh.parse_sheet(ws, h)
+    assert h.legs[0].basis == "sold"
+    assert h.legs[0].load_factor == pytest.approx(66 / 72)
+
+
+def test_a_block_with_neither_has_no_load_factor():
+    ws = _sheet(["03/02/2026 (Tuesday)"], [
+        ("BS101", "DAC-CGP", [(72, "07:10", "")]),
+    ])
+    h = flh.LoadHistory()
+    flh.parse_sheet(ws, h)
+    assert h.legs[0].basis == ""
+    assert h.legs[0].load_factor is None
+
+
+def test_blocks_of_different_widths_on_one_sheet_each_read_correctly():
+    """The 2026 sheet is six columns wide until 20 April, then eight, ten,
+    thirteen and sixteen. One layout for the sheet put Flown where a later
+    block held something else."""
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["", "", "03/02/2026 (Tuesday)", "", "",
+               "04/02/2026 (Wednesday)", "", "", "", ""])
+    ws.append(["Flight", "Leg/Sector", "Capacity", "Flown", "Load Factor",
+               "Capacity", "STD", "Aircraft", "Sold", "Load Factor"])
+    ws.append(["BS101", "DAC-CGP", 72, 70, "", 189, "07:10", "Boeing 737-800",
+               170, ""])
+    h = flh.LoadHistory()
+    flh.parse_sheet(ws, h)
+    assert len(h.legs) == 2
+    first, second = h.legs
+    assert (first.capacity, first.flown, first.basis) == (72, 70, "flown")
+    assert (second.capacity, second.sold, second.basis) == (189, 170, "sold")
+    assert second.aircraft == "Boeing 737-800"

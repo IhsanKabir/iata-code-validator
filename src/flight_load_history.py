@@ -41,6 +41,7 @@ _FIELD_ALIASES = {
     "sold": "sold",
     "unsold": "unsold",
     "loadfactor": "load_factor",
+    "aircraft": "aircraft",
 }
 
 _DATE_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*(?:\(([A-Za-z]+)\))?")
@@ -110,6 +111,8 @@ class Leg:
     #: Only the 2026 layout carries this; None on the earlier sheets.
     sold: float | None = None
     std: str = ""
+    #: Blocks from 20 Apr 2026 onward name the aircraft; earlier ones do not.
+    aircraft: str = ""
 
     @property
     def origin(self) -> str:
@@ -120,14 +123,32 @@ class Leg:
         return self.leg_route.split("-", 1)[1] if "-" in self.leg_route else ""
 
     @property
+    def seats_taken(self):
+        """Passengers on the flight, by whichever count the block holds.
+
+        Blocks before 20 Apr 2026 carry Flown; later ones carry Sold and
+        no Flown at all. They are not the same measure -- sold is before
+        no-shows -- so `basis` says which one a figure came from rather
+        than blending them silently.
+        """
+        return self.flown if self.flown is not None else self.sold
+
+    @property
+    def basis(self) -> str:
+        if self.flown is not None:
+            return "flown"
+        return "sold" if self.sold is not None else ""
+
+    @property
     def load_factor(self):
         """Recomputed, never read from the sheet's own column.
 
         That column holds '#DIV/0!' wherever capacity was blank.
         """
-        if not self.capacity or self.flown is None:
+        taken = self.seats_taken
+        if not self.capacity or taken is None:
             return None
-        return self.flown / self.capacity
+        return taken / self.capacity
 
     @property
     def operated(self) -> bool:
@@ -166,27 +187,29 @@ class LoadHistory:
                 + f"; {self.not_operated:,} block(s) held no flight")
 
 
-def _block_layout(blocks, header_cols) -> dict:
-    """Which offset inside a date block holds which figure, for THIS sheet.
+def _block_layout(blocks, header_cols) -> list:
+    """Which offset holds which figure, for EVERY date block separately.
 
-    Derived from the sub-header row between one date block and the next,
-    so a three-column year and a six-column year both read correctly, and
-    a fourth layout would too.
+    One layout per sheet is not enough. The 2026 sheet changes width partway
+    through -- six columns until 20 April, then blocks of eight, ten, thirteen
+    and sixteen as Aircraft, Starting fare, Sold Seats and others are added,
+    and the widths keep varying after that. Reading the first block's layout
+    across all 230 put Flown at an offset that later held something else,
+    which is how a 189-seat 737 came back as 436 seats with no passengers.
+
+    So each block is read against its own sub-headers.
     """
-    if not blocks:
-        return {}
-    start = blocks[0][0]
-    width = ((blocks[1][0] - start) if len(blocks) > 1
-             else max(1, len(header_cols) - start))
-    out = {}
-    for k in range(width):
-        col = start + k
-        if col >= len(header_cols):
-            break
-        key = re.sub(r"[^a-z]", "", str(header_cols[col] or "").lower())
-        name = _FIELD_ALIASES.get(key)
-        if name and name not in out:
-            out[name] = k
+    out = []
+    for n, (start, _when) in enumerate(blocks):
+        end = (blocks[n + 1][0] if n + 1 < len(blocks)
+               else max(start + 1, len(header_cols)))
+        layout = {}
+        for col in range(start, min(end, len(header_cols))):
+            key = re.sub(r"[^a-z]", "", str(header_cols[col] or "").lower())
+            name = _FIELD_ALIASES.get(key)
+            if name and name not in layout:
+                layout[name] = col - start
+        out.append(layout)
     return out
 
 
@@ -212,8 +235,8 @@ def parse_sheet(ws, history: LoadHistory) -> None:
     if not blocks:
         return
     history.sheets.append(getattr(ws, "title", ""))
-    idx = _block_layout(blocks, header_cols)
-    if "capacity" not in idx:
+    layouts = _block_layout(blocks, header_cols)
+    if not any("capacity" in lay for lay in layouts):
         history.unreadable_sheets.append(getattr(ws, "title", ""))
         return
     for row in rows:
@@ -223,10 +246,10 @@ def parse_sheet(ws, history: LoadHistory) -> None:
         leg_route = str(row[1] or "").strip().upper()
         if not flight_no or not leg_route:
             continue
-        for start, when in blocks:
-            def at(name, _start=start, _row=row):
+        for (start, when), idx in zip(blocks, layouts):
+            def at(name, _start=start, _row=row, _idx=idx):
                 """A field of this date's block, by name, for this sheet."""
-                off = idx.get(name)
+                off = _idx.get(name)
                 if off is None or _start + off >= len(_row):
                     return None
                 return _row[_start + off]
@@ -240,7 +263,8 @@ def parse_sheet(ws, history: LoadHistory) -> None:
             history.legs.append(Leg(
                 flight_date=when, flight_no=flight_no, leg_route=leg_route,
                 capacity=cap, flown=_num(at("flown")),
-                sold=_num(at("sold")), std=_clock(at("std"))))
+                sold=_num(at("sold")), std=_clock(at("std")),
+                aircraft=str(at("aircraft") or "").strip()))
 
 
 def read_workbook(path, sheets=None) -> LoadHistory:
