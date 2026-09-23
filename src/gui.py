@@ -149,6 +149,10 @@ MSG_SM_REFUSED = "sm_refused"       # payload: str (why no answer exists)
 MSG_SC_DONE = "sc_done"             # payload: dict (one agency scorecard)
 MSG_SC_CHOOSE = "sc_choose"         # payload: list (ambiguous candidates)
 MSG_SC_ERROR = "sc_error"           # payload: str
+# Zenith Route Optimisation sub-tab
+MSG_RO_LOG = "ro_log"               # payload: str
+MSG_RO_DONE = "ro_done"             # payload: dict(rows, path, warnings)
+MSG_RO_ERROR = "ro_error"           # payload: str
 # Zenith Flight Schedule History sub-tab
 MSG_FSH_PROGRESS = "fsh_progress"   # (done, total, filename)
 MSG_FSH_LOG = "fsh_log"             # payload: str
@@ -4386,6 +4390,35 @@ class App(WhatsAppMixin, HealthMixin):
             self.btn_sm_open.configure(
                 state="normal" if self._sm_last_path else "disabled")
             self.btn_sm_calls.configure(state="disabled")
+        elif kind == MSG_RO_LOG:
+            self._ro_log(str(payload))
+        elif kind == MSG_RO_ERROR:
+            self._ro_log("Failed.")
+            self.btn_ro_run.configure(state="normal")
+            messagebox.showerror("Route Optimisation", str(payload))
+        elif kind == MSG_RO_DONE:
+            info = payload if isinstance(payload, dict) else {}
+            self._ro_last_path = info.get("path", "")
+            t = self.zenith_ro_tree
+            t.delete(*t.get_children())
+            for (route, lf, ours, rival, share, rask, top, verdict,
+                 squeezed) in info.get("rows", ()):
+                t.insert(
+                    "", "end",
+                    values=(route,
+                            "" if lf is None else f"{lf:.0%}",
+                            f"{ours:,.0f}", f"{rival:,.0f}",
+                            # blank, not 0%, where there is nothing to divide
+                            "" if share is None else f"{share:.1%}",
+                            "" if rask is None else f"{rask:,.2f}",
+                            top or "—", verdict),
+                    tags=("squeezed",) if squeezed else ())
+            self._ro_log(info.get("summary", "Done."))
+            self.zenith_ro_warning.configure(
+                text="\n".join(info.get("warnings", ())))
+            self.btn_ro_run.configure(state="normal")
+            self.btn_ro_open.configure(
+                state="normal" if self._ro_last_path else "disabled")
         elif kind == MSG_SC_ERROR:
             self._sc_log("Failed.")
             self.btn_sc_run.configure(state="normal")
@@ -6027,6 +6060,7 @@ class App(WhatsAppMixin, HealthMixin):
         counter_inner = ttk.Frame(inner_nb)
         visits_inner = ttk.Frame(inner_nb)
         movement_inner = ttk.Frame(inner_nb)
+        route_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
         inner_nb.add(flight_inner, text="Flight Loads")
@@ -6035,12 +6069,14 @@ class App(WhatsAppMixin, HealthMixin):
         inner_nb.add(counter_inner, text="Counter Activity")
         inner_nb.add(visits_inner, text="Agency Visits")
         inner_nb.add(movement_inner, text="Sales Movement")
+        inner_nb.add(route_inner, text="Route Optimisation")
         inner_nb.add(reports_inner, text="Reports")
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
         self._build_zenith_counter_tab(counter_inner)
         self._build_zenith_visits_tab(visits_inner)
         self._build_zenith_movement_tab(movement_inner)
+        self._build_zenith_route_tab(route_inner)
         self._build_zenith_reports_tab(reports_inner)
 
         # From here, the existing Customer Lookup form goes into
@@ -7949,6 +7985,292 @@ class App(WhatsAppMixin, HealthMixin):
             })
         except Exception as exc:                   # noqa: BLE001
             self._post(MSG_SC_ERROR, str(exc))
+
+    # ==================================================================
+    # Zenith Route Optimisation sub-tab — UI
+    # ==================================================================
+    def _build_zenith_route_tab(self, parent: ttk.Frame) -> None:
+        """Is the current flying the right flying?
+
+        Four sources, one question: our load records say how full each
+        flight goes, a stored schedule pull says who else flies the leg,
+        the distance table makes a short route and a long one comparable,
+        and the revenue file says what the seats earn. No Zenith sign-in
+        is needed — everything is read from files.
+        """
+        parent = self._make_scrollable(parent)
+        self._section(
+            parent, "Route Optimisation  ·  are we flying the right routes?",
+            help_text=(
+                "Compares how full our aircraft go against how many seats "
+                "every other airline puts on the same leg.\n\n"
+                "SEATS decide this, not departures. On DAC-CCU an IndiGo "
+                "A320 against our ATR is 180 seats to 72, so counting "
+                "flights says we hold a third of that market and counting "
+                "seats says a tenth — which is why we fly at 92% and still "
+                "lose share.\n\n"
+                "A connecting itinerary is not a competitor on the leg: a "
+                "Singapore 787 routed through Changi takes 1,683 minutes "
+                "gate to gate against a 30-minute hop, and is held back. "
+                "Competitor frequency is what is ON SALE, so every figure "
+                "is a floor."))
+
+        io = self._section(parent, "Files")
+        self.zenith_ro_loads = tk.StringVar(value="")
+        e1 = ttk.Entry(io, textvariable=self.zenith_ro_loads)
+        self._form_row(io, 0, "Load workbook:", e1, label_width=18,
+                       suffix=ttk.Button(io, text="Browse…",
+                                         command=self._ro_pick_loads))
+        self.zenith_ro_distance = tk.StringVar(value="")
+        e2 = ttk.Entry(io, textvariable=self.zenith_ro_distance)
+        self._form_row(io, 1, "Distances:", e2, label_width=18,
+                       suffix=ttk.Button(io, text="Browse…",
+                                         command=self._ro_pick_distance))
+        ttk.Label(io, text="optional — without it there is no RASK, and a "
+                           "full short hop and a full long sector are not "
+                           "the same opportunity.",
+                  style="Hint.TLabel").grid(row=2, column=1, sticky="w")
+        self.zenith_ro_output = tk.StringVar(
+            value=str(Path.home() / "Documents"))
+        e3 = ttk.Entry(io, textvariable=self.zenith_ro_output)
+        self._form_row(io, 3, "Output folder:", e3, label_width=18,
+                       suffix=ttk.Button(io, text="Browse…",
+                                         command=self._ro_pick_output))
+
+        win = self._section(parent, "Market schedule")
+        self.zenith_ro_days = tk.IntVar(value=90)
+        row = ttk.Frame(win)
+        ttk.Spinbox(row, from_=30, to=365, increment=30, width=5,
+                    textvariable=self.zenith_ro_days).pack(side="left")
+        ttk.Label(row, text="  days of our own load history to average   "
+                            "(the schedule comes from the stored pull)",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(win, 0, "Look back:", row, label_width=18)
+        self.zenith_ro_sched = ttk.Label(win, text="", style="Hint.TLabel")
+        self.zenith_ro_sched.grid(row=1, column=1, sticky="w")
+
+        ctl = ttk.Frame(parent)
+        ctl.pack(fill="x", padx=4, pady=(8, 4))
+        self.btn_ro_run = ttk.Button(ctl, text="Compare the network",
+                                     style="Primary.TButton",
+                                     command=self._ro_run)
+        self.btn_ro_run.pack(side="left")
+        self.btn_ro_open = ttk.Button(ctl, text="Open workbook",
+                                      command=self._ro_open, state="disabled")
+        self.btn_ro_open.pack(side="left", padx=(8, 0))
+        self.zenith_ro_status = ttk.Label(
+            ctl, text="Reads files only — no sign-in needed.",
+            style="Hint.TLabel")
+        self.zenith_ro_status.pack(side="left", padx=(12, 0))
+
+        self.zenith_ro_warning = ttk.Label(
+            parent, text="", style="Hint.TLabel", wraplength=900,
+            justify="left", foreground="#B00020")
+        self.zenith_ro_warning.pack(anchor="w", padx=8)
+
+        body = self._section(parent, "Routes")
+        cols = (("route", "Route", 90), ("lf", "Load", 70),
+                ("ours", "Our seats/day", 100),
+                ("rival", "Rival seats/day", 110),
+                ("share", "Seat share", 90), ("rask", "RASK", 80),
+                ("top", "Top rival", 110),
+                ("verdict", "Verdict", 300))
+        self.zenith_ro_tree = ttk.Treeview(
+            body, columns=[c[0] for c in cols], show="headings", height=16)
+        for cid, label, width in cols:
+            self.zenith_ro_tree.heading(cid, text=label)
+            self.zenith_ro_tree.column(
+                cid, width=width,
+                anchor="e" if cid in ("lf", "ours", "rival", "share", "rask")
+                else "w")
+        vs = ttk.Scrollbar(body, command=self.zenith_ro_tree.yview)
+        vs.pack(side="right", fill="y")
+        hs = ttk.Scrollbar(body, orient="horizontal",
+                           command=self.zenith_ro_tree.xview)
+        hs.pack(side="bottom", fill="x")
+        self.zenith_ro_tree.pack(fill="both", expand=True, padx=2, pady=4)
+        self.zenith_ro_tree.configure(yscrollcommand=vs.set,
+                                      xscrollcommand=hs.set)
+        self.zenith_ro_tree.tag_configure("squeezed", foreground="#B00020")
+        self._register_result_tree(self.zenith_ro_tree)
+
+        self._ro_worker: threading.Thread | None = None
+        self._ro_last_path: str = ""
+        self._ro_describe_schedule()
+
+    #: Where the FirstTrip collector writes its pulls.
+    _RO_SCHEDULE_DIR = Path("E:/Analysis/curated/competitor_schedule")
+
+    def _ro_describe_schedule(self) -> None:
+        """Name the stored pull that will be used, rather than imply one."""
+        try:
+            folder = self._RO_SCHEDULE_DIR
+            files = sorted(folder.glob("firsttrip_*.parquet")) \
+                if folder.is_dir() else []
+            self.zenith_ro_sched.configure(
+                text=(f"market schedule: {files[-1].name}" if files
+                      else "no stored schedule pull found — run the "
+                           "FirstTrip collector first"))
+        except Exception:        # noqa: BLE001 - UI only
+            pass
+
+    def _ro_pick_loads(self) -> None:
+        got = filedialog.askopenfilename(
+            title="Flight load analysis workbook",
+            filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if got:
+            self.zenith_ro_loads.set(got)
+
+    def _ro_pick_distance(self) -> None:
+        got = filedialog.askopenfilename(
+            title="Route distance workbook",
+            filetypes=[("Excel", "*.xlsx *.xlsm")])
+        if got:
+            self.zenith_ro_distance.set(got)
+
+    def _ro_pick_output(self) -> None:
+        got = filedialog.askdirectory(
+            title="Where should the workbook go?",
+            initialdir=self.zenith_ro_output.get() or str(Path.home()))
+        if got:
+            self.zenith_ro_output.set(got)
+
+    def _ro_log(self, msg: str) -> None:
+        try:
+            self.zenith_ro_status.configure(text=msg)
+        except Exception:        # noqa: BLE001 - UI only
+            pass
+
+    def _ro_open(self) -> None:
+        if not self._ro_last_path:
+            return
+        try:
+            os.startfile(self._ro_last_path)   # noqa: S606 — user asked
+        except Exception as exc:               # noqa: BLE001
+            messagebox.showerror("Route Optimisation", str(exc))
+
+    def _ro_run(self) -> None:
+        if self._ro_worker is not None and self._ro_worker.is_alive():
+            return
+        loads = (self.zenith_ro_loads.get() or "").strip()
+        if not loads or not Path(loads).is_file():
+            messagebox.showerror(
+                "Route Optimisation",
+                "Pick the flight load analysis workbook first — our own "
+                "frequency and load factor come from it, never from the "
+                "market search.")
+            return
+        try:
+            days = max(30, int(self.zenith_ro_days.get() or 90))
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Route Optimisation",
+                                 "'Look back' must be a whole number of days.")
+            return
+        self.btn_ro_run.configure(state="disabled")
+        self.zenith_ro_warning.configure(text="")
+        self.zenith_ro_tree.delete(*self.zenith_ro_tree.get_children())
+        self._ro_log("Reading the load workbook…")
+        self._ro_worker = threading.Thread(
+            target=self._ro_worker_run,
+            args=(Path(loads), (self.zenith_ro_distance.get() or "").strip(),
+                  Path(self.zenith_ro_output.get().strip()
+                       or str(Path.home())), days),
+            daemon=True)
+        self._ro_worker.start()
+
+    def _ro_worker_run(self, loads: Path, distance: str, out_dir: Path,
+                       days: int) -> None:
+        from datetime import timedelta
+
+        from . import flight_load_history as flh
+        from . import route_optimisation as ro
+        from . import route_optimisation_report as ror
+
+        try:
+            hist = flh.read_workbook(loads)
+            if not hist.legs:
+                raise ValueError(
+                    f"No flight legs were readable in {loads.name}.")
+            cut = max(x.flight_date for x in hist.legs)
+            legs = [x for x in hist.legs
+                    if x.flight_date >= cut - timedelta(days=days)]
+            self._post(MSG_RO_LOG,
+                       f"{len(legs):,} of our legs in the last {days} days; "
+                       f"reading the market schedule…")
+            rows, window_days = self._ro_schedule_rows()
+            if not rows:
+                raise ValueError(
+                    "No stored market schedule was found. Run the FirstTrip "
+                    "collector before comparing the network.")
+            dist = ro.load_distances(distance) if distance else {}
+            res = ro.build(legs, rows, distances=dist,
+                           revenue=self._ro_revenue(),
+                           days_observed=window_days)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / ror.default_filename()
+            ror.build_workbook(res, path)
+            self._post(MSG_RO_DONE, {
+                "path": str(path), "summary": res.summary(),
+                "warnings": list(res.warnings),
+                "rows": [
+                    (v.route, v.load_factor, v.our_seats, v.rival_seats,
+                     v.seat_share, v.rask,
+                     (v.top_rival.airline if v.top_rival else ""),
+                     v.verdict(), v.squeezed)
+                    for v in res.routes],
+            })
+        except Exception as exc:                   # noqa: BLE001
+            self._post(MSG_RO_ERROR, str(exc))
+
+    @classmethod
+    def _ro_schedule_rows(cls) -> tuple:
+        """The most recent stored pull, and how many days it covers."""
+        from . import counter_reconcile as cr
+
+        duckdb = cr._duckdb()
+        folder = cls._RO_SCHEDULE_DIR
+        if duckdb is None or not folder.is_dir():
+            return [], 14
+        files = sorted(folder.glob("firsttrip_*.parquet"))
+        if not files:
+            return [], 14
+        target = files[-1].as_posix().replace("'", "''")
+        con = duckdb.connect()
+        con.execute("SET enable_progress_bar=false")
+        got = con.execute(f"""
+            select queried_origin, queried_destination, queried_date,
+                   airline, flight_number, origin, destination,
+                   cast(departure as varchar) as departure, aircraft,
+                   date_diff('minute', cast(departure as timestamp),
+                             cast(arrival as timestamp)) as _minutes
+            from read_parquet('{target}')
+        """).fetchall()
+        cols = ("queried_origin", "queried_destination", "queried_date",
+                "airline", "flight_number", "origin", "destination",
+                "departure", "aircraft", "_minutes")
+        rows = [dict(zip(cols, r)) for r in got]
+        days = len({r["queried_date"] for r in rows}) or 14
+        return rows, days
+
+    @staticmethod
+    def _ro_revenue() -> dict:
+        """Route revenue per month, where the curated file carries it."""
+        from . import counter_reconcile as cr
+
+        duckdb = cr._duckdb()
+        if duckdb is None:
+            return {}
+        target = "E:/Analysis/curated/flight_perf/**/*.parquet"
+        try:
+            con = duckdb.connect()
+            con.execute("SET enable_progress_bar=false")
+            got = con.execute(f"""
+                select leg_route, avg(net), avg(segments)
+                from read_parquet('{target}') group by 1
+            """).fetchall()
+        except Exception:                      # noqa: BLE001
+            return {}
+        return {r[0]: (r[1], r[2]) for r in got if r[1]}
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a

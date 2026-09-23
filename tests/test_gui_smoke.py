@@ -439,3 +439,42 @@ def test_a_missing_last_year_leaves_the_cell_blank_not_zero(app):
             for i in app.zenith_sc_tree.get_children()]
     assert vals[0][2] == ""          # last-year share blank, not 0.000%
     assert vals[0][3] == ""
+
+
+def test_the_route_optimisation_tab_is_built(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    for attr in ("zenith_ro_tree", "btn_ro_run", "zenith_ro_loads",
+                 "zenith_ro_sched"):
+        assert hasattr(app, attr), f"missing {attr}"
+
+
+def test_the_route_tab_names_the_stored_pull_it_will_use(app):
+    """Leaving which schedule was used implied is how a stale pull gets
+    read as current."""
+    _sm_app(app)
+    said = str(app.zenith_ro_sched.cget("text"))
+    assert "firsttrip_" in said or "no stored schedule pull" in said
+
+
+def test_the_route_tab_refuses_to_run_without_our_own_load_file(app,
+                                                                monkeypatch):
+    """Our frequency must come from our records, never from the market
+    search, which sees only what is on sale."""
+    _sm_app(app)
+    app.zenith_ro_loads.set("")
+    shown = {}
+    monkeypatch.setattr("src.gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app._ro_run()
+    assert "never from the market search" in shown.get("msg", "")
+
+
+def test_a_route_with_no_share_shows_a_blank_not_a_zero(app):
+    _sm_app(app)
+    app._handle_msg("ro_done", {
+        "path": "", "summary": "x", "warnings": [],
+        "rows": [("DAC-XXX", None, 0.0, 0.0, None, None, "", "thin", False)]})
+    vals = app.zenith_ro_tree.item(
+        app.zenith_ro_tree.get_children()[0], "values")
+    assert vals[1] == "" and vals[4] == "" and vals[5] == ""

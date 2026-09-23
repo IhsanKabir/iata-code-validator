@@ -49,6 +49,10 @@ hiddenimports = [
     "src.sales_call_list",
     "src.agency_identity",
     "src.agency_scorecard",
+    "src.flight_load_history",
+    "src.aircraft_seats",
+    "src.route_optimisation",
+    "src.route_optimisation_report",
     # Reached the same deferred way and previously left to PyInstaller's own
     # analysis. Listed now so the whole class is covered rather than the ones
     # somebody remembered; tests/test_build_spec.py keeps this in step with
