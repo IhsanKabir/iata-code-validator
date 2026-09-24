@@ -54,8 +54,26 @@ def test_every_deferred_gui_import_is_named_in_the_spec():
         "the packaged .exe while every test still passes.")
 
 
+#: Modules the release workflow writes AFTER the tests run, from repo
+#: secrets (see build-release.yml). They exist on a developer's machine and
+#: in the packaged build, never in a clean checkout -- which is where CI
+#: runs this test. Without this exemption v1.50.0 and v1.51.0 failed to
+#: build while every local run passed.
+GENERATED = {"_build_config"}
+
+
 def test_the_spec_only_names_modules_that_exist():
     """A renamed or deleted module left in the spec fails the build late."""
-    gone = sorted(name for name in _spec_hidden()
+    gone = sorted(name for name in _spec_hidden() - GENERATED
                   if not (ROOT / "src" / f"{name}.py").is_file())
     assert not gone, f"spec names modules that no longer exist: {gone}"
+
+
+def test_generated_modules_are_really_generated_by_the_release_workflow():
+    """The exemption must not hide a module that simply went missing."""
+    workflow = (ROOT / ".github" / "workflows" /
+                "build-release.yml").read_text(encoding="utf-8")
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    for name in GENERATED:
+        assert f"src/{name}.py" in workflow
+        assert f"src/{name}.py" in gitignore
