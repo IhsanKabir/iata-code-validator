@@ -296,13 +296,17 @@ def write_rivals(ws, res: ro.Result) -> None:
             r += 1
 
 
-def build_workbook(res: ro.Result, out_path) -> None:
+def build_workbook(res: ro.Result, out_path, fleet=None,
+                   checks=()) -> None:
+    from .route_fleet_report import add_fleet_sheet
+
     wb = Workbook()
     wb.active.title = "Summary"
     # routes first: the Summary's distances point at where each pair landed
     starts = write_routes(wb.create_sheet(ROUTES_SHEET), res)
     write_summary(wb["Summary"], res, starts)
     write_rivals(wb.create_sheet("Who flies what"), res)
+    add_fleet_sheet(wb, fleet, list(checks))
     wb.save(str(out_path))
 
 

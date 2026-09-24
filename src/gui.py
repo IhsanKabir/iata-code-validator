@@ -8188,6 +8188,7 @@ class App(WhatsAppMixin, HealthMixin):
                        days: int) -> None:
         from datetime import timedelta
 
+        from . import fleet_rotation as fr
         from . import flight_load_history as flh
         from . import route_optimisation as ro
         from . import route_optimisation_report as ror
@@ -8215,9 +8216,15 @@ class App(WhatsAppMixin, HealthMixin):
             res = ro.build(legs, rows, distances=dist, revenue=revenue,
                            days_observed=window_days)
             res.warnings.append(note)
+            self._post(MSG_RO_LOG, "Chaining the timetable onto the fleet…")
+            blocks = fr.block_times(rows)
+            fleet = fr.chain(legs, blocks, dist)
+            checks = [c for c in (
+                fr.check_rotation(fleet, legs, blocks, p.outbound_route, dist)
+                for p in res.squeezed_pairs) if c is not None]
             out_dir.mkdir(parents=True, exist_ok=True)
             path = out_dir / ror.default_filename()
-            ror.build_workbook(res, path)
+            ror.build_workbook(res, path, fleet, checks)
             self._post(MSG_RO_DONE, {
                 "path": str(path), "summary": res.summary(),
                 "warnings": list(res.warnings),
