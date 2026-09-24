@@ -8254,7 +8254,13 @@ class App(WhatsAppMixin, HealthMixin):
 
     @staticmethod
     def _ro_revenue() -> dict:
-        """Route revenue per month, where the curated file carries it."""
+        """Route revenue BY MONTH, left for the engine to pick months from.
+
+        This used to return one average over every month the file held,
+        which mixed in refund tails from before a route was live and forward
+        months only partly sold. The engine now chooses the completed months
+        that match our load window, so all months are handed over as they are.
+        """
         from . import counter_reconcile as cr
 
         duckdb = cr._duckdb()
@@ -8265,12 +8271,16 @@ class App(WhatsAppMixin, HealthMixin):
             con = duckdb.connect()
             con.execute("SET enable_progress_bar=false")
             got = con.execute(f"""
-                select leg_route, avg(net), avg(segments)
-                from read_parquet('{target}') group by 1
+                select leg_route, year_month, sum(net)
+                from read_parquet('{target}') group by 1, 2
             """).fetchall()
         except Exception:                      # noqa: BLE001
             return {}
-        return {r[0]: (r[1], r[2]) for r in got if r[1]}
+        out: dict = {}
+        for route, month, net in got:
+            if route and month and net is not None:
+                out.setdefault(route, {})[str(month)] = float(net)
+        return out
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a

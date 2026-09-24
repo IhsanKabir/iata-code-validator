@@ -11,7 +11,7 @@ from tests.test_route_optimisation import _legs, _market
 def _res():
     return ro.build(_legs(), _market(), days_observed=14,
                     distances={"DAC-CCU": 329.656},
-                    revenue={"DAC-CCU": (10_440_000, 985)})
+                    revenue={"DAC-CCU": {"2026-09": 10_440_000}})
 
 
 def _book(tmp_path):

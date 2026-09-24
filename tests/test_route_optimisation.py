@@ -140,10 +140,72 @@ def test_a_route_with_too_few_flights_is_not_ranked():
 def test_rask_needs_distance_and_revenue_and_says_nothing_without_them():
     got = ro.build(_legs(), _market(), days_observed=14).by_route("DAC-CCU")
     assert got.rask is None
-    with_both = ro.build(_legs(), _market(), days_observed=14,
-                         distances={"DAC-CCU": 329.656},
-                         revenue={"DAC-CCU": (10_440_000, 985)})
-    assert with_both.by_route("DAC-CCU").rask > 0
+
+
+# --------------------------------------------------------------------------
+# RASK over the same completed months on both sides
+# --------------------------------------------------------------------------
+def _two_months():
+    """Our ATR flying Tue/Fri/Sun from 22 Jun to 20 Sep: July and August
+    are the only whole months inside that window."""
+    out = []
+    d = date(2026, 6, 22)
+    while d <= date(2026, 9, 20):
+        if d.weekday() in (1, 4, 6):
+            out.append(_Leg("DAC-CCU", 72, 67, d))
+        d = date.fromordinal(d.toordinal() + 1)
+    return out
+
+
+def test_only_whole_months_inside_the_load_window_are_used():
+    assert ro.whole_months(date(2026, 6, 22), date(2026, 9, 20)) ==         ["2026-07", "2026-08"]
+    assert ro.whole_months(date(2026, 7, 1), date(2026, 7, 31)) == ["2026-07"]
+    assert ro.whole_months(date(2026, 7, 2), date(2026, 7, 31)) == []
+
+
+def test_rask_is_revenue_over_seats_flown_times_km_in_the_same_months():
+    legs = _two_months()
+    res = ro.build(legs, _market(), days_observed=14,
+                   distances={"DAC-CCU": 329.656},
+                   revenue={"DAC-CCU": {"2026-07": 9_580_000,
+                                        "2026-08": 10_990_000}})
+    view = res.by_route("DAC-CCU")
+    seats = sum(x.capacity for x in legs
+                if f"{x.flight_date:%Y-%m}" in ("2026-07", "2026-08"))
+    assert view.rask == pytest.approx(
+        (9_580_000 + 10_990_000) / (seats * 329.656))
+    assert view.rask_months == ("2026-07", "2026-08")
+
+
+def test_forward_months_and_refund_tails_do_not_drag_rask_down():
+    """Averaging every month the revenue file held put Kolkata at 14
+    instead of 35: half-sold forward months and negative refund tails from
+    before the route was live were counted as ordinary months."""
+    clean = {"2026-07": 9_580_000, "2026-08": 10_990_000}
+    polluted = dict(clean, **{"2024-12": -100_000, "2025-05": 3_880_000,
+                              "2026-11": 280_000, "2027-02": 30_000})
+    a = ro.build(_two_months(), _market(), days_observed=14,
+                 distances={"DAC-CCU": 329.656},
+                 revenue={"DAC-CCU": clean}).by_route("DAC-CCU").rask
+    b = ro.build(_two_months(), _market(), days_observed=14,
+                 distances={"DAC-CCU": 329.656},
+                 revenue={"DAC-CCU": polluted}).by_route("DAC-CCU").rask
+    assert a == pytest.approx(b)
+
+
+def test_no_whole_month_means_no_rask_and_says_so():
+    res = ro.build(_legs(), _market(), days_observed=14,
+                   distances={"DAC-CCU": 329.656},
+                   revenue={"DAC-CCU": {"2026-09": 9_910_000}})
+    assert res.by_route("DAC-CCU").rask is None
+    assert any("No complete calendar month" in w for w in res.warnings)
+
+
+def test_the_months_used_are_stated_on_the_result():
+    res = ro.build(_two_months(), _market(), days_observed=14,
+                   distances={"DAC-CCU": 329.656},
+                   revenue={"DAC-CCU": {"2026-07": 1, "2026-08": 1}})
+    assert any("2026-07, 2026-08" in w for w in res.warnings)
 
 
 def test_an_unknown_aircraft_is_excluded_and_reported():

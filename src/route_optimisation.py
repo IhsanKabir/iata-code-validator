@@ -62,8 +62,12 @@ class RouteView:
     aircraft: str = ""
     rivals: list = field(default_factory=list)
     distance_km: float | None = None
+    #: Average ticket revenue per month over `rask_months`, for display.
     revenue_month: float | None = None
-    passengers_month: float | None = None
+    #: The RASK inputs, over exactly the same completed months on both sides.
+    rask_revenue: float | None = None
+    rask_seat_km: float | None = None
+    rask_months: tuple = ()
     observed_days: int = 0
 
     @property
@@ -107,11 +111,25 @@ class RouteView:
 
         A 95% load factor on a 329 km hop and on a 4,000 km sector are not
         the same opportunity, and only distance makes them comparable.
+
+            RASK = ticket revenue in months M
+                   / (seats actually flown in months M x route km)
+
+        M is the set of CALENDAR MONTHS lying wholly inside our load window
+        that the revenue file also carries. The first version averaged every
+        month the revenue file held -- refund tails from before a route was
+        live, and forward months only partly sold -- which put Kolkata at
+        14 instead of 35 and scrambled the ranking between routes, because
+        each route carries a different number of those months. Seats are
+        summed from the legs flown in the same months rather than scaled
+        from a daily average by thirty.
+
+        Strictly this is passenger RASK: ticket revenue only, no cargo or
+        ancillaries.
         """
-        if not (self.revenue_month and self.distance_km and self.our_seats):
+        if not (self.rask_revenue and self.rask_seat_km):
             return None
-        ask = self.our_seats * 30.0 * self.distance_km
-        return self.revenue_month / ask if ask else None
+        return self.rask_revenue / self.rask_seat_km
 
     @property
     def squeezed(self) -> bool:
@@ -143,6 +161,8 @@ class Result:
     window: tuple = ()
     load_span: tuple = ()
     basis: str = ""
+    #: The completed months RASK is computed over, stated on the sheet.
+    rask_months: tuple = ()
 
     @property
     def squeezed(self) -> list:
@@ -211,6 +231,43 @@ def _nonstop_cutoff(minutes) -> float:
     return min(min(real) * NONSTOP_FACTOR, NONSTOP_CEILING_MINUTES)
 
 
+def whole_months(first, last) -> list:
+    """'YYYY-MM' for every calendar month lying wholly inside [first, last].
+
+    A load window of 22 Jun to 20 Sep gives July and August only: June and
+    September are part-months on the load side, and their revenue would be
+    set against a different number of days of seats.
+    """
+    from calendar import monthrange
+    from datetime import date
+
+    out = []
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        start = date(y, m, 1)
+        end = date(y, m, monthrange(y, m)[1])
+        if start >= first and end <= last:
+            out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def _attach_rask(view: RouteView, revenue_by_month: dict,
+                 seats_by_month: dict, months) -> None:
+    """Revenue and seat-km over the same completed months, or nothing."""
+    used = [m for m in months
+            if m in revenue_by_month and seats_by_month.get(m)]
+    if not used or not view.distance_km:
+        return
+    rev = sum(float(revenue_by_month[m]) for m in used)
+    seat_km = sum(seats_by_month[m] for m in used) * view.distance_km
+    if rev <= 0 or seat_km <= 0:
+        return
+    view.rask_revenue, view.rask_seat_km = rev, seat_km
+    view.rask_months = tuple(used)
+    view.revenue_month = rev / len(used)
+
+
 def build(load_legs, schedule_rows, *, distances=None, revenue=None,
           days_observed: int = 14, our_airline: str = "BS") -> Result:
     """Fold our loads and the market schedule into one view per route.
@@ -228,6 +285,13 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
     ours = defaultdict(lambda: {"legs": 0, "seats": 0.0, "taken": 0.0,
                                 "ac": ""})
     bases = set()
+    # seats offered per route per calendar month, for RASK -- every leg that
+    # flew counts, whether or not its passengers were recorded
+    seats_by_month = defaultdict(lambda: defaultdict(float))
+    for leg in load_legs:
+        if leg.capacity:
+            seats_by_month[leg.leg_route][f"{leg.flight_date:%Y-%m}"] += \
+                leg.capacity
     for leg in load_legs:
         if leg.load_factor is None:
             continue
@@ -255,6 +319,8 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
 
     span = max(1, (res.load_span[1] - res.load_span[0]).days + 1) \
         if res.load_span else 1
+    full_months = whole_months(*res.load_span) if res.load_span else []
+    res.rask_months = tuple(full_months)
 
     for rt, rows in by_route.items():
         mins = [r.get("_minutes") for r in rows]
@@ -282,9 +348,8 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
             observed_days=days_observed,
             distance_km=(distances or {}).get(rt),
         )
-        rev = (revenue or {}).get(rt)
-        if rev:
-            view.revenue_month, view.passengers_month = rev
+        _attach_rask(view, (revenue or {}).get(rt) or {},
+                     seats_by_month.get(rt, {}), full_months)
         for al, got in per_airline.items():
             if al == our_airline:
                 continue
@@ -310,6 +375,17 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
         "Competitor frequency is what is ON SALE, so it is a floor: a "
         "sold-out flight can be invisible. Our own frequency comes from our "
         "records, not from the search.")
+    if revenue:
+        res.warnings.append(
+            ("RASK is ticket revenue divided by seats flown times route "
+             "distance, over the completed months "
+             + ", ".join(res.rask_months)
+             + " only -- the same months on both sides. Forward months "
+             "still on sale and months before a route was live are left "
+             "out, because averaging them in understated Kolkata by 60%.")
+            if res.rask_months else
+            "No complete calendar month lies inside the load window, so "
+            "RASK is not computed. Widen the look-back to cover one.")
     if res.basis and "sold" in res.basis:
         res.warnings.append(
             "Load factor uses seats SOLD where the workbook no longer carries "
