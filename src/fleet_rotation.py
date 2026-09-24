@@ -38,11 +38,19 @@ BEHIND_DHAKA = {
     "CAN": -120, "HKG": -120,
 }
 
-#: Least time on the ground between landing and the next departure. An
-#: assumption, stated on the sheet: too long and the chain invents aircraft,
-#: too short and it finds slots a real turnaround would not allow.
-GROUND_MINUTES = {"ATR 72": 25, "Airbus A330-300": 60}
-DEFAULT_GROUND = 45
+#: Two ground times, for two different jobs.
+#:
+#: CHAIN_TURN is for the flights ALREADY in the timetable. Those turns are
+#: not in question -- the timetable flies them -- so this is only a floor
+#: to stop two legs overlapping. The ATRs turn in 30-40 minutes at
+#: Chittagong and the outstations (land 07:55, leave 08:25); holding them
+#: to 40 minutes would take 13 ATRs to fly the timetable eight fly now.
+CHAIN_TURN = 20
+#: NEW_TURN is for the EXTRA rotation being tested: before it leaves, at
+#: the other end, and back at base before the aircraft's next flight. It is
+#: the longest turn operations quote (typically 40 minutes to an hour,
+#: 1h15 at most), so a slot that fits here fits on the slowest day.
+NEW_TURN = 75
 
 #: A slot only counts if the rotation would leave within operating hours.
 #: Jets run red-eyes -- DAC-SIN leaves 22:30 -- so theirs runs to 23:00.
@@ -53,6 +61,7 @@ LATEST_START = 23 * 60
 LATEST_START_BY = {"ATR 72": 20 * 60 + 30}
 
 DAY = 24 * 60
+HUB = "DAC"
 
 
 #: The 737-800s and the A320 are chained as one pool. The workbook labels
@@ -200,7 +209,7 @@ def chain(legs, blocks: dict, distances: dict | None = None) -> Fleet:
 
     for fam, flights in by_type.items():
         flights.sort()
-        ground = GROUND_MINUTES.get(fam, DEFAULT_GROUND)
+        ground = CHAIN_TURN
         waiting = defaultdict(list)            # station -> [Aircraft]
         fleet: list = []
         per_day = defaultdict(set)
@@ -224,16 +233,20 @@ def chain(legs, blocks: dict, distances: dict | None = None) -> Fleet:
     return out
 
 
+#: Candidate departure times are tried this many minutes apart.
+STEP = 5
+
+
 @dataclass
 class Slot:
     day: object
-    #: Earliest departure (Dhaka clock minutes) in a ground gap of an
-    #: aircraft that is flying that day anyway -- no extra aircraft needed.
+    #: Earliest departure (Dhaka clock minutes) that an aircraft already
+    #: flying that day could take -- no extra aircraft needed.
     gap: int | None = None
-    #: An aircraft the busiest day proves exists sat out this whole day.
-    #: It may well be the standby or in maintenance, so it is shown apart.
+    #: An aircraft sat at the base all day without flying. It may well be
+    #: the standby or in maintenance, so it is shown apart, not counted.
     spare: bool = False
-    #: How many different aircraft had a gap that fits. Pairs showing the
+    #: How many aircraft are free at once at that time. Pairs showing the
     #: same slot compete for these: one aircraft, one extra rotation.
     aircraft: int = 0
 
@@ -242,45 +255,88 @@ class Slot:
         return self.gap is not None or self.spare
 
 
-def slots_for(fleet: Fleet, fam: str, base: str, rotation: int) -> list:
-    """For each day, the earliest time a rotation of `rotation` minutes
-    could leave `base` on an aircraft of this type, or None.
+class _Ground:
+    """How many aircraft of one type stand at one station, minute by minute.
 
-    Two sources: a ground window between an aircraft's legs at the base,
-    and -- at Dhaka only, where a type not flying that day is parked -- an
-    aircraft the busiest day proves exists but this day never used.
-    Windows longer than a day are an aircraft the timetable lost track of
-    (a leg missing from the workbook), not a spare, and are left out.
+    This does not depend on WHICH aircraft took which leg: every landing
+    adds one once its turn is done and every departure takes one away,
+    whoever flew it. So the count is a fact of the timetable, where a
+    search for gaps on individual aircraft would depend on the chain's
+    arbitrary choice of tail -- and did: the same Kolkata slot came and
+    went with the chain's ground time.
     """
+
+    def __init__(self, planes, base: str, turn: int = CHAIN_TURN):
+        events = []
+        for plane in planes:
+            if plane.legs and plane.legs[0][2].split("-", 1)[0] == base:
+                events.append((-DAY, 0, 1))     # there before it first flew
+            for dep, arr, route in plane.legs:
+                o, d = route.split("-", 1)
+                if o == base:
+                    events.append((dep, 1, -1))
+                if d == base:
+                    events.append((arr + turn, 0, 1))
+        events.sort()                           # landings before departures
+        self.times, self.counts, n = [], [], 0
+        for when, _, delta in events:
+            n += delta
+            self.times.append(when)
+            self.counts.append(n)
+
+    def at(self, when: int) -> int:
+        from bisect import bisect_right
+        i = bisect_right(self.times, when)
+        return self.counts[i - 1] if i else 0
+
+    def lowest(self, start: int, end: int) -> int:
+        """The fewest aircraft standing at any moment in [start, end]."""
+        from bisect import bisect_right
+        low = self.at(start)
+        i, j = bisect_right(self.times, start), bisect_right(self.times, end)
+        if j > i:
+            low = min(low, min(self.counts[i:j]))
+        return low
+
+
+def slots_for(fleet: Fleet, fam: str, base: str, rotation: int) -> list:
+    """For each day, the earliest time a round trip of `rotation` minutes
+    could leave `base` without an extra aircraft, and how many could.
+
+    The day's SPARE is the fewest aircraft standing at the base at any
+    moment of it: at the busiest moment those were not needed at all, so
+    they may be the standby or in maintenance, and are shown apart rather
+    than counted. The rotation fits when, from departure until it is back
+    and turned, the count stays above that spare -- an aircraft that flies
+    at other hours is free then -- and the one leaving has had its turn.
+    Both counts come from the timetable alone, not from which aircraft
+    the chain happened to give which leg.
+    """
+    planes = fleet.aircraft.get(fam, [])
     days = [d.day for d in fleet.days.get(fam, [])]
-    earliest: dict = {}
-    planes = defaultdict(set)
-    for plane in fleet.aircraft.get(fam, []):
-        for (_, arr, route), (dep_next, _, _) in zip(plane.legs,
-                                                     plane.legs[1:]):
-            if route.split("-", 1)[1] != base:
-                continue
-            ground = GROUND_MINUTES.get(fam, DEFAULT_GROUND)
-            free_from, free_to = arr + ground, dep_next
-            if free_to - free_from > DAY:
-                continue
-            start = free_from
-            day_no, clock = divmod(start, DAY)
-            if clock < EARLIEST_START:
-                start += EARLIEST_START - clock
-                clock = EARLIEST_START
-            if (clock > LATEST_START_BY.get(fam, LATEST_START)
-                    or start + rotation > free_to):
-                continue
-            day = fleet.epoch.fromordinal(fleet.epoch.toordinal() + day_no)
-            planes[day].add(plane.ident)
-            if day not in earliest or clock < earliest[day]:
-                earliest[day] = clock
-    proven = fleet.proven(fam)
-    return [Slot(day, earliest.get(day),
-                 base == "DAC" and fleet.flying_on(fam, day) < proven,
-                 len(planes.get(day, ())))
-            for day in days]
+    if not planes:
+        return []
+    ground = _Ground(planes, base)
+    # The same count with every landing held back its full 1h15 turn: the
+    # aircraft that leaves must be one of these. Where the timetable sent
+    # an aircraft out sooner, this count reads low, so it errs towards
+    # "no slot", never towards a slot that is not there.
+    rested = _Ground(planes, base, turn=NEW_TURN)
+    latest = LATEST_START_BY.get(fam, LATEST_START)
+    out = []
+    for day in days:
+        lo = (day - fleet.epoch).days * DAY
+        spare = max(0, ground.lowest(lo, lo + DAY - 1))
+        slot = Slot(day, spare=spare > 0)
+        for clock in range(EARLIEST_START, latest + 1, STEP):
+            t = lo + clock
+            free = min(ground.lowest(t, t + rotation),
+                       rested.at(t)) - spare
+            if free >= 1:
+                slot.gap, slot.aircraft = clock, free
+                break
+        out.append(slot)
+    return out
 
 
 def chain_breaks(fleet: Fleet, fam: str) -> int:
@@ -319,7 +375,8 @@ def check_rotation(fleet: Fleet, legs, blocks: dict, outbound: str,
     """Would one more round trip on `outbound` fit the fleet we fly?
 
     The type is whatever flies the route now; the length is both blocks
-    plus a ground time at each end. None where the route's type or
+    plus the longest turn at the far end and back at base. None where
+    the route's type or
     block times are unknown.
     """
     from .route_optimisation import distance_of
@@ -331,7 +388,6 @@ def check_rotation(fleet: Fleet, legs, blocks: dict, outbound: str,
         return None
     fam = max({family(x.aircraft) for x in ours},
               key=lambda f: sum(1 for x in ours if family(x.aircraft) == f))
-    ground = GROUND_MINUTES.get(fam, DEFAULT_GROUND)
     out_b = blocks.get(outbound) or estimate_block(
         outbound, distance_of(outbound, distances or {}), fam)
     in_b = blocks.get(inbound) or estimate_block(
@@ -339,7 +395,7 @@ def check_rotation(fleet: Fleet, legs, blocks: dict, outbound: str,
     if not (out_b and in_b):
         return None
     got = RotationCheck(pair=f"{base} ⇄ {away}", base=base, fam=fam,
-                        rotation=out_b + ground + in_b + ground)
+                        rotation=out_b + NEW_TURN + in_b + NEW_TURN)
     flown = {x.flight_date.strftime("%a") for x in ours}
     got.flown_days = tuple(d for d in WEEKDAYS if d in flown)
     per = defaultdict(list)

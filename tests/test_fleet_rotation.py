@@ -77,38 +77,53 @@ def test_the_busiest_day_proves_the_fleet():
     assert fleet.flying_on("ATR 72", date(2026, 9, 8)) == 1
 
 
-def test_a_ground_gap_at_the_base_is_a_slot():
+def _shuttle(when=MON):
+    """One ATR on DAC-CGP all day, never more than 40 minutes at Dhaka,
+    and back for the night at 21:25."""
+    out = []
+    for dep, back in (("07:00", "08:25"), ("10:00", "11:30"),
+                      ("13:00", "14:30"), ("16:00", "17:30"),
+                      ("19:00", "20:30")):
+        out += [_Leg("DAC-CGP", dep, when), _Leg("CGP-DAC", back, when)]
+    return out
+
+
+def test_a_slot_needs_an_aircraft_on_the_ground_for_the_whole_trip():
+    """The Kolkata ATR is back 09:45; after its full 1h15 turn it can go
+    at 11:00, and the 17:00 Kolkata still has the Chittagong ATR, back
+    12:25. It does not matter which aircraft the chain gave which leg."""
     fleet = fr.chain(_day(), BLOCKS)
-    slots = fr.slots_for(fleet, "ATR 72", "DAC", rotation=170)
-    assert slots[0].gap is not None and slots[0].fits
-    # The first ATR, back from Chittagong 12:25 plus 25 minutes' ground,
-    # waits until the 17:00 Kolkata. The second's wait from 10:10 has no
-    # leg after it in the data, so its end is unknown and it is not
-    # counted: a slot is claimed only between two recorded legs.
-    assert slots[0].gap == 12 * 60 + 50
+    slot = fr.slots_for(fleet, "ATR 72", "DAC", rotation=170)[0]
+    assert slot.gap == 11 * 60 and slot.aircraft == 1 and slot.fits
 
 
-def test_a_rotation_longer_than_any_gap_does_not_fit():
-    fleet = fr.chain(_day(), BLOCKS)
-    slots = fr.slots_for(fleet, "ATR 72", "DAC", rotation=12 * 60)
-    assert slots[0].gap is None and not slots[0].fits
+def test_an_aircraft_busy_all_day_and_free_only_at_night_is_no_slot():
+    """40 minutes at Dhaka between trips, then parked from 21:25: too late
+    for an ATR rotation, which must leave by 20:30."""
+    fleet = fr.chain(_shuttle(), BLOCKS)
+    slot = fr.slots_for(fleet, "ATR 72", "DAC", rotation=170)[0]
+    assert slot.gap is None and not slot.fits
 
 
-def test_an_aircraft_idle_all_day_is_shown_as_spare_not_as_a_gap():
+def test_an_aircraft_idle_all_day_is_spare_and_not_counted_as_a_slot():
+    """Tuesday: the Kolkata ATR flies nothing. That may be the standby,
+    so the slot comes from the Chittagong ATR alone, after its 12:25
+    landing and 1h15 turn."""
     legs = _day(MON) + _day(date(2026, 9, 8))[:4]
     fleet = fr.chain(legs, BLOCKS)
-    tue = fr.slots_for(fleet, "ATR 72", "DAC", rotation=12 * 60)[1]
-    assert tue.spare is True and tue.gap is None
+    tue = fr.slots_for(fleet, "ATR 72", "DAC", rotation=170)[1]
+    assert tue.spare is True
+    assert tue.gap == 13 * 60 + 40
 
 
 def test_one_more_rotation_is_checked_weekday_by_weekday():
     fleet = fr.chain(_day(), BLOCKS)
     got = fr.check_rotation(fleet, _day(), BLOCKS, "DAC-CCU")
     assert got.fam == "ATR 72"
-    assert got.rotation == 60 + 25 + 60 + 25
+    assert got.rotation == 60 + fr.NEW_TURN + 60 + fr.NEW_TURN
     assert got.flown_days == ("Mon",)
     gaps, spares, seen, start, planes = got.by_weekday["Mon"]
-    assert (gaps, seen, planes) == (1, 1, 1) and start is not None
+    assert (gaps, seen, planes, start) == (1, 1, 1, 11 * 60)
 
 
 def test_an_unknown_route_cannot_be_checked():
@@ -137,11 +152,3 @@ def test_no_fleet_means_no_fleet_sheet(tmp_path):
                                        ("", None), (None, None)])
 def test_clock_reading(text, want):
     assert fr._clock(text) == want
-
-
-def test_an_atr_free_only_late_at_night_is_not_a_slot():
-    """Parked for the night after a 22:10 landing is not a Kolkata slot."""
-    legs = [_Leg("DAC-CGP", "20:30"), _Leg("CGP-DAC", "21:50"),
-            _Leg("DAC-CGP", "07:00", date(2026, 9, 8))]
-    fleet = fr.chain(legs, BLOCKS)
-    assert fr.slots_for(fleet, "ATR 72", "DAC", rotation=170)[0].gap is None

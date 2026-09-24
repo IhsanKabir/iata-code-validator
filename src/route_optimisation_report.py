@@ -195,7 +195,35 @@ def _pair_rows(ws, r: int, pair, bold: bool = False,
     return r
 
 
-def write_summary(ws, res: ro.Result, linked: dict | None = None) -> None:
+def write_advice(ws, r: int, advice: list) -> int:
+    """Each suggested change, then the evidence for it, one line each."""
+    r = _band(ws, r, "WHAT TO CHANGE, AND WHY",
+              "each suggestion with the data behind it — strongest first")
+    if not advice:
+        _cell(ws, r, 1, "No route calls for a change on this data.",
+              size=10, color=GREY)
+        return r + 2
+    for item in advice:
+        tone = BAD if item.kind == "add" else WARN
+        _cell(ws, r, 1, item.pair, bold=True, size=11, border=True,
+              fill=PAPER)
+        ws.merge_cells(f"B{r}:{LAST}{r}")
+        _cell(ws, r, 2, f"  {item.action}", bold=True, size=11,
+              fill=tone, align="left")
+        ws.row_dimensions[r].height = 20
+        r += 1
+        for reason in item.reasons:
+            ws.merge_cells(f"B{r}:{LAST}{r}")
+            _cell(ws, r, 2, f"  • {reason}", size=9, align="left",
+                  wrap=True)
+            ws.row_dimensions[r].height = 30
+            r += 1
+        r += 1
+    return r
+
+
+def write_summary(ws, res: ro.Result, linked: dict | None = None,
+                  advice=()) -> None:
     _prep(ws)
     ws.freeze_panes = "A4"
     lo, hi = (res.window or ("", ""))
@@ -231,6 +259,8 @@ def write_summary(ws, res: ro.Result, linked: dict | None = None) -> None:
             ws.row_dimensions[r].height = 26
             r += 1
         r += 1
+
+    r = write_advice(ws, r, list(advice))
 
     r = _band(ws, r, "FULL AND OUT-FLOWN",
               "near-full aircraft holding a small share of the seats, in "
@@ -299,12 +329,14 @@ def write_rivals(ws, res: ro.Result) -> None:
 def build_workbook(res: ro.Result, out_path, fleet=None,
                    checks=()) -> None:
     from .route_fleet_report import add_fleet_sheet
+    from .route_reasons import advise_all
 
     wb = Workbook()
     wb.active.title = "Summary"
     # routes first: the Summary's distances point at where each pair landed
     starts = write_routes(wb.create_sheet(ROUTES_SHEET), res)
-    write_summary(wb["Summary"], res, starts)
+    write_summary(wb["Summary"], res, starts,
+                  advise_all(res, checks))
     write_rivals(wb.create_sheet("Who flies what"), res)
     add_fleet_sheet(wb, fleet, list(checks))
     wb.save(str(out_path))

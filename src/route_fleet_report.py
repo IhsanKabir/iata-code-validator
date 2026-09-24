@@ -98,21 +98,35 @@ def write_fleet(ws, fleet: fr.Fleet, checks: list) -> None:
 
     r = _band(ws, r, "HOW TO READ THIS")
     notes = [
-        "GREEN 15:25 (13/13): on 13 of the 13 such weekdays seen, an "
-        "aircraft already flying that day sat at the base long enough for "
-        "the round trip, typically from 15:25. No extra aircraft is needed. "
-        "×2 means two different aircraft had such a gap.",
+        "How a slot is found: minute by minute, the sheet counts how many "
+        "aircraft of the type stand at the base — each landing adds one, "
+        "each departure takes one away, whichever aircraft flew it. At the "
+        "busiest moment of the day some may still be standing: the "
+        "timetable never needed them, so they are treated as the spare "
+        "(standby or maintenance) and not used. A rotation fits when, for "
+        "its whole length, the count stays above that spare.",
+        "GREEN 16:15 (13/13): on 13 of the 13 such weekdays seen, an "
+        "aircraft that flies at other hours was free from about 16:15 for "
+        "the whole round trip. No extra aircraft is needed. ×2 means two "
+        "such rotations would fit at once.",
         "Slots are SHARED between pairs of the same type: DAC ⇄ CCU and "
         "DAC ⇄ CGP showing 15:25 ×2 are offered the same two aircraft — "
         "two extra rotations between them, not two each.",
-        "YELLOW: the gap is there only some weeks, or the only free aircraft "
-        "is one that flew nothing all day — which is often the standby or "
-        "one in maintenance. RED: no slot either way.",
-        "Round trip = block out + ground + block back + ground. Block times "
-        "are our own from the market pull, corrected for each station's "
-        "clock; ground times assumed: ATR 25 min, narrowbody jets 45, A330 "
-        "60. A slot must leave between 05:00 and 20:30 for the ATR, 23:00 "
-        "for the jets.",
+        "YELLOW: the slot is there only some weeks — the timetable differs "
+        "week to week — or the only free aircraft is the spare. RED: no "
+        "slot either way.",
+        "Why ground time matters: an aircraft back at base cannot leave "
+        "again the minute it lands. Without it, a 2-hour gap would look "
+        "like room for a 2-hour round trip that cannot actually be flown. "
+        "The extra rotation is given the LONGEST turn, 1h15, at every stop "
+        "— before it leaves, at the far end, and back at base before the "
+        "aircraft's next flight — so a slot shown here fits even on a slow "
+        "day. The flights already in the timetable keep their own turns: "
+        "they are flown today, so they are taken as proven.",
+        "Round trip = block out + 1h15 + block back + 1h15. Block times are "
+        "our own from the market pull, corrected for each station's clock. "
+        "A slot must leave between 05:00 and 20:30 for the ATR, 23:00 for "
+        "the jets.",
         f"The 737-800s and the A320 are one pool: {fr.NARROWBODY} — the load "
         "file labels the return leg by habit, not by what flew, so the two "
         "cannot be told apart on the way home.",
