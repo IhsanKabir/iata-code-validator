@@ -65,6 +65,21 @@ def test_an_unknown_distance_falls_back_to_an_equal_split_and_is_counted():
     assert got.for_leg("DAC-XYZ")["2026-07"] == pytest.approx(5_000)
 
 
+def test_a_leg_missing_from_the_table_is_weighted_by_great_circle():
+    """The table has no CGP-DXB. An equal split gave half of a DXB-CGP-DAC
+    fare to the 300 km domestic leg; the flying is almost all Dubai."""
+    got = rr.split_revenue([("DXB-CGP-DAC", JUL, 40_000)], KM)
+    assert got.estimated == 1 and got.equal_split == 0
+    assert got.for_leg("CGP-DAC")["2026-07"] < 0.1 * 40_000
+    assert got.for_leg("DXB-CGP")["2026-07"] + \
+        got.for_leg("CGP-DAC")["2026-07"] == pytest.approx(40_000)
+
+
+def test_great_circle_is_close_to_the_table_where_both_exist():
+    assert rr.great_circle_km("DAC", "DXB") == pytest.approx(3564, rel=0.05)
+    assert rr.great_circle_km("DAC", "XYZ") is None
+
+
 def test_refunds_come_off_through_the_same_split():
     got = rr.split_revenue([("DAC-CGP-DAC", JUL, 14_349),
                             ("DAC-CGP-DAC", JUL, -14_349)], KM)

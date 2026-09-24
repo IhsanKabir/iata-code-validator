@@ -20,14 +20,81 @@ from . import route_optimisation as ro
 from .counter_master import (BAD, GOOD, GREY, LAST, MONEY, NAVY, PAPER, PCT,
                              WARN, _band, _cell, _headers, _kpi_strip)
 
-WIDTHS = [12, 8, 10, 11, 11, 10, 9, 10, 9, 10, 13, 13, 11, 10, 10,
-          7, 7, 7, 7, 7, 30]
+WIDTHS = [14, 8, 10, 11, 11, 10, 9, 10, 9, 10, 13, 9, 11, 10, 10,
+          15, 12, 4, 4, 4, 30]
 
 ROUTE_HEADERS = [
     "Route", "Load", "Our seats/day", "Our flights/day", "Rival seats/day",
     "Rival flights", "Seat share", "Flight share", "Aircraft", "Distance km",
     "Base fare/month", "RASK", "Top rival", "Their seats", "Their aircraft",
-    "", "", "", "", "", "Verdict"]
+    "Base fare, RASK months", "Seats flown, RASK months", "", "", "",
+    "Verdict"]
+
+#: The RASK cells. RASK is a live formula over these, so a distance typed
+#: into a blank Distance cell computes it on the spot.
+DIST, RASK, FARE, SEATS = "J", "L", "P", "Q"
+ROUTES_SHEET = "Every route"
+KM = '#,##0;-#,##0;""'
+
+
+def _formula(ws, r: int, col: str, formula: str, *, fmt=None, fill=None,
+             bold=False) -> None:
+    """A deliberate live formula. `_cell` refuses anything starting with
+    '=' so that data can never become one; this is the one door in."""
+    c = ws[f"{col}{r}"]
+    _cell(ws, r, c.column, None, size=9, border=True, align="right",
+          fill=fill, fmt=fmt, bold=bold)
+    c.value = formula
+
+
+def _rask_formula(parts) -> str:
+    """RASK over the directions whose distance is filled in.
+
+    `parts` are row numbers. A direction with no distance adds nothing to
+    either side, so a pair shows RASK for the half it can -- and the whole
+    the moment the other distance is typed in.
+    """
+    num = "+".join(f"IF(N({DIST}{x})>0,N({FARE}{x}),0)" for x in parts)
+    den = "+".join(f"IF(N({DIST}{x})>0,N({SEATS}{x})*{DIST}{x},0)"
+                   for x in parts)
+    return f'=IFERROR(ROUND(({num})/({den}),2),"")'
+
+
+def _direction_rask(ws, r: int, view, dist_from: str | None) -> None:
+    """Distance, the two RASK inputs, and RASK itself, for one direction.
+
+    `dist_from` is a formula supplying the distance from elsewhere (the
+    reverse direction, or the Every route sheet); otherwise the table's
+    distance is written, or the cell is left blank and shaded for filling.
+    """
+    if dist_from:
+        _formula(ws, r, DIST, dist_from, fmt=KM,
+                 fill=None if view.distance_km else WARN)
+    else:
+        _cell(ws, r, 10, view.distance_km, fmt=KM, size=9, border=True,
+              align="right", fill=None if view.distance_km else WARN)
+    _cell(ws, r, 16, round(view.rask_revenue) if view.rask_revenue else None,
+          fmt=MONEY, size=9, border=True, align="right")
+    _cell(ws, r, 17, round(view.rask_seats) if view.rask_seats else None,
+          fmt="#,##0", size=9, border=True, align="right")
+    _formula(ws, r, RASK, _rask_formula([r]), fmt="0.00")
+
+
+def _pair_rask(ws, r: int, rows: list) -> None:
+    """The pair row: its distance, inputs and RASK, all from its directions."""
+    if not rows:
+        return
+    first = rows[0]
+    dist = f'=IF(N({DIST}{first})>0,{DIST}{first},'
+    dist += (f'IF(N({DIST}{rows[1]})>0,{DIST}{rows[1]},""))'
+             if len(rows) > 1 else '"")')
+    _formula(ws, r, DIST, dist, fmt=KM, fill=PAPER)
+    _formula(ws, r, FARE, "=" + "+".join(f"N({FARE}{x})" for x in rows),
+             fmt=MONEY, fill=PAPER)
+    _formula(ws, r, SEATS, "=" + "+".join(f"N({SEATS}{x})" for x in rows),
+             fmt="#,##0", fill=PAPER)
+    _formula(ws, r, RASK, _rask_formula(rows), fmt="0.00", fill=PAPER,
+             bold=True)
 
 
 def _prep(ws) -> None:
@@ -72,43 +139,63 @@ def _route_row(ws, r: int, view, bold: bool = False, *, label=None,
     _cell(ws, r, 8, view.flight_share, fmt=PCT, size=9, border=True,
           align="center", fill=fill)
     _cell(ws, r, 9, view.aircraft or None, size=9, border=True, fill=fill)
-    _cell(ws, r, 10, round(view.distance_km) if view.distance_km else None,
-          size=9, border=True, align="right", fill=fill)
+    # distance (col 10), RASK (12) and its inputs (16, 17) are written by
+    # _direction_rask / _pair_rask, as live formulas
     _cell(ws, r, 11, round(view.revenue_month) if view.revenue_month else None,
           fmt=MONEY, size=9, border=True, align="right", fill=fill)
-    _cell(ws, r, 12, round(view.rask, 2) if view.rask else None, fmt="0.00",
-          size=9, border=True, align="right", fill=fill)
     _cell(ws, r, 13, tr.airline if tr else None, size=9, border=True,
           align="center", fill=fill)
     _cell(ws, r, 14, round(tr.seats) if tr else None, size=9, border=True,
           align="right", fill=fill)
     _cell(ws, r, 15, (tr.aircraft or "")[:18] if tr else None, size=9,
           border=True, fill=fill)
-    for j in range(16, 21):
+    for j in (10, 12, 16, 17, 18, 19, 20):
         _cell(ws, r, j, None, border=True, fill=fill)
     _cell(ws, r, 21, view.verdict(), bold=bold, size=9, fill=tone or fill,
           border=True)
 
 
-def _pair_rows(ws, r: int, pair, bold: bool = False) -> int:
-    """The pair's combined row, then outbound, then inbound."""
+def _pair_rows(ws, r: int, pair, bold: bool = False,
+               linked: int | None = None) -> int:
+    """The pair's combined row, then outbound, then inbound.
+
+    `linked` is where this pair starts on the Every route sheet. When set,
+    the distances are read from there, so a distance is typed in ONE place
+    and every sheet's RASK follows it.
+    """
+    top = r
     _route_row(ws, r, pair, bold=True, label=pair.name, fill=PAPER)
     r += 1
-    for arrow, route, view in (("→", pair.outbound_route, pair.outbound),
-                               ("←", pair.inbound_route, pair.inbound)):
+    rows = []
+    for k, (arrow, route, view) in enumerate(
+            (("→", pair.outbound_route, pair.outbound),
+             ("←", pair.inbound_route, pair.inbound)), start=1):
         if view is None:
             _cell(ws, r, 1, f"   {arrow} {route}", size=9, color=GREY,
                   border=True)
             ws.merge_cells(f"B{r}:{LAST}{r}")
             _cell(ws, r, 2, "  not in the market pull", size=9, color=GREY,
                   align="left")
+            r += 1
+            continue
+        _route_row(ws, r, view, bold=bold, label=f"   {arrow} {route}")
+        if linked is not None:
+            src = f"'{ROUTES_SHEET}'!{DIST}{linked + k}"
+            dist_from = f'=IF(N({src})>0,{src},"")'
+        elif k == 2 and not view.distance_km and pair.outbound is not None:
+            # both ways unknown: the inbound follows the outbound, so one
+            # typed distance fills the pair (and can still be overwritten)
+            dist_from = f'=IF(N({DIST}{top + 1})>0,{DIST}{top + 1},"")'
         else:
-            _route_row(ws, r, view, bold=bold, label=f"   {arrow} {route}")
+            dist_from = None
+        _direction_rask(ws, r, view, dist_from)
+        rows.append(r)
         r += 1
+    _pair_rask(ws, top, rows)
     return r
 
 
-def write_summary(ws, res: ro.Result) -> None:
+def write_summary(ws, res: ro.Result, linked: dict | None = None) -> None:
     _prep(ws)
     ws.freeze_panes = "A4"
     lo, hi = (res.window or ("", ""))
@@ -154,10 +241,11 @@ def write_summary(ws, res: ro.Result) -> None:
               color=GREY)
         r += 1
     for pair in res.squeezed_pairs:
-        r = _pair_rows(ws, r, pair, bold=True)
+        r = _pair_rows(ws, r, pair, bold=True,
+                       linked=(linked or {}).get(pair.outbound_route))
 
 
-def write_routes(ws, res: ro.Result) -> None:
+def write_routes(ws, res: ro.Result) -> dict:
     _prep(ws)
     _title(ws, "EVERY ROUTE",
            "Each city pair is shown both ways: first the two directions "
@@ -166,10 +254,16 @@ def write_routes(ws, res: ro.Result) -> None:
            "direction where the search saw rivals, since one showing nobody "
            "is unsold on the site rather than ours alone. A route with too few "
            "observed flights is kept, and said to be too thin to judge, "
-           "rather than ranked against the rest.")
+           "rather than ranked against the rest.   RASK is a live formula: "
+           "a YELLOW distance is missing from the distance table -- type the "
+           "km into the outbound (→) row and RASK fills in on every sheet.")
+    ws.row_dimensions[2].height = 44
     r = _headers(ws, 4, ROUTE_HEADERS)
+    starts = {}
     for pair in res.pairs:
+        starts[pair.outbound_route] = r
         r = _pair_rows(ws, r, pair)
+    return starts
 
 
 def write_rivals(ws, res: ro.Result) -> None:
@@ -204,9 +298,10 @@ def write_rivals(ws, res: ro.Result) -> None:
 
 def build_workbook(res: ro.Result, out_path) -> None:
     wb = Workbook()
-    write_summary(wb.active, res)
     wb.active.title = "Summary"
-    write_routes(wb.create_sheet("Every route"), res)
+    # routes first: the Summary's distances point at where each pair landed
+    starts = write_routes(wb.create_sheet(ROUTES_SHEET), res)
+    write_summary(wb["Summary"], res, starts)
     write_rivals(wb.create_sheet("Who flies what"), res)
     wb.save(str(out_path))
 

@@ -88,3 +88,61 @@ def test_a_run_with_nothing_squeezed_says_so(tmp_path):
     ror.build_workbook(ro.build(legs, rows, days_observed=14), out)
     assert "No route is both full and out-flown." in \
         _text(load_workbook(out)["Summary"])
+
+
+# ---- RASK is a live formula, so a typed-in distance computes it -----------
+
+def _no_distance_pair():
+    """Both directions full and out-flown, and missing from the table."""
+    def view(route):
+        return ro.RouteView(route, our_seats=72, our_taken=70, our_legs=20,
+                            rivals=[ro.Rival("6E", 2, 360)],
+                            rask_revenue=1_000_000.0, rask_seats=2_000.0,
+                            rask_months=("2026-07",))
+    return ro.Result(routes=[view("DAC-XYZ"), view("XYZ-DAC")])
+
+
+def _rows_for(ws, label):
+    for r in range(1, ws.max_row + 1):
+        if str(ws.cell(row=r, column=1).value or "").strip() == label:
+            return r
+    raise AssertionError(f"no row {label!r}")
+
+
+def test_a_missing_distance_is_left_blank_with_rask_as_a_formula(tmp_path):
+    out = tmp_path / "ro.xlsx"
+    ror.build_workbook(_no_distance_pair(), out)
+    ws = load_workbook(out)["Every route"]
+    r = _rows_for(ws, "→ DAC-XYZ")
+    assert ws[f"J{r}"].value is None                     # blank, to be typed
+    assert ws[f"P{r}"].value == 1_000_000 and ws[f"Q{r}"].value == 2_000
+    rask = ws[f"L{r}"].value
+    assert rask.startswith("=") and f"J{r}" in rask and f"P{r}" in rask
+
+
+def test_one_typed_distance_fills_the_pair(tmp_path):
+    """The inbound reads the outbound's distance; the pair row pools both."""
+    out = tmp_path / "ro.xlsx"
+    ror.build_workbook(_no_distance_pair(), out)
+    ws = load_workbook(out)["Every route"]
+    o = _rows_for(ws, "→ DAC-XYZ")
+    i = _rows_for(ws, "← XYZ-DAC")
+    assert f"J{o}" in ws[f"J{i}"].value
+    pair = _rows_for(ws, "DAC ⇄ XYZ")
+    assert all(f"{c}{x}" in ws[f"L{pair}"].value
+               for c in "JPQ" for x in (o, i))
+
+
+def test_the_summary_reads_its_distances_from_every_route(tmp_path):
+    out = tmp_path / "ro.xlsx"
+    ror.build_workbook(_no_distance_pair(), out)
+    wb = load_workbook(out)
+    o = _rows_for(wb["Every route"], "→ DAC-XYZ")
+    s = _rows_for(wb["Summary"], "→ DAC-XYZ")
+    assert f"'Every route'!J{o}" in wb["Summary"][f"J{s}"].value
+
+
+def test_a_known_distance_is_written_as_a_number(tmp_path):
+    ws = _book(tmp_path)["Every route"]
+    r = _rows_for(ws, "→ DAC-CCU")
+    assert ws[f"J{r}"].value == 329.656

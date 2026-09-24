@@ -158,7 +158,8 @@ def _two_months():
 
 
 def test_only_whole_months_inside_the_load_window_are_used():
-    assert ro.whole_months(date(2026, 6, 22), date(2026, 9, 20)) ==         ["2026-07", "2026-08"]
+    assert ro.whole_months(date(2026, 6, 22), date(2026, 9, 20)) == \
+        ["2026-07", "2026-08"]
     assert ro.whole_months(date(2026, 7, 1), date(2026, 7, 31)) == ["2026-07"]
     assert ro.whole_months(date(2026, 7, 2), date(2026, 7, 31)) == []
 
@@ -259,8 +260,10 @@ def test_pair_figures_are_sums_not_averages_of_ratios():
 
 
 def test_pair_rask_pools_revenue_and_seat_km_over_both_directions():
-    out = ro.RouteView("DAC-CCU", rask_revenue=300.0, rask_seat_km=10.0)
-    back = ro.RouteView("CCU-DAC", rask_revenue=100.0, rask_seat_km=10.0)
+    out = ro.RouteView("DAC-CCU", rask_revenue=300.0, rask_seats=10.0,
+                       distance_km=1.0)
+    back = ro.RouteView("CCU-DAC", rask_revenue=100.0, rask_seats=10.0,
+                        distance_km=1.0)
     assert ro.pairs_of([out, back])[0].rask == pytest.approx(20.0)
 
 
@@ -288,3 +291,24 @@ def test_a_direction_missing_from_the_pull_leaves_half_a_pair():
     pair = ro.pairs_of([ro.RouteView("CGP-DAC", our_seats=10)])[0]
     assert pair.outbound is None and pair.inbound.route == "CGP-DAC"
     assert pair.our_seats == 10
+
+
+def test_a_reverse_distance_answers_for_a_missing_direction():
+    assert ro.distance_of("CGP-AUH", {"AUH-CGP": 3000.0}) == 3000.0
+    assert ro.distance_of("CGP-DXB", {}) is None
+
+
+def test_a_route_with_no_distance_keeps_its_rask_inputs_for_the_workbook():
+    """RASK stays blank, but base fare and seats flown are carried so the
+    sheet can compute it once the distance is typed in."""
+    v = ro.RouteView("CGP-DXB")
+    ro._attach_rask(v, {"2026-07": 1000.0}, {"2026-07": 50.0}, ["2026-07"])
+    assert v.rask is None
+    assert (v.rask_revenue, v.rask_seats) == (1000.0, 50.0)
+    v.distance_km = 10.0
+    assert v.rask == pytest.approx(2.0)
+
+
+def test_a_direction_where_nobody_was_seen_has_no_share_not_all_of_it():
+    v = ro.RouteView("DOH-DAC", our_seats=121, our_legs=20)
+    assert v.seat_share is None and v.flight_share is None

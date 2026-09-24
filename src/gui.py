@@ -8297,9 +8297,13 @@ class App(WhatsAppMixin, HealthMixin):
                         f"({exc}), so RASK is left blank.")
         note =(f"Base fare from {got.tickets:,} tickets; {got.split:,} "
                 f"covering more than one leg were split by distance")
+        if got.estimated:
+            note += (f" ({got.estimated:,} with a leg missing from the "
+                     f"distance table, weighted by great-circle distance "
+                     f"for the split only)")
         if got.equal_split:
-            note += (f", {got.equal_split:,} of them equally because a leg's "
-                     f"distance is not in the table")
+            note += (f", {got.equal_split:,} equally because not even an "
+                     f"estimate was possible")
         if got.unreadable:
             note += f"; {got.unreadable:,} with no readable routing left out"
         return got.by_leg, note + "."

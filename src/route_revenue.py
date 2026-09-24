@@ -17,9 +17,10 @@ things badly wrong, and this module exists to get them right:
 
 So each ticket's base fare is split across the legs in its routing,
 weighted by distance -- the mileage prorate airlines use between
-themselves. Where a leg's distance is unknown the ticket is split equally
-instead, and counted, so the report can say how much rests on the cruder
-split. Refunds and voids carry negative base fare and go through the same
+themselves. Where the table lacks a leg, its great-circle length from
+airport positions weights the split instead; only where even that is
+unknown is the ticket split equally. Both are counted, so the report can
+say how much rests on the cruder splits. Refunds and voids carry negative base fare and go through the same
 split, so the result is base fare net of both.
 
 Every leg is dated to the ticket's first flight: the warehouse holds no
@@ -46,12 +47,60 @@ def legs_of(routing) -> list:
     return [f"{a}-{b}" for a, b in zip(points, points[1:]) if a != b]
 
 
+#: Airport positions (lat, lon), used ONLY to weight the fare split for a
+#: leg the distance table lacks. The table has no CGP-MCT, CGP-DXB or
+#: CGP-DOH, and an equal split handed half of a DXB-CGP-DAC fare to the
+#: 300 km domestic leg: 9.8M too much on CGP-DAC over July and August. A
+#: great-circle length puts the fare where the flying is. These never
+#: appear in the report as a route's distance -- that stays blank until
+#: the table carries it.
+AIRPORTS = {
+    "DAC": (23.843, 90.398), "CGP": (22.250, 91.813),
+    "ZYL": (24.963, 91.867), "CXB": (21.452, 91.964),
+    "JSR": (23.184, 89.161), "RJH": (24.437, 88.617),
+    "SPD": (25.759, 88.909), "BZL": (22.801, 90.301),
+    "CCU": (22.654, 88.447), "MAA": (12.990, 80.169),
+    "DEL": (28.556, 77.100), "BOM": (19.089, 72.868),
+    "KTM": (27.697, 85.359), "CMB": (7.180, 79.884),
+    "MLE": (4.192, 73.529), "DXB": (25.253, 55.366),
+    "SHJ": (25.329, 55.517), "AUH": (24.433, 54.651),
+    "FJR": (25.112, 56.324), "DOH": (25.273, 51.608),
+    "MCT": (23.593, 58.284), "BAH": (26.271, 50.634),
+    "KWI": (29.227, 47.969), "DMM": (26.471, 49.798),
+    "RUH": (24.958, 46.699), "JED": (21.680, 39.157),
+    "MED": (24.553, 39.705), "KUL": (2.746, 101.710),
+    "SIN": (1.364, 103.991), "BKK": (13.690, 100.750),
+    "CAN": (23.392, 113.299), "HKG": (22.308, 113.918),
+    "NRT": (35.772, 140.393), "LHR": (51.470, -0.454),
+    "MAN": (53.354, -2.275), "YYZ": (43.677, -79.625),
+}
+
+
+def great_circle_km(a: str, b: str):
+    """Shortest distance over the earth between two known airports."""
+    from math import asin, cos, radians, sin, sqrt
+
+    if a not in AIRPORTS or b not in AIRPORTS:
+        return None
+    (la1, lo1), (la2, lo2) = AIRPORTS[a], AIRPORTS[b]
+    h = (sin(radians(la2 - la1) / 2) ** 2
+         + cos(radians(la1)) * cos(radians(la2))
+         * sin(radians(lo2 - lo1) / 2) ** 2)
+    return 2 * 6371.0 * asin(sqrt(h))
+
+
 def _km(leg: str, distances: dict):
     got = distances.get(leg)
     if got is None:
         a, b = leg.split("-")
         got = distances.get(f"{b}-{a}")     # a reverse leg is the same length
     return got
+
+
+def _weight_km(leg: str, distances: dict):
+    """The table's kilometres, else a great-circle estimate, else None."""
+    got = _km(leg, distances)
+    return got if got is not None else great_circle_km(*leg.split("-"))
 
 
 @dataclass
@@ -61,7 +110,10 @@ class LegRevenue:
     tickets: int = 0
     #: Tickets split across two or more legs.
     split: int = 0
-    #: Of those, split equally because a leg's distance was not known.
+    #: Of those, a leg missing from the distance table, so weighted by a
+    #: great-circle estimate for that leg.
+    estimated: int = 0
+    #: Of those, split equally because not even an estimate was possible.
     equal_split: int = 0
     #: Rows whose routing could not be read, left out rather than guessed.
     unreadable: int = 0
@@ -94,7 +146,9 @@ def split_revenue(rows, distances: dict | None = None) -> LegRevenue:
             acc[legs[0]][month] += base
             continue
         out.split += 1
-        kms = [_km(leg, distances) for leg in legs]
+        if any(_km(leg, distances) is None for leg in legs):
+            out.estimated += 1
+        kms = [_weight_km(leg, distances) for leg in legs]
         if all(k and k > 0 for k in kms):
             total = sum(kms)
             shares = [k / total for k in kms]

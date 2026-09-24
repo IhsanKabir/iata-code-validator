@@ -62,11 +62,13 @@ class RouteView:
     aircraft: str = ""
     rivals: list = field(default_factory=list)
     distance_km: float | None = None
-    #: Average ticket revenue per month over `rask_months`, for display.
+    #: Average base fare per month over `rask_months`, for display.
     revenue_month: float | None = None
-    #: The RASK inputs, over exactly the same completed months on both sides.
+    #: The RASK inputs, over exactly the same completed months on both
+    #: sides. Kept even where the distance is unknown, so the workbook can
+    #: compute RASK the moment someone types the distance in.
     rask_revenue: float | None = None
-    rask_seat_km: float | None = None
+    rask_seats: float | None = None
     rask_months: tuple = ()
     observed_days: int = 0
 
@@ -88,11 +90,17 @@ class RouteView:
 
     @property
     def seat_share(self):
+        """Blank where the search saw nobody: DOH-DAC shows no rival on
+        sale, which is the site not selling it, not us flying alone."""
+        if not self.rivals:
+            return None
         return (self.our_seats / self.market_seats) if self.market_seats \
             else None
 
     @property
     def flight_share(self):
+        if not self.rivals:
+            return None
         total = self.our_flights + self.rival_flights
         return (self.our_flights / total) if total else None
 
@@ -135,6 +143,12 @@ class RouteView:
         if not (self.rask_revenue and self.rask_seat_km):
             return None
         return self.rask_revenue / self.rask_seat_km
+
+    @property
+    def rask_seat_km(self):
+        if not (self.rask_seats and self.distance_km):
+            return None
+        return self.rask_seats * self.distance_km
 
     @property
     def squeezed(self) -> bool:
@@ -281,6 +295,16 @@ class RoutePair:
                 / sum(v.rask_seat_km for v in both))
 
     @property
+    def rask_revenue(self):
+        got = [v.rask_revenue for v in self.directions if v.rask_revenue]
+        return sum(got) if got else None
+
+    @property
+    def rask_seats(self):
+        got = [v.rask_seats for v in self.directions if v.rask_seats]
+        return sum(got) if got else None
+
+    @property
     def top_rival(self):
         """The airline with the most seats across both directions."""
         acc: dict = {}
@@ -404,6 +428,16 @@ def load_distances(path) -> dict:
     return out
 
 
+def distance_of(route: str, distances: dict):
+    """The route's kilometres, or its reverse's: the table has AUH-CGP but
+    not CGP-AUH, and the two are the same flight backwards."""
+    got = distances.get(route)
+    if got is None and "-" in route:
+        a, b = route.split("-", 1)
+        got = distances.get(f"{b}-{a}")
+    return got
+
+
 def _nonstop_cutoff(minutes) -> float:
     """How long a nonstop on this route may take, from the route itself."""
     real = [m for m in minutes if m and m > 0]
@@ -435,16 +469,20 @@ def whole_months(first, last) -> list:
 
 def _attach_rask(view: RouteView, revenue_by_month: dict,
                  seats_by_month: dict, months) -> None:
-    """Revenue and seat-km over the same completed months, or nothing."""
+    """Base fare and seats flown over the same completed months, or nothing.
+
+    The distance is not needed here: RASK multiplies it in only at the end,
+    so a route whose distance is missing still carries its two inputs.
+    """
     used = [m for m in months
             if m in revenue_by_month and seats_by_month.get(m)]
-    if not used or not view.distance_km:
+    if not used:
         return
     rev = sum(float(revenue_by_month[m]) for m in used)
-    seat_km = sum(seats_by_month[m] for m in used) * view.distance_km
-    if rev <= 0 or seat_km <= 0:
+    seats_flown = sum(seats_by_month[m] for m in used)
+    if rev <= 0 or seats_flown <= 0:
         return
-    view.rask_revenue, view.rask_seat_km = rev, seat_km
+    view.rask_revenue, view.rask_seats = rev, seats_flown
     view.rask_months = tuple(used)
     view.revenue_month = rev / len(used)
 
@@ -527,7 +565,7 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
             our_taken=mine.get("taken", 0.0) / span,
             aircraft=mine.get("ac", ""),
             observed_days=days_observed,
-            distance_km=(distances or {}).get(rt),
+            distance_km=distance_of(rt, distances or {}),
         )
         _attach_rask(view, (revenue or {}).get(rt) or {},
                      seats_by_month.get(rt, {}), full_months)
