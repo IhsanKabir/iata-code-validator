@@ -342,6 +342,27 @@ def build_workbook(res: ro.Result, out_path, fleet=None,
     wb.save(str(out_path))
 
 
+def writable_path(path):
+    """`path`, or the next free 'name (2).xlsx' if Excel has it open.
+
+    Excel locks a workbook it has open, so rebuilding the report while
+    last run's copy is still on screen failed with nothing but "Failed."
+    Saving beside it keeps the run and says where it went.
+    """
+    from pathlib import Path
+
+    path = Path(path)
+    candidate, n = path, 1
+    while candidate.exists():
+        try:
+            with open(candidate, "r+b"):
+                return candidate
+        except PermissionError:
+            n += 1
+            candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+    return candidate
+
+
 def default_filename() -> str:
     from datetime import date
     return f"Route_Optimisation_{date.today():%b%Y}.xlsx"

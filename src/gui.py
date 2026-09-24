@@ -4393,7 +4393,9 @@ class App(WhatsAppMixin, HealthMixin):
         elif kind == MSG_RO_LOG:
             self._ro_log(str(payload))
         elif kind == MSG_RO_ERROR:
-            self._ro_log("Failed.")
+            # the reason stays on the tab, not only in a dialog once closed
+            self._ro_log("Failed — the reason is shown below.")
+            self.zenith_ro_warning.configure(text=str(payload))
             self.btn_ro_run.configure(state="normal")
             messagebox.showerror("Route Optimisation", str(payload))
         elif kind == MSG_RO_DONE:
@@ -8223,7 +8225,12 @@ class App(WhatsAppMixin, HealthMixin):
                 fr.check_rotation(fleet, legs, blocks, p.outbound_route, dist)
                 for p in res.squeezed_pairs) if c is not None]
             out_dir.mkdir(parents=True, exist_ok=True)
-            path = out_dir / ror.default_filename()
+            wanted = out_dir / ror.default_filename()
+            path = ror.writable_path(wanted)
+            if path != wanted:
+                self._post(MSG_RO_LOG,
+                           f"{wanted.name} is open in Excel — saving as "
+                           f"{path.name} instead.")
             ror.build_workbook(res, path, fleet, checks)
             self._post(MSG_RO_DONE, {
                 "path": str(path), "summary": res.summary(),
@@ -8231,6 +8238,9 @@ class App(WhatsAppMixin, HealthMixin):
                 "rows": self._ro_grid_rows(res),
             })
         except Exception as exc:                   # noqa: BLE001
+            # logged with the traceback: a run that fails in the packaged
+            # app otherwise leaves only "Failed." and nothing to diagnose
+            log.exception("Route Optimisation run failed")
             self._post(MSG_RO_ERROR, str(exc))
 
     @staticmethod

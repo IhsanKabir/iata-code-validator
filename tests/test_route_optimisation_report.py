@@ -146,3 +146,30 @@ def test_a_known_distance_is_written_as_a_number(tmp_path):
     ws = _book(tmp_path)["Every route"]
     r = _rows_for(ws, "→ DAC-CCU")
     assert ws[f"J{r}"].value == 329.656
+
+
+# ---- last run's report still open in Excel --------------------------------
+
+def test_a_report_open_in_excel_is_saved_beside_it(tmp_path, monkeypatch):
+    """Excel locks what it has open; the run used to end in 'Failed.'"""
+    import builtins
+
+    locked = tmp_path / "Route_Optimisation_Sep2026.xlsx"
+    locked.write_bytes(b"x")
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if str(path) == str(locked):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    got = ror.writable_path(locked)
+    assert got.name == "Route_Optimisation_Sep2026 (2).xlsx"
+
+
+def test_a_free_or_missing_report_path_is_used_as_is(tmp_path):
+    free = tmp_path / "r.xlsx"
+    assert ror.writable_path(free) == free
+    free.write_bytes(b"x")
+    assert ror.writable_path(free) == free

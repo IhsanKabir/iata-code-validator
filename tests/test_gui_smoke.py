@@ -499,3 +499,11 @@ def test_the_route_grid_shows_each_pair_then_both_directions(app):
     cgp = labels.index("DAC ⇄ CGP")
     assert labels[cgp + 1:cgp + 3] == ["→ DAC-CGP", "← CGP-DAC"]
     assert "pair" in t.item(t.get_children()[cgp], "tags")
+
+
+def test_a_failed_route_run_keeps_its_reason_on_the_tab(app, monkeypatch):
+    _sm_app(app)
+    monkeypatch.setattr("src.gui.messagebox.showerror", lambda *a: None)
+    app._handle_msg("ro_error", "No stored market schedule was found.")
+    assert "No stored market schedule" in str(
+        app.zenith_ro_warning.cget("text"))
