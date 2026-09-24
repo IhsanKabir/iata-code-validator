@@ -4402,7 +4402,10 @@ class App(WhatsAppMixin, HealthMixin):
             t = self.zenith_ro_tree
             t.delete(*t.get_children())
             for (route, lf, ours, rival, share, rask, top, verdict,
-                 squeezed) in info.get("rows", ()):
+                 squeezed, kind) in info.get("rows", ()):
+                tags = tuple(x for x in (
+                    "pair" if kind == "pair" else "",
+                    "squeezed" if squeezed else "") if x)
                 t.insert(
                     "", "end",
                     values=(route,
@@ -4412,7 +4415,7 @@ class App(WhatsAppMixin, HealthMixin):
                             "" if share is None else f"{share:.1%}",
                             "" if rask is None else f"{rask:,.2f}",
                             top or "—", verdict),
-                    tags=("squeezed",) if squeezed else ())
+                    tags=tags)
             self._ro_log(info.get("summary", "Done."))
             self.zenith_ro_warning.configure(
                 text="\n".join(info.get("warnings", ())))
@@ -8069,7 +8072,7 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_ro_warning.pack(anchor="w", padx=8)
 
         body = self._section(parent, "Routes")
-        cols = (("route", "Route", 90), ("lf", "Load", 70),
+        cols = (("route", "Route", 120), ("lf", "Load", 70),
                 ("ours", "Our seats/day", 100),
                 ("rival", "Rival seats/day", 110),
                 ("share", "Seat share", 90), ("rask", "RASK", 80),
@@ -8092,6 +8095,9 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_ro_tree.configure(yscrollcommand=vs.set,
                                       xscrollcommand=hs.set)
         self.zenith_ro_tree.tag_configure("squeezed", foreground="#B00020")
+        # a pair's combined row reads as the heading of its two directions
+        self.zenith_ro_tree.tag_configure(
+            "pair", background="#EEF2F7", font=("Segoe UI", 9, "bold"))
         self._register_result_tree(self.zenith_ro_tree)
 
         self._ro_worker: threading.Thread | None = None
@@ -8203,24 +8209,40 @@ class App(WhatsAppMixin, HealthMixin):
                     "No stored market schedule was found. Run the FirstTrip "
                     "collector before comparing the network.")
             dist = ro.load_distances(distance) if distance else {}
-            res = ro.build(legs, rows, distances=dist,
-                           revenue=self._ro_revenue(),
+            self._post(MSG_RO_LOG, "Splitting base fare across ticket legs…")
+            revenue, note = self._ro_revenue(
+                min(x.flight_date for x in legs), cut, dist)
+            res = ro.build(legs, rows, distances=dist, revenue=revenue,
                            days_observed=window_days)
+            res.warnings.append(note)
             out_dir.mkdir(parents=True, exist_ok=True)
             path = out_dir / ror.default_filename()
             ror.build_workbook(res, path)
             self._post(MSG_RO_DONE, {
                 "path": str(path), "summary": res.summary(),
                 "warnings": list(res.warnings),
-                "rows": [
-                    (v.route, v.load_factor, v.our_seats, v.rival_seats,
-                     v.seat_share, v.rask,
-                     (v.top_rival.airline if v.top_rival else ""),
-                     v.verdict(), v.squeezed)
-                    for v in res.routes],
+                "rows": self._ro_grid_rows(res),
             })
         except Exception as exc:                   # noqa: BLE001
             self._post(MSG_RO_ERROR, str(exc))
+
+    @staticmethod
+    def _ro_grid_rows(res) -> list:
+        """Each pair combined, then its outbound and inbound directions."""
+        def row(view, label, kind):
+            top = view.top_rival
+            return (label, view.load_factor, view.our_seats, view.rival_seats,
+                    view.seat_share, view.rask,
+                    top.airline if top else "", view.verdict(),
+                    view.squeezed, kind)
+
+        out = []
+        for pair in res.pairs:
+            out.append(row(pair, pair.name, "pair"))
+            for arrow, view in (("→", pair.outbound), ("←", pair.inbound)):
+                if view is not None:
+                    out.append(row(view, f"   {arrow} {view.route}", "leg"))
+        return out
 
     @classmethod
     def _ro_schedule_rows(cls) -> tuple:
@@ -8253,34 +8275,34 @@ class App(WhatsAppMixin, HealthMixin):
         return rows, days
 
     @staticmethod
-    def _ro_revenue() -> dict:
-        """Route revenue BY MONTH, left for the engine to pick months from.
+    def _ro_revenue(first, last, distances: dict) -> tuple:
+        """Base fare per leg per month, and a line saying how it was split.
 
-        This used to return one average over every month the file held,
-        which mixed in refund tails from before a route was live and forward
-        months only partly sold. The engine now chooses the completed months
-        that match our load window, so all months are handed over as they are.
+        Read from the sales warehouse rather than the flight performance
+        file, because that file carries net ticket revenue credited to the
+        first leg only. The engine picks the completed months from this.
         """
         from . import counter_reconcile as cr
+        from . import route_revenue as rr
 
-        duckdb = cr._duckdb()
-        if duckdb is None:
-            return {}
-        target = "E:/Analysis/curated/flight_perf/**/*.parquet"
+        source = cr.find_sales_warehouse()
+        if source is None:
+            return {}, ("No sales warehouse was found, so RASK is left "
+                        "blank.")
         try:
-            con = duckdb.connect()
-            con.execute("SET enable_progress_bar=false")
-            got = con.execute(f"""
-                select leg_route, year_month, sum(net)
-                from read_parquet('{target}') group by 1, 2
-            """).fetchall()
-        except Exception:                      # noqa: BLE001
-            return {}
-        out: dict = {}
-        for route, month, net in got:
-            if route and month and net is not None:
-                out.setdefault(route, {})[str(month)] = float(net)
-        return out
+            got = rr.read_warehouse(source, first, last, distances)
+        except Exception as exc:                   # noqa: BLE001
+            # the rest of the comparison stands without RASK -- say so
+            return {}, (f"Base fare could not be read from {source.path} "
+                        f"({exc}), so RASK is left blank.")
+        note =(f"Base fare from {got.tickets:,} tickets; {got.split:,} "
+                f"covering more than one leg were split by distance")
+        if got.equal_split:
+            note += (f", {got.equal_split:,} of them equally because a leg's "
+                     f"distance is not in the table")
+        if got.unreadable:
+            note += f"; {got.unreadable:,} with no readable routing left out"
+        return got.by_leg, note + "."
 
     def _build_zenith_reports_tab(self, parent: ttk.Frame) -> None:
         """Reports sub-tab — download pre-built analytics workbooks, gated by a

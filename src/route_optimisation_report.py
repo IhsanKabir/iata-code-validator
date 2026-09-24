@@ -2,7 +2,8 @@
 
 Sheets:
   Summary        what was compared, and the routes worth acting on
-  Every route    one row per directed route, ranked by seat share
+  Every route    one block per city pair -- both directions combined, then
+                 outbound and inbound -- ranked by the pair's seat share
   Who flies what one row per competitor per route, with the aircraft
 
 The Summary carries the caveats rather than leaving them in a docstring,
@@ -25,7 +26,7 @@ WIDTHS = [12, 8, 10, 11, 11, 10, 9, 10, 9, 10, 13, 13, 11, 10, 10,
 ROUTE_HEADERS = [
     "Route", "Load", "Our seats/day", "Our flights/day", "Rival seats/day",
     "Rival flights", "Seat share", "Flight share", "Aircraft", "Distance km",
-    "Revenue/month", "RASK", "Top rival", "Their seats", "Their aircraft",
+    "Base fare/month", "RASK", "Top rival", "Their seats", "Their aircraft",
     "", "", "", "", "", "Verdict"]
 
 
@@ -47,42 +48,64 @@ def _title(ws, text, note) -> None:
     ws.row_dimensions[2].height = 30
 
 
-def _route_row(ws, r: int, view, bold: bool = False) -> None:
+def _route_row(ws, r: int, view, bold: bool = False, *, label=None,
+               fill=None) -> None:
+    """One row for a direction or a pair -- both carry the same figures."""
     tr = view.top_rival
     tone = BAD if view.squeezed else None
-    _cell(ws, r, 1, view.route, bold=True, size=10, border=True)
+    _cell(ws, r, 1, label or view.route, bold=True, size=10, border=True,
+          fill=fill)
     _cell(ws, r, 2, view.load_factor, fmt=PCT, size=9, border=True,
           align="center",
-          fill=BAD if (view.load_factor or 0) >= ro.FULL_ENOUGH else None)
-    _cell(ws, r, 3, round(view.our_seats), size=9, border=True, align="right")
+          fill=BAD if (view.load_factor or 0) >= ro.FULL_ENOUGH else fill)
+    _cell(ws, r, 3, round(view.our_seats), size=9, border=True, align="right",
+          fill=fill)
     _cell(ws, r, 4, round(view.our_flights, 2), fmt="0.00", size=9,
-          border=True, align="center")
+          border=True, align="center", fill=fill)
     _cell(ws, r, 5, round(view.rival_seats), size=9, border=True,
-          align="right")
+          align="right", fill=fill)
     _cell(ws, r, 6, round(view.rival_flights, 2), fmt="0.00", size=9,
-          border=True, align="center")
+          border=True, align="center", fill=fill)
     # the number that moves the answer: an ATR against an A320
     _cell(ws, r, 7, view.seat_share, fmt=PCT, size=10, bold=True,
-          border=True, align="center", fill=tone)
+          border=True, align="center", fill=tone or fill)
     _cell(ws, r, 8, view.flight_share, fmt=PCT, size=9, border=True,
-          align="center")
-    _cell(ws, r, 9, view.aircraft or None, size=9, border=True)
+          align="center", fill=fill)
+    _cell(ws, r, 9, view.aircraft or None, size=9, border=True, fill=fill)
     _cell(ws, r, 10, round(view.distance_km) if view.distance_km else None,
-          size=9, border=True, align="right")
+          size=9, border=True, align="right", fill=fill)
     _cell(ws, r, 11, round(view.revenue_month) if view.revenue_month else None,
-          fmt=MONEY, size=9, border=True, align="right")
+          fmt=MONEY, size=9, border=True, align="right", fill=fill)
     _cell(ws, r, 12, round(view.rask, 2) if view.rask else None, fmt="0.00",
-          size=9, border=True, align="right")
+          size=9, border=True, align="right", fill=fill)
     _cell(ws, r, 13, tr.airline if tr else None, size=9, border=True,
-          align="center")
+          align="center", fill=fill)
     _cell(ws, r, 14, round(tr.seats) if tr else None, size=9, border=True,
-          align="right")
+          align="right", fill=fill)
     _cell(ws, r, 15, (tr.aircraft or "")[:18] if tr else None, size=9,
-          border=True)
+          border=True, fill=fill)
     for j in range(16, 21):
-        _cell(ws, r, j, None, border=True)
-    _cell(ws, r, 21, view.verdict(), bold=bold, size=9, fill=tone,
+        _cell(ws, r, j, None, border=True, fill=fill)
+    _cell(ws, r, 21, view.verdict(), bold=bold, size=9, fill=tone or fill,
           border=True)
+
+
+def _pair_rows(ws, r: int, pair, bold: bool = False) -> int:
+    """The pair's combined row, then outbound, then inbound."""
+    _route_row(ws, r, pair, bold=True, label=pair.name, fill=PAPER)
+    r += 1
+    for arrow, route, view in (("→", pair.outbound_route, pair.outbound),
+                               ("←", pair.inbound_route, pair.inbound)):
+        if view is None:
+            _cell(ws, r, 1, f"   {arrow} {route}", size=9, color=GREY,
+                  border=True)
+            ws.merge_cells(f"B{r}:{LAST}{r}")
+            _cell(ws, r, 2, "  not in the market pull", size=9, color=GREY,
+                  align="left")
+        else:
+            _route_row(ws, r, view, bold=bold, label=f"   {arrow} {route}")
+        r += 1
+    return r
 
 
 def write_summary(ws, res: ro.Result) -> None:
@@ -123,28 +146,30 @@ def write_summary(ws, res: ro.Result) -> None:
         r += 1
 
     r = _band(ws, r, "FULL AND OUT-FLOWN",
-              "near-full aircraft holding a small share of the seats — "
-              "smallest share first")
+              "near-full aircraft holding a small share of the seats, in "
+              "either direction — each pair with both its directions")
     r = _headers(ws, r, ROUTE_HEADERS)
-    if not res.squeezed:
+    if not res.squeezed_pairs:
         _cell(ws, r, 1, "No route is both full and out-flown.", size=10,
               color=GREY)
         r += 1
-    for view in res.squeezed:
-        _route_row(ws, r, view, bold=True)
-        r += 1
+    for pair in res.squeezed_pairs:
+        r = _pair_rows(ws, r, pair, bold=True)
 
 
 def write_routes(ws, res: ro.Result) -> None:
     _prep(ws)
     _title(ws, "EVERY ROUTE",
-           "Ranked by our share of the seats. A route with too few observed "
-           "flights is kept, and said to be too thin to judge, rather than "
-           "ranked against the rest.")
+           "Each city pair is shown both ways: first the two directions "
+           "combined (shaded), then outbound (→) and inbound (←). Pairs are "
+           "ranked by our share of the seats both ways -- counting only a "
+           "direction where the search saw rivals, since one showing nobody "
+           "is unsold on the site rather than ours alone. A route with too few "
+           "observed flights is kept, and said to be too thin to judge, "
+           "rather than ranked against the rest.")
     r = _headers(ws, 4, ROUTE_HEADERS)
-    for view in res.routes:
-        _route_row(ws, r, view)
-        r += 1
+    for pair in res.pairs:
+        r = _pair_rows(ws, r, pair)
 
 
 def write_rivals(ws, res: ro.Result) -> None:
@@ -158,7 +183,8 @@ def write_rivals(ws, res: ro.Result) -> None:
         "Route", "Airline", "Flights/day", "Seats/day", "Aircraft",
         "Seat count from", "", "", "", "", "", "", "", "", "", "", "", "",
         "", "", ""])
-    for view in res.routes:
+    views = [v for p in res.pairs for v in p.directions]
+    for view in views:
         for rival in view.rivals:
             _cell(ws, r, 1, view.route, size=9, border=True)
             _cell(ws, r, 2, rival.airline, bold=True, size=9, border=True,

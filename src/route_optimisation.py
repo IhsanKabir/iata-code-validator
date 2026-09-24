@@ -112,8 +112,13 @@ class RouteView:
         A 95% load factor on a 329 km hop and on a 4,000 km sector are not
         the same opportunity, and only distance makes them comparable.
 
-            RASK = ticket revenue in months M
+            RASK = base fare earned on the leg in months M
                    / (seats actually flown in months M x route km)
+
+        Base fare excludes taxes and surcharges, which pass through to
+        governments and airports and say nothing about the route. A ticket
+        covering several legs is split across them by distance before it
+        reaches here (see route_revenue), so a return pays both directions.
 
         M is the set of CALENDAR MONTHS lying wholly inside our load window
         that the revenue file also carries. The first version averaged every
@@ -124,7 +129,7 @@ class RouteView:
         summed from the legs flown in the same months rather than scaled
         from a daily average by thirty.
 
-        Strictly this is passenger RASK: ticket revenue only, no cargo or
+        Strictly this is passenger RASK: base fare only, no cargo or
         ancillaries.
         """
         if not (self.rask_revenue and self.rask_seat_km):
@@ -139,18 +144,185 @@ class RouteView:
                     and not self.thin)
 
     def verdict(self) -> str:
-        if self.thin:
-            return "too few flights to judge"
-        lf, share = self.load_factor, self.seat_share
-        if lf is None or share is None:
-            return "not comparable"
-        if self.squeezed:
-            return "FULL AND OUT-FLOWN — candidate for more capacity"
-        if lf >= FULL_ENOUGH:
-            return "full, and already holds the market"
-        if lf < 0.65:
-            return "capacity ahead of demand"
-        return "steady"
+        return _verdict(self.thin, self.load_factor, self.seat_share,
+                        self.squeezed)
+
+
+def _verdict(thin, lf, share, squeezed) -> str:
+    if thin:
+        return "too few flights to judge"
+    if lf is None or share is None:
+        return "not comparable"
+    if squeezed:
+        return "FULL AND OUT-FLOWN — candidate for more capacity"
+    if lf >= FULL_ENOUGH:
+        return "full, and already holds the market"
+    if lf < 0.65:
+        return "capacity ahead of demand"
+    return "steady"
+
+
+#: Our home airports. The direction leaving one of these is the outbound.
+HOME_AIRPORTS = frozenset({"DAC", "CGP", "ZYL", "CXB", "JSR", "RJH", "SPD",
+                           "BZL"})
+
+
+def pair_of(route: str) -> tuple:
+    """('DAC-CGP', 'CGP-DAC') for either direction: outbound first.
+
+    Outbound leaves Dhaka where Dhaka is an end; otherwise it leaves the
+    home airport; otherwise the alphabetically first one, so a pair is
+    always named the same way whichever direction is met first.
+    """
+    a, b = route.upper().split("-", 1)
+
+    def rank(x):
+        return (x != "DAC", x not in HOME_AIRPORTS, x)
+
+    home, away = (a, b) if rank(a) <= rank(b) else (b, a)
+    return f"{home}-{away}", f"{away}-{home}"
+
+
+@dataclass
+class RoutePair:
+    """Both directions of one city pair, read together.
+
+    A return ticket pays for both legs and a crew flies both, so a schedule
+    change is made to the pair. The combined figures are sums over the two
+    directions, never averages of their ratios -- so a busy outbound and a
+    thin inbound weigh by the seats they actually carry.
+    """
+
+    outbound_route: str
+    inbound_route: str
+    outbound: RouteView | None = None
+    inbound: RouteView | None = None
+
+    @property
+    def name(self) -> str:
+        a, b = self.outbound_route.split("-")
+        return f"{a} ⇄ {b}"
+
+    @property
+    def directions(self) -> list:
+        return [v for v in (self.outbound, self.inbound) if v is not None]
+
+    def _sum(self, attr) -> float:
+        return sum(getattr(v, attr) for v in self.directions)
+
+    @property
+    def our_flights(self) -> float:
+        return self._sum("our_flights")
+
+    @property
+    def our_seats(self) -> float:
+        return self._sum("our_seats")
+
+    @property
+    def rival_seats(self) -> float:
+        return self._sum("rival_seats")
+
+    @property
+    def rival_flights(self) -> float:
+        return self._sum("rival_flights")
+
+    @property
+    def load_factor(self):
+        seats = self.our_seats
+        return self._sum("our_taken") / seats if seats else None
+
+    @property
+    def _seen(self) -> list:
+        """Directions the market pull actually saw rivals on.
+
+        A direction with no rivals is usually one the search sells little
+        of -- DOH-DAC shows nobody at all -- not one we fly alone, and
+        pooling it in would read as 100% ours and lift Doha from 12% to 19%.
+        """
+        return [v for v in self.directions if v.rivals]
+
+    @property
+    def seat_share(self):
+        ours = sum(v.our_seats for v in self._seen)
+        total = ours + self.rival_seats
+        return ours / total if total else None
+
+    @property
+    def flight_share(self):
+        ours = sum(v.our_flights for v in self._seen)
+        total = ours + self.rival_flights
+        return ours / total if total else None
+
+    @property
+    def aircraft(self) -> str:
+        seen = []
+        for v in self.directions:
+            if v.aircraft and v.aircraft not in seen:
+                seen.append(v.aircraft)
+        return " / ".join(seen)
+
+    @property
+    def distance_km(self):
+        return next((v.distance_km for v in self.directions
+                     if v.distance_km), None)
+
+    @property
+    def revenue_month(self):
+        got = [v.revenue_month for v in self.directions if v.revenue_month]
+        return sum(got) if got else None
+
+    @property
+    def rask(self):
+        both = [v for v in self.directions
+                if v.rask_revenue and v.rask_seat_km]
+        if not both:
+            return None
+        return (sum(v.rask_revenue for v in both)
+                / sum(v.rask_seat_km for v in both))
+
+    @property
+    def top_rival(self):
+        """The airline with the most seats across both directions."""
+        acc: dict = {}
+        for v in self.directions:
+            for r in v.rivals:
+                got = acc.setdefault(r.airline, Rival(
+                    airline=r.airline, aircraft=r.aircraft,
+                    seat_basis=r.seat_basis))
+                got.flights += r.flights
+                got.seats += r.seats
+        return max(acc.values(), key=lambda r: r.seats) if acc else None
+
+    @property
+    def thin(self) -> bool:
+        return all(v.thin for v in self.directions)
+
+    @property
+    def squeezed(self) -> bool:
+        return any(v.squeezed for v in self.directions)
+
+    def verdict(self) -> str:
+        hit = [v.route for v in self.directions if v.squeezed]
+        if hit:
+            ways = "both ways" if len(hit) == 2 else f"{hit[0]} only"
+            return f"FULL AND OUT-FLOWN ({ways}) — candidate for more capacity"
+        return _verdict(self.thin, self.load_factor, self.seat_share, False)
+
+
+def pairs_of(routes) -> list:
+    """Group directed routes into pairs, smallest pair seat share first."""
+    by_key: dict = {}
+    for view in routes:
+        out, back = pair_of(view.route)
+        pair = by_key.setdefault(out, RoutePair(out, back))
+        if view.route.upper() == out:
+            pair.outbound = view
+        else:
+            pair.inbound = view
+    got = list(by_key.values())
+    got.sort(key=lambda p: (p.seat_share if p.seat_share is not None
+                            else 1.0, p.outbound_route))
+    return got
 
 
 @dataclass
@@ -169,6 +341,15 @@ class Result:
         got = [r for r in self.routes if r.squeezed]
         got.sort(key=lambda r: (r.seat_share or 1.0))
         return got
+
+    @property
+    def pairs(self) -> list:
+        """Every route with its reverse beside it, outbound first."""
+        return pairs_of(self.routes)
+
+    @property
+    def squeezed_pairs(self) -> list:
+        return [p for p in self.pairs if p.squeezed]
 
     @property
     def comparable(self) -> list:
@@ -377,12 +558,15 @@ def build(load_legs, schedule_rows, *, distances=None, revenue=None,
         "records, not from the search.")
     if revenue:
         res.warnings.append(
-            ("RASK is ticket revenue divided by seats flown times route "
-             "distance, over the completed months "
-             + ", ".join(res.rask_months)
-             + " only -- the same months on both sides. Forward months "
-             "still on sale and months before a route was live are left "
-             "out, because averaging them in understated Kolkata by 60%.")
+            ("RASK is BASE FARE (before taxes, net of refunds and voids) "
+             "divided by seats flown times route distance, over the "
+             "completed months " + ", ".join(res.rask_months)
+             + " only -- the same months on both sides. A ticket covering "
+             "several legs is split across them by distance, so a return "
+             "pays both directions and a connection through Dhaka pays "
+             "mostly its long leg. Each ticket is dated to its first "
+             "flight, so a return crossing a month end is filed a month "
+             "early.")
             if res.rask_months else
             "No complete calendar month lies inside the load window, so "
             "RASK is not computed. Widen the look-back to cover one.")

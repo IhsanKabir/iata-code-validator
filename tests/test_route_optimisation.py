@@ -225,3 +225,66 @@ def test_a_sold_basis_is_declared():
     res = ro.build(_legs(), _market(), days_observed=14)
     assert res.basis == "sold"
     assert any("before no-shows" in w for w in res.warnings)
+
+
+# ---- both directions of a pair, read together ------------------------------
+
+def test_a_pair_is_named_outbound_from_dhaka_whichever_way_it_is_met():
+    assert ro.pair_of("CGP-DAC") == ("DAC-CGP", "CGP-DAC")
+    assert ro.pair_of("DAC-CGP") == ("DAC-CGP", "CGP-DAC")
+    assert ro.pair_of("DXB-CGP") == ("CGP-DXB", "DXB-CGP")
+    assert ro.pair_of("CCU-DAC") == ("DAC-CCU", "CCU-DAC")
+
+
+def test_the_two_directions_of_a_route_sit_together():
+    res = ro.Result(routes=[ro.RouteView("CGP-DAC"), ro.RouteView("DAC-DXB"),
+                            ro.RouteView("DAC-CGP")])
+    cgp = [p for p in res.pairs if p.outbound_route == "DAC-CGP"][0]
+    assert cgp.outbound.route == "DAC-CGP"
+    assert cgp.inbound.route == "CGP-DAC"
+    assert len(res.pairs) == 2
+
+
+def test_pair_figures_are_sums_not_averages_of_ratios():
+    """A busy outbound and a thin inbound weigh by the seats they carry."""
+    out = ro.RouteView("DAC-CCU", our_seats=300, our_taken=270, our_legs=20,
+                       rivals=[ro.Rival("6E", 1, 180)])
+    back = ro.RouteView("CCU-DAC", our_seats=100, our_taken=50, our_legs=20,
+                        rivals=[ro.Rival("6E", 1, 180), ro.Rival("BG", 1, 74)])
+    pair = ro.pairs_of([out, back])[0]
+    assert pair.load_factor == pytest.approx(320 / 400)
+    assert pair.seat_share == pytest.approx(400 / (400 + 434))
+    top = pair.top_rival
+    assert (top.airline, top.seats) == ("6E", 360)
+
+
+def test_pair_rask_pools_revenue_and_seat_km_over_both_directions():
+    out = ro.RouteView("DAC-CCU", rask_revenue=300.0, rask_seat_km=10.0)
+    back = ro.RouteView("CCU-DAC", rask_revenue=100.0, rask_seat_km=10.0)
+    assert ro.pairs_of([out, back])[0].rask == pytest.approx(20.0)
+
+
+def test_a_pair_is_flagged_when_either_direction_is_squeezed():
+    full = ro.RouteView("DAC-CCU", our_seats=72, our_taken=70, our_legs=20,
+                        rivals=[ro.Rival("6E", 2, 360)])
+    easy = ro.RouteView("CCU-DAC", our_seats=72, our_taken=40, our_legs=20,
+                        rivals=[ro.Rival("6E", 2, 360)])
+    res = ro.Result(routes=[full, easy])
+    assert [p.outbound_route for p in res.squeezed_pairs] == ["DAC-CCU"]
+    assert "DAC-CCU only" in res.squeezed_pairs[0].verdict()
+
+
+def test_a_direction_with_no_rivals_seen_does_not_inflate_the_pair_share():
+    """DOH-DAC shows nobody on sale; it is not a route we fly alone."""
+    out = ro.RouteView("DAC-DOH", our_seats=150, our_legs=20,
+                       rivals=[ro.Rival("QR", 3, 1150)])
+    back = ro.RouteView("DOH-DAC", our_seats=121, our_legs=20)
+    pair = ro.pairs_of([out, back])[0]
+    assert pair.seat_share == pytest.approx(150 / 1300)
+    assert pair.our_seats == 271                # still both ways
+
+
+def test_a_direction_missing_from_the_pull_leaves_half_a_pair():
+    pair = ro.pairs_of([ro.RouteView("CGP-DAC", our_seats=10)])[0]
+    assert pair.outbound is None and pair.inbound.route == "CGP-DAC"
+    assert pair.our_seats == 10

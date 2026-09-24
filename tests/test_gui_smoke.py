@@ -474,7 +474,28 @@ def test_a_route_with_no_share_shows_a_blank_not_a_zero(app):
     _sm_app(app)
     app._handle_msg("ro_done", {
         "path": "", "summary": "x", "warnings": [],
-        "rows": [("DAC-XXX", None, 0.0, 0.0, None, None, "", "thin", False)]})
+        "rows": [("DAC-XXX", None, 0.0, 0.0, None, None, "", "thin", False,
+                  "leg")]})
     vals = app.zenith_ro_tree.item(
         app.zenith_ro_tree.get_children()[0], "values")
     assert vals[1] == "" and vals[4] == "" and vals[5] == ""
+
+
+def test_the_route_grid_shows_each_pair_then_both_directions(app):
+    """DAC-CGP and CGP-DAC sit together, the combined row first."""
+    from src import route_optimisation as ro
+
+    _sm_app(app)
+    res = ro.Result(routes=[ro.RouteView("CGP-DAC", our_seats=100,
+                                         our_taken=90, our_legs=20),
+                            ro.RouteView("DAC-CCU", our_seats=72,
+                                         our_taken=70, our_legs=20),
+                            ro.RouteView("DAC-CGP", our_seats=100,
+                                         our_taken=80, our_legs=20)])
+    app._handle_msg("ro_done", {"path": "", "summary": "x", "warnings": [],
+                                "rows": app._ro_grid_rows(res)})
+    t = app.zenith_ro_tree
+    labels = [str(t.item(i, "values")[0]).strip() for i in t.get_children()]
+    cgp = labels.index("DAC ⇄ CGP")
+    assert labels[cgp + 1:cgp + 3] == ["→ DAC-CGP", "← CGP-DAC"]
+    assert "pair" in t.item(t.get_children()[cgp], "tags")
