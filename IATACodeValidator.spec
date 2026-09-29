@@ -60,6 +60,7 @@ hiddenimports = [
     "src.ffp_gui",
     "src.ffp_collect",
     "src.zenith_ffp",
+    "src.tab_lock",
     # Reached the same deferred way and previously left to PyInstaller's own
     # analysis. Listed now so the whole class is covered rather than the ones
     # somebody remembered; tests/test_build_spec.py keeps this in step with

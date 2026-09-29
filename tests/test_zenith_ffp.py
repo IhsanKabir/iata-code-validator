@@ -323,3 +323,94 @@ def test_a_session_zenith_refuses_asks_for_a_new_sign_in():
     s, _ = _searcher([], poll_ok=False)
     with pytest.raises(zf.FFPSessionError):
         s.search(level="Gold")
+
+
+# ---- order, level choice, several searches at once --------------------------
+
+def _by_name(n=900):
+    return _FakeZenith(_members(n), number="exact", name="prefix")
+
+
+def _after_method_check(fake, store):
+    """Run the method check alone; return where collection searches start,
+    so its probe searches are not counted as collection."""
+    fc._choose_method(fake, store, lambda _m: None)
+    return len(fake.calls)
+
+
+def test_small_levels_are_collected_before_silver(store):
+    fake = _by_name()
+    start = _after_method_check(fake, store)
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    order = [lv for lv, num, name in fake.calls[start:] if name]
+    firsts = {lv: order.index(lv) for lv in ("Gold", "Platinum", "Silver")
+              if lv in order}
+    lasts = {lv: len(order) - 1 - order[::-1].index(lv) for lv in firsts}
+    # a level of 50 or fewer is complete from its count and needs none
+    assert "Gold" in firsts and "Silver" in firsts
+    for level in firsts:
+        if level != "Silver":
+            assert lasts[level] < firsts["Silver"]
+
+
+def test_a_run_can_leave_silver_for_later(store):
+    people = _members(1_200)
+    fake = _FakeZenith(people, number="exact", name="prefix")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0,
+               levels=["Gold", "Platinum", "Titanium"])
+    found = store.counts_by_level()
+    want = {lv: sum(m.level == lv for m in people) for lv in ("Gold",
+                                                            "Platinum")}
+    assert found["Gold"] == want["Gold"]
+    assert found["Platinum"] == want["Platinum"]
+    assert fc.pending_levels(store) == ["Silver"]
+    assert store.get("finished") == "0"
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+def test_several_searches_at_once_still_find_everyone_once(store, workers):
+    people = _members(1_100)
+    fake = _FakeZenith(people, number="exact", name="prefix")
+    start = _after_method_check(fake, store)
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0,
+               workers=workers)
+    assert store.member_count() == 1_100
+    assert store.get("finished") == "1"
+    names = [(lv, name) for lv, num, name in fake.calls[start:]]
+    assert len(names) == len(set(names))          # no search run twice
+
+
+def test_a_failed_search_goes_back_in_the_queue(store):
+    fake = _by_name()
+    real = fake.search
+    calls = {"n": 0}
+
+    def flaky(**kw):
+        calls["n"] += 1
+        if calls["n"] == 30:
+            raise zf.FFPSearchError("Zenith returned 504 four times.")
+        return real(**kw)
+
+    fake.search = flaky
+    with pytest.raises(zf.FFPSearchError):
+        fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.running() == 0                   # nothing left half-taken
+    fake.search = real
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 900
+
+
+def test_a_progress_file_from_the_last_version_still_opens(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE frontier (prefix TEXT PRIMARY KEY, state TEXT NOT NULL,
+                               total INTEGER NOT NULL DEFAULT -1);
+        INSERT INTO frontier VALUES ('Silver|A', 'pending', -1),
+                                    ('Gold|B', 'pending', -1);""")
+    con.commit()
+    con.close()
+    s = fc.FFPStore(path)
+    assert s.next_pending() == "Gold|B"           # Gold outranks Silver
+    s.close()

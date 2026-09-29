@@ -30,22 +30,62 @@ _TITLE = "FFP Customers"
 class FFPMixin:
     # ---- building ---------------------------------------------------------
     def _build_zenith_ffp_tab(self, parent: ttk.Frame) -> None:
+        """A password screen first; the tab itself is built on unlock."""
         self._ffp_worker: threading.Thread | None = None
         self._ffp_stop = threading.Event()
         self._ffp_store_obj = None
         self._ffp_last_path = ""
+        self._ffp_unlocked = False
+        self._ffp_parent = parent
+        gate = ttk.Frame(parent)
+        gate.pack(anchor="nw", padx=16, pady=16)
+        self._ffp_gate = gate
+        ttk.Label(gate, text="FFP Customers is password-protected.",
+                  font=("Segoe UI Semibold", 11)).pack(anchor="w")
+        ttk.Label(gate, text="The member list holds customers' personal "
+                             "details.", style="Hint.TLabel"
+                  ).pack(anchor="w", pady=(0, 8))
+        row = ttk.Frame(gate)
+        row.pack(anchor="w")
+        ttk.Label(row, text="Password:").pack(side="left", padx=(0, 6))
+        self.ffp_pwd = ttk.Entry(row, show="•", width=24)
+        self.ffp_pwd.pack(side="left")
+        self.ffp_pwd.bind("<Return>", lambda _e: self._ffp_unlock())
+        ttk.Button(row, text="Unlock", style="Primary.TButton",
+                   command=self._ffp_unlock).pack(side="left", padx=(8, 0))
+        self.ffp_gate_msg = ttk.Label(gate, text="", foreground="#B00020")
+        self.ffp_gate_msg.pack(anchor="w", pady=(6, 0))
+
+    def _ffp_unlock(self) -> None:
+        from . import tab_lock
+        if self._ffp_unlocked:
+            return
+        entered = self.ffp_pwd.get()
+        self.ffp_pwd.delete(0, "end")          # never left on screen
+        if not tab_lock.check(entered):
+            self.ffp_gate_msg.configure(text="Wrong password.")
+            return
+        self._ffp_unlocked = True
+        self._ffp_gate.destroy()
+        self._ffp_build_contents(self._ffp_parent)
+
+    def _ffp_build_contents(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
         self._section(
             parent, "FFP Customers  ·  every frequent-flyer member",
             help_text=(
-                "Collects every FFP member -- number, name, date of birth, "
+                "Collects FFP members -- number, name, date of birth, "
                 "email, phone, ID number, level and miles -- from Zenith's "
                 "FFP account search.\n\n"
                 "That search lists at most 50 members at a time but always "
-                "says how many matched. So the app searches FFP numbers "
-                "beginning 0-9, splits any beginning that matches more than "
-                "50 into ten longer ones, and repeats until every search "
-                "lists all it found.\n\n"
+                "says how many matched. So the app narrows it -- by the "
+                "start of the last name within each level, since Zenith "
+                "matches FFP numbers only whole -- until every search lists "
+                "all it found.\n\n"
+                "Levels go in order Gold, Platinum, Titanium, then Silver. "
+                "Silver has about 120,000 members and needs tens of "
+                "thousands of searches -- days of running -- so it is off "
+                "until you tick it.\n\n"
                 "It first counts each level in Zenith, so the finished list "
                 "is checked against Zenith's own numbers.\n\n"
                 "Progress is saved as it goes: Stop, a crash or a signed-out "
@@ -60,14 +100,33 @@ class FFPMixin:
                        label_width=18,
                        suffix=ttk.Button(io, text="Browse…",
                                          command=self._ffp_pick_output))
-        self.ffp_delay = tk.DoubleVar(value=1.0)
+        self.ffp_delay = tk.DoubleVar(value=0.5)
         row = ttk.Frame(io)
-        ttk.Spinbox(row, from_=0.5, to=10, increment=0.5, width=5,
+        ttk.Spinbox(row, from_=0, to=10, increment=0.5, width=5,
                     textvariable=self.ffp_delay).pack(side="left")
-        ttk.Label(row, text="  seconds between searches — gentler on "
-                            "Zenith; raise it if searches start timing out",
+        ttk.Label(row, text="  seconds between searches — raise it if "
+                            "searches start timing out",
                   style="Hint.TLabel").pack(side="left")
         self._form_row(io, 1, "Pause:", row, label_width=18)
+        self.ffp_workers = tk.IntVar(value=3)
+        row = ttk.Frame(io)
+        ttk.Spinbox(row, from_=1, to=4, increment=1, width=5,
+                    textvariable=self.ffp_workers).pack(side="left")
+        ttk.Label(row, text="  searches at once — overlaps the wait for "
+                            "Zenith; drop to 1 if it starts refusing",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(io, 2, "At once:", row, label_width=18)
+
+        from .ffp_collect import LEVEL_ORDER
+        self.ffp_levels = {lv: tk.BooleanVar(value=lv != "Silver")
+                           for lv in LEVEL_ORDER}
+        row = ttk.Frame(io)
+        for lv in LEVEL_ORDER:
+            ttk.Checkbutton(row, text=lv, variable=self.ffp_levels[lv]
+                            ).pack(side="left", padx=(0, 10))
+        ttk.Label(row, text="Silver: ~120,000 members — days of searching",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(io, 3, "Levels:", row, label_width=18)
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -159,10 +218,15 @@ class FFPMixin:
                                          "this tab).")
             return
         try:
-            delay = max(0.5, float(self.ffp_delay.get()))
+            delay = max(0.0, float(self.ffp_delay.get()))
+            workers = min(4, max(1, int(self.ffp_workers.get())))
         except (tk.TclError, ValueError):
-            messagebox.showerror(_TITLE, "'Pause' must be a number of "
-                                         "seconds.")
+            messagebox.showerror(_TITLE, "'Pause' and 'At once' must be "
+                                         "numbers.")
+            return
+        levels = [lv for lv, var in self.ffp_levels.items() if var.get()]
+        if not levels:
+            messagebox.showerror(_TITLE, "Tick at least one level.")
             return
         self._ffp_stop.clear()
         self.ffp_warning.configure(text="")
@@ -170,10 +234,12 @@ class FFPMixin:
         self.btn_ffp_stop.configure(state="normal")
         self._ffp_log("Opening Zenith's FFP search…")
         self._ffp_worker = threading.Thread(
-            target=self._ffp_worker_run, args=(delay,), daemon=True)
+            target=self._ffp_worker_run, args=(delay, workers, levels),
+            daemon=True)
         self._ffp_worker.start()
 
-    def _ffp_worker_run(self, delay: float) -> None:
+    def _ffp_worker_run(self, delay: float, workers: int = 1,
+                        levels=None) -> None:
         from . import ffp_collect as fc
         from . import zenith_client
         from . import zenith_ffp as zf
@@ -185,7 +251,7 @@ class FFPMixin:
                 searcher, self._ffp_store(), stop=self._ffp_stop,
                 log=lambda m: self._post(FFP_MSG_LOG, m),
                 on_progress=lambda p: self._post(FFP_MSG_PROGRESS, p),
-                delay_s=delay)
+                delay_s=delay, workers=workers, levels=levels)
             self._post(FFP_MSG_DONE, got)
         except fc.PartialMatchUnsupported as exc:
             self._post(FFP_MSG_ERROR, str(exc))
@@ -279,6 +345,10 @@ class FFPMixin:
         self.btn_ffp_export.configure(state="normal")
 
     def _ffp_handle_msg(self, kind: str, payload) -> bool:
+        if not kind.startswith("ffp_"):
+            return False
+        if not getattr(self, "_ffp_unlocked", False):
+            return True                # nothing to show on a locked tab
         if kind == FFP_MSG_LOG:
             self._ffp_log(str(payload))
         elif kind == FFP_MSG_PROGRESS:
@@ -286,10 +356,19 @@ class FFPMixin:
         elif kind == FFP_MSG_DONE:
             self._ffp_render(payload)
             self._ffp_finish()
-            finished = self._ffp_store().get("finished") == "1"
-            self._ffp_log(
-                "Collection complete — press Export to Excel." if finished
-                else "Stopped. Press Collect to carry on from here.")
+            from . import ffp_collect as fc
+            store = self._ffp_store()
+            left = fc.pending_levels(store)
+            chosen = [lv for lv, var in self.ffp_levels.items() if var.get()]
+            if not left:
+                self._ffp_log("Collection complete — press Export to Excel.")
+            elif not set(left) & set(chosen):
+                self._ffp_log(f"{', '.join(chosen)} complete — press Export "
+                              f"to Excel. Not collected yet: "
+                              f"{', '.join(left)}.")
+            else:
+                self._ffp_log("Stopped. Press Collect to carry on from "
+                              "here.")
         elif kind == FFP_MSG_ERROR:
             self._ffp_finish()
             self._ffp_log("Stopped — the reason is shown below.")

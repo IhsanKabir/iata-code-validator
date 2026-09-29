@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from html import unescape
@@ -164,6 +165,8 @@ class FFPSearcher:
         self.attempts = max(1, attempts)
         self._token = ""
         self.searches = 0
+        # several workers share one searcher: one bootstrap, one counter
+        self._lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -198,8 +201,9 @@ class FFPSearcher:
     def search(self, *, level: str = "", ffp_number: str = "",
                last_name: str = "", email: str = "",
                phone: str = "") -> SearchPage:
-        if not self._token:
-            self.bootstrap()
+        with self._lock:
+            if not self._token:
+                self.bootstrap()
         data = {"__RequestVerificationToken": self._token,
                 "LastName": last_name, "FFPNumber": ffp_number,
                 "Email": email, "PhoneNumber": phone, "LevelName": level}
@@ -216,7 +220,8 @@ class FFPSearcher:
                         f"Network error searching FFP ({exc}).") from exc
                 time.sleep(5 * attempt)
                 continue
-            self.searches += 1
+            with self._lock:
+                self.searches += 1
             if "/otds/" in (r.url or "") or r.status_code in (401, 403):
                 raise FFPSessionError(
                     "Zenith signed the session out. Sign in again, then "
@@ -236,7 +241,8 @@ class FFPSearcher:
                         "Zenith keeps answering the FFP search with an "
                         "error page. Sign in again.")
                 rebooted = True               # lost the modern session
-                self.bootstrap()
+                with self._lock:
+                    self.bootstrap()
                 data["__RequestVerificationToken"] = self._token
                 continue
             self._token = parse_token(r.text) if _TOKEN_RE.search(

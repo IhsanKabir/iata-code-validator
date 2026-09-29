@@ -509,18 +509,58 @@ def test_a_failed_route_run_keeps_its_reason_on_the_tab(app, monkeypatch):
         app.zenith_ro_warning.cget("text"))
 
 
-def test_the_ffp_tab_is_built_beside_customer_lookup(app):
+# ---- FFP Customers: behind a password -------------------------------------
+
+_TEST_PASSWORD = "not-the-real-one"
+
+
+def _use_test_password(monkeypatch):
+    from src import tab_lock
+    salt = b"0123456789abcdef"
+    monkeypatch.setattr(tab_lock, "FFP_SALT", salt)
+    monkeypatch.setattr(tab_lock, "FFP_HASH",
+                        tab_lock.derive(_TEST_PASSWORD, salt))
+
+
+def _unlock_ffp(app, monkeypatch):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    if not app._ffp_unlocked:
+        _use_test_password(monkeypatch)
+        app.ffp_pwd.insert(0, _TEST_PASSWORD)
+        app._ffp_unlock()
+
+
+def test_the_ffp_tab_is_locked_until_the_password(app, monkeypatch):
     for widget in list(app._tab_widgets.values()):
         app._ensure_tab_built(widget)
     tabs = [app.zenith_inner_notebook.tab(t, "text")
             for t in app.zenith_inner_notebook.tabs()]
     assert tabs[:2] == ["Customer Lookup", "FFP Customers"]
+    assert not app._ffp_unlocked and not hasattr(app, "btn_ffp_run")
+    _use_test_password(monkeypatch)
+    app.ffp_pwd.insert(0, "wrong")
+    app._ffp_unlock()
+    assert not app._ffp_unlocked
+    assert "Wrong password" in str(app.ffp_gate_msg.cget("text"))
+    assert app.ffp_pwd.get() == ""               # not left on screen
+    # a message for the locked tab is swallowed, not crashed on
+    assert app._ffp_handle_msg("ffp_log", "x") is True
+
+
+def test_the_right_password_opens_the_tab(app, monkeypatch):
+    _unlock_ffp(app, monkeypatch)
+    assert app._ffp_unlocked
     assert str(app.btn_ffp_run.cget("text")) == "Collect FFP members"
+    # the small levels are ticked, Silver is left for the user to choose
+    ticked = {lv: v.get() for lv, v in app.ffp_levels.items()}
+    assert ticked == {"Gold": True, "Platinum": True, "Titanium": True,
+                      "Silver": False}
+    assert app.ffp_workers.get() == 3
 
 
 def test_ffp_collect_asks_for_a_sign_in_first(app, monkeypatch):
-    for widget in list(app._tab_widgets.values()):
-        app._ensure_tab_built(widget)
+    _unlock_ffp(app, monkeypatch)
     monkeypatch.setattr(app, "_zenith_session", None, raising=False)
     shown = {}
     monkeypatch.setattr("src.ffp_gui.messagebox.showerror",
@@ -529,9 +569,8 @@ def test_ffp_collect_asks_for_a_sign_in_first(app, monkeypatch):
     assert "Sign in to Zenith" in shown.get("msg", "")
 
 
-def test_an_ffp_failure_keeps_its_reason_on_the_tab(app):
-    for widget in list(app._tab_widgets.values()):
-        app._ensure_tab_built(widget)
+def test_an_ffp_failure_keeps_its_reason_on_the_tab(app, monkeypatch):
+    _unlock_ffp(app, monkeypatch)
     app._handle_msg("ffp_error", "Zenith signed the session out.")
     assert "signed the session out" in str(app.ffp_warning.cget("text"))
     assert str(app.btn_ffp_run.cget("state")) == "normal"
@@ -540,8 +579,7 @@ def test_an_ffp_failure_keeps_its_reason_on_the_tab(app):
 def test_an_ffp_stop_still_shows_the_level_counts(app, monkeypatch, tmp_path):
     """The message says 'the level counts are exact' -- so they are shown."""
     from src import ffp_collect as fc
-    for widget in list(app._tab_widgets.values()):
-        app._ensure_tab_built(widget)
+    _unlock_ffp(app, monkeypatch)
     path = tmp_path / "ffp.sqlite"
     store = fc.FFPStore(path)
     store.put("level_total:Silver", 119848)

@@ -46,10 +46,25 @@ DIGITS = "0123456789"
 MAX_DIGITS = 12
 
 PENDING, DONE, SPLIT, CAPPED = "pending", "done", "split", "capped"
+#: Taken by a worker and not yet answered. A run that stops leaves these
+#: behind; the next run hands them out again.
+RUNNING = "running"
+
+#: The order levels are collected in: the small, valuable ones first.
+LEVEL_ORDER = ("Gold", "Platinum", "Titanium", "Silver")
 
 _MEMBER_COLS = ("ffp_number", "customer_id", "last_name", "first_name",
                 "birth_date", "email", "phone", "id_number", "level",
                 "miles")
+
+
+def _level_of(prefix: str) -> str:
+    return prefix.split("|", 1)[0] if "|" in prefix else ""
+
+
+def _rank(prefix: str) -> int:
+    level = _level_of(prefix)
+    return LEVEL_ORDER.index(level) if level in LEVEL_ORDER else         len(LEVEL_ORDER)
 
 
 class PartialMatchUnsupported(Exception):
@@ -62,8 +77,13 @@ class FFPStore:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        # one connection, several workers: every statement goes through this
+        self._lock = threading.RLock()
         self.con = sqlite3.connect(str(self.path), check_same_thread=False)
+        # A commit per search; write-ahead logging keeps each one cheap and
+        # still survives the app being closed or crashing mid-run.
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA synchronous=NORMAL")
         cols = ", ".join(f"{c} TEXT NOT NULL DEFAULT ''"
                          for c in _MEMBER_COLS[1:])
         self.con.executescript(f"""
@@ -76,6 +96,22 @@ class FFPStore:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        # rank (level order) and depth are kept as columns, indexed, so
+        # picking the next search does not scan a queue that runs to
+        # tens of thousands; a database from an earlier version gets them
+        have = {r[1] for r in self.con.execute("PRAGMA table_info(frontier)")}
+        if "rank" not in have:
+            self.con.execute("ALTER TABLE frontier ADD COLUMN rank INTEGER "
+                             "NOT NULL DEFAULT 0")
+            self.con.execute("ALTER TABLE frontier ADD COLUMN depth INTEGER "
+                             "NOT NULL DEFAULT 0")
+            for (prefix,) in self.con.execute(
+                    "SELECT prefix FROM frontier").fetchall():
+                self.con.execute(
+                    "UPDATE frontier SET rank=?, depth=? WHERE prefix=?",
+                    (_rank(prefix), len(prefix), prefix))
+        self.con.execute("CREATE INDEX IF NOT EXISTS frontier_next ON "
+                         "frontier (state, rank, depth, prefix)")
         self.con.commit()
 
     def close(self) -> None:
@@ -83,8 +119,9 @@ class FFPStore:
 
     # ---- meta ------------------------------------------------------------
     def get(self, key: str, default: str = "") -> str:
-        row = self.con.execute("SELECT value FROM meta WHERE key=?",
-                               (key,)).fetchone()
+        with self._lock:
+            row = self.con.execute("SELECT value FROM meta WHERE key=?",
+                                   (key,)).fetchone()
         return row[0] if row else default
 
     def put(self, key: str, value) -> None:
@@ -112,25 +149,30 @@ class FFPStore:
             return self.member_count() - before
 
     def member_count(self) -> int:
-        return self.con.execute("SELECT count(*) FROM members").fetchone()[0]
+        with self._lock:
+            return self.con.execute(
+                "SELECT count(*) FROM members").fetchone()[0]
 
     def counts_by_level(self) -> dict:
-        return dict(self.con.execute(
-            "SELECT level, count(*) FROM members GROUP BY level"))
+        with self._lock:
+            return dict(self.con.execute(
+                "SELECT level, count(*) FROM members GROUP BY level"))
 
     def members(self):
-        cur = self.con.execute(
-            f"SELECT {', '.join(_MEMBER_COLS)} FROM members "
-            f"ORDER BY level, ffp_number")
-        for row in cur:
+        with self._lock:
+            rows = self.con.execute(
+                f"SELECT {', '.join(_MEMBER_COLS)} FROM members "
+                f"ORDER BY level, ffp_number").fetchall()
+        for row in rows:
             yield dict(zip(_MEMBER_COLS, row))
 
     # ---- frontier --------------------------------------------------------
     def seed(self, prefixes) -> None:
         with self._lock:
             self.con.executemany(
-                "INSERT OR IGNORE INTO frontier (prefix, state) "
-                "VALUES (?, ?)", [(p, PENDING) for p in prefixes])
+                "INSERT OR IGNORE INTO frontier (prefix, state, rank, depth) "
+                "VALUES (?, ?, ?, ?)",
+                [(p, PENDING, _rank(p), len(p)) for p in prefixes])
             self.con.commit()
 
     def mark(self, prefix: str, state: str, total: int) -> None:
@@ -140,19 +182,58 @@ class FFPStore:
                 (state, total, prefix))
             self.con.commit()
 
-    def next_pending(self):
-        row = self.con.execute(
-            "SELECT prefix FROM frontier WHERE state=? "
-            "ORDER BY length(prefix), prefix LIMIT 1", (PENDING,)).fetchone()
+    @staticmethod
+    def _level_filter(levels) -> tuple:
+        """SQL keeping name searches of `levels`; number searches carry no
+        level (rank past the last level) and are always kept."""
+        if levels is None:
+            return "", ()
+        ranks = sorted({LEVEL_ORDER.index(lv) for lv in levels
+                        if lv in LEVEL_ORDER} | {len(LEVEL_ORDER)})
+        return (f" AND rank IN ({', '.join('?' * len(ranks))})",
+                tuple(ranks))
+
+    def next_pending(self, levels=None):
+        where, args = self._level_filter(levels)
+        with self._lock:
+            row = self.con.execute(
+                "SELECT prefix FROM frontier WHERE state=?" + where
+                + " ORDER BY rank, depth, prefix LIMIT 1",
+                (PENDING, *args)).fetchone()
         return row[0] if row else None
 
+    def claim_next(self, levels=None):
+        """Hand one pending search to a worker, so no two take the same."""
+        with self._lock:
+            prefix = self.next_pending(levels)
+            if prefix is not None:
+                self.con.execute("UPDATE frontier SET state=? WHERE prefix=?",
+                                 (RUNNING, prefix))
+                self.con.commit()
+            return prefix
+
+    def release_running(self) -> None:
+        """Searches a stopped run left unanswered go back in the queue."""
+        with self._lock:
+            self.con.execute("UPDATE frontier SET state=? WHERE state=?",
+                             (PENDING, RUNNING))
+            self.con.commit()
+
+    def running(self) -> int:
+        with self._lock:
+            return self.con.execute(
+                "SELECT count(*) FROM frontier WHERE state=?",
+                (RUNNING,)).fetchone()[0]
+
     def frontier_counts(self) -> dict:
-        return dict(self.con.execute(
-            "SELECT state, count(*) FROM frontier GROUP BY state"))
+        with self._lock:
+            return dict(self.con.execute(
+                "SELECT state, count(*) FROM frontier GROUP BY state"))
 
     def capped(self) -> list:
-        return [r[0] for r in self.con.execute(
-            "SELECT prefix FROM frontier WHERE state=?", (CAPPED,))]
+        with self._lock:
+            return [r[0] for r in self.con.execute(
+                "SELECT prefix FROM frontier WHERE state=?", (CAPPED,))]
 
     def reset(self) -> None:
         with self._lock:
@@ -179,7 +260,7 @@ class Progress:
 def progress_of(store: FFPStore, searches: int = 0, last: str = "") -> Progress:
     fc = store.frontier_counts()
     return Progress(members=store.member_count(), searches=searches,
-                    pending=fc.get(PENDING, 0),
+                    pending=fc.get(PENDING, 0) + fc.get(RUNNING, 0),
                     done=fc.get(DONE, 0) + fc.get(SPLIT, 0) + fc.get(CAPPED, 0),
                     last=last, level_totals=store.level_totals(),
                     level_found=store.counts_by_level())
@@ -314,36 +395,81 @@ def _too_deep(store: FFPStore, prefix: str) -> bool:
     return len(prefix.split("|", 1)[1]) >= MAX_NAME
 
 
+def _one_search(searcher, store: FFPStore, prefix: str, log):
+    """Run one search and file what it found; split it if it was too big."""
+    page = _search(searcher, store, prefix)
+    if page.total == 0:
+        store.mark(prefix, DONE, 0)
+    elif page.complete:
+        store.save_members(page.members)
+        store.mark(prefix, DONE, page.total)
+    elif _too_deep(store, prefix):
+        store.save_members(page.members)
+        store.mark(prefix, CAPPED, page.total)
+        log(f"'{prefix}' still matches {page.total:,}; the first 50 "
+            f"are kept.")
+    else:
+        store.save_members(page.members)
+        store.seed(_children(store, prefix))
+        store.mark(prefix, SPLIT, page.total)
+    return page
+
+
+def pending_levels(store: FFPStore) -> list:
+    """Levels that still have searches to run, in collection order."""
+    left = []
+    for level in LEVEL_ORDER:
+        if store.next_pending([level]) is not None:
+            left.append(level)
+    return left
+
+
 def collect(searcher, store: FFPStore, *, stop: threading.Event,
             log=lambda _m: None, on_progress=lambda _p: None,
-            delay_s: float = 1.0) -> Progress:
-    """Collect every member into `store`, carrying on from any earlier run."""
+            delay_s: float = 0.5, workers: int = 1,
+            levels=None) -> Progress:
+    """Collect members into `store`, carrying on from any earlier run.
+
+    `levels` limits the run to those levels (None: all), taken in
+    LEVEL_ORDER -- the small levels first. `workers` searches run at once,
+    each claiming its own, so waiting on Zenith overlaps. The first error
+    stops every worker; the search it was on goes back in the queue.
+    """
     if store.get("mode") not in (NUMBER, NAME):
         _choose_method(searcher, store, log)
-    while not stop.is_set():
-        prefix = store.next_pending()
-        if prefix is None:
-            break
-        page = _search(searcher, store, prefix)
-        if page.total == 0:
-            store.mark(prefix, DONE, 0)
-        elif page.complete:
-            store.save_members(page.members)
-            store.mark(prefix, DONE, page.total)
-        elif _too_deep(store, prefix):
-            store.save_members(page.members)
-            store.mark(prefix, CAPPED, page.total)
-            log(f"'{prefix}' still matches {page.total:,}; the first 50 "
-                f"are kept.")
-        else:
-            store.save_members(page.members)
-            store.seed(_children(store, prefix))
-            store.mark(prefix, SPLIT, page.total)
-        on_progress(progress_of(store, searcher.searches,
-                                f"{prefix}: {page.total:,}"))
-        if delay_s > 0:
-            stop.wait(delay_s)
+    store.release_running()
+    errors: list = []
+
+    def work() -> None:
+        while not stop.is_set():
+            prefix = store.claim_next(levels)
+            if prefix is None:
+                if store.running() == 0:
+                    return
+                stop.wait(0.3)       # another worker may still split one
+                continue
+            try:
+                page = _one_search(searcher, store, prefix, log)
+            except Exception as exc:          # noqa: BLE001 - handed back
+                store.mark(prefix, PENDING, -1)
+                errors.append(exc)
+                stop.set()
+                return
+            on_progress(progress_of(store, searcher.searches,
+                                    f"{prefix}: {page.total:,}"))
+            if delay_s > 0:
+                stop.wait(delay_s)
+
+    pool = [threading.Thread(target=work, daemon=True)
+            for _ in range(max(1, int(workers)))]
+    for t in pool:
+        t.start()
+    for t in pool:
+        t.join()
+    store.release_running()
     store.put("finished", "1" if store.next_pending() is None else "0")
+    if errors:
+        raise errors[0]
     return progress_of(store, searcher.searches)
 
 
