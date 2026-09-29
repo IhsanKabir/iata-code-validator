@@ -83,8 +83,19 @@ class SearchPage:
 
     @property
     def complete(self) -> bool:
-        """Every match is listed, so the rows can be taken as they are."""
-        return not self.truncated and len(self.members) >= self.total
+        """Every match is listed, so the rows can be taken as they are.
+
+        Zenith's own warning decides, not a count of the rows read: if one
+        row were laid out differently and could not be read, counting would
+        call the search incomplete for ever and split it down 30 levels --
+        the same runaway the trailing-space bug caused.
+        """
+        return not self.truncated
+
+    @property
+    def short(self) -> int:
+        """Rows Zenith said it listed but that could not be read."""
+        return max(0, self.total - len(self.members)) if self.complete else 0
 
 
 def _text(fragment: str) -> str:
@@ -117,9 +128,13 @@ def parse_member(row: str) -> FFPMember:
     Most carry a class; level and miles do not, so they are read by place."""
     cells = [_text(c) for c in _TD_RE.findall(row)]
     at = (lambda i: cells[i] if i < len(cells) else "")
+    customer_id = _hidden(row, "idCustomer")
+    number = re.search(r"\d{4,}", at(0))
     return FFPMember(
-        ffp_number=at(0).split()[0] if at(0) else "",
-        customer_id=_hidden(row, "idCustomer"),
+        # the FFP number is the customer code; a row whose number cannot be
+        # read keeps its customer id rather than being dropped
+        ffp_number=number.group(0) if number else customer_id,
+        customer_id=customer_id,
         last_name=_span(row, "surname"),
         first_name=_span(row, "firstname"),
         birth_date=_span(row, "birthdate"),
@@ -242,9 +257,11 @@ class FFPSearcher:
                 page = parse_search_results(r.text)
             except FFPSearchError:
                 if rebooted:
-                    raise FFPSessionError(
-                        "Zenith keeps answering the FFP search with an "
-                        "error page. Sign in again.")
+                    # a fresh bootstrap was accepted, so the sign-in is fine:
+                    # this is Zenith having a bad moment, not a lost session
+                    raise FFPSearchError(
+                        "Zenith answered the FFP search with an error page "
+                        "twice.")
                 rebooted = True               # lost the modern session
                 with self._lock:
                     self.bootstrap()

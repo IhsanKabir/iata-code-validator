@@ -243,9 +243,11 @@ def test_stop_keeps_progress_and_the_next_run_carries_on(store):
     again = _FakeZenith(people)
     fc.collect(again, store, stop=threading.Event(), delay_s=0)
     assert store.member_count() == 900
-    # the level check is not repeated, and finished searches are not redone
-    assert not any(level for level, _, _ in again.calls)
-    assert not finished & {num for _, num, _ in again.calls}
+    # the method check is not repeated -- only a recount of each level
+    # still being collected -- and finished searches are not redone
+    recounts = [lv for lv, num, name in again.calls if lv and not name]
+    assert len(recounts) == len(set(recounts)) <= 4
+    assert not finished & {num for _, num, _ in again.calls if num}
 
 
 def test_the_workbook_lists_every_member_and_checks_the_counts(store,
@@ -396,24 +398,103 @@ def test_several_searches_at_once_still_find_everyone_once(store, workers):
     assert len(names) == len(set(names))          # no search run twice
 
 
-def test_a_failed_search_goes_back_in_the_queue(store):
-    fake = _by_name()
+def _flaky(fake, fail_on, exc):
     real = fake.search
     calls = {"n": 0}
 
-    def flaky(**kw):
+    def search(**kw):
         calls["n"] += 1
-        if calls["n"] == 30:
-            raise zf.FFPSearchError("Zenith returned 504 four times.")
+        if calls["n"] in fail_on:
+            raise exc
         return real(**kw)
 
-    fake.search = flaky
+    fake.search = search
+    return real
+
+
+def test_one_failed_search_does_not_end_the_run(store, monkeypatch):
+    monkeypatch.setattr(fc, "RETRY_WAIT_S", 0)
+    fake = _by_name()
+    _flaky(fake, {30}, zf.FFPSearchError("Zenith returned 504 four times."))
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 900 and store.get("finished") == "1"
+
+
+def test_five_failures_in_a_row_end_it_with_the_search_requeued(
+        store, monkeypatch):
+    monkeypatch.setattr(fc, "RETRY_WAIT_S", 0)
+    fake = _by_name()
+    real = _flaky(fake, set(range(30, 40)),
+                  zf.FFPSearchError("Zenith returned 504 four times."))
     with pytest.raises(zf.FFPSearchError):
         fc.collect(fake, store, stop=threading.Event(), delay_s=0)
     assert store.running() == 0                   # nothing left half-taken
     fake.search = real
     fc.collect(fake, store, stop=threading.Event(), delay_s=0)
     assert store.member_count() == 900
+
+
+def test_a_lost_sign_in_ends_the_run_at_once(store, monkeypatch):
+    monkeypatch.setattr(fc, "RETRY_WAIT_S", 0)
+    fake = _by_name()
+    _flaky(fake, {30}, zf.FFPSessionError("signed out"))
+    with pytest.raises(zf.FFPSessionError):
+        fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.running() == 0
+
+
+def test_no_two_punctuation_marks_are_added_in_a_row(store):
+    store.put("mode", "name")
+    kids = fc._children(store, "Gold|Md.")
+    assert "Gold|Md.a" in kids
+    assert not [k for k in kids if k[-2:] in ("..", ".-", ".'", ". ")]
+    assert "Gold|Md a" in fc._children(store, "Gold|Md")
+
+
+def test_names_starting_with_a_digit_are_searched(store):
+    fake = _by_name(600)
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    searched = {name for _, _, name in fake.calls}
+    assert {"0", "9"} <= searched
+
+
+def test_a_saved_run_gets_digit_starts_once(store):
+    store.put("mode", "name")
+    store.put("space_fix", "1")
+    store.put("level_total:Gold", 1050)
+    store.put("level_total:Platinum", 20)
+    fc.add_digit_starts(store)
+    queued = {p for p, in store.con.execute("SELECT prefix FROM frontier")}
+    assert "Gold|0" in queued and "Gold|9" in queued
+    assert "Platinum|0" not in queued             # fits one search already
+    assert store.get("digit_fix") == "1"
+
+
+def test_the_limit_test_skips_a_setting_zenith_errors_on(store):
+    fake = _FakeZenith(_members(2_000), name="prefix",
+                       honours=("form", "Take"))
+    real = fake.search
+
+    def choke_on_pagesize(**kw):
+        if "PageSize" in (kw.get("extra_form") or {}):
+            raise zf.FFPSearchError("500 on an unknown field")
+        return real(**kw)
+
+    fake.search = choke_on_pagesize
+    found = fc.probe_page_limit(fake, store, stop=threading.Event())
+    assert found["name"] == "Take"
+
+
+def test_a_row_zenith_listed_but_that_could_not_be_read_is_not_split(store):
+    """Counting rows would call this incomplete for ever and split it."""
+    page = zf.SearchPage(total=3, members=tuple(_members(2)), truncated=False)
+    assert page.complete and page.short == 1
+
+
+def test_a_row_without_a_readable_number_keeps_its_customer_id():
+    row = _row("12345678").replace(">12345678</a>", ">—</a>")
+    m = zf.parse_member(row)
+    assert m.ffp_number == "12345678" == m.customer_id
 
 
 def test_a_progress_file_from_the_last_version_still_opens(tmp_path):
@@ -515,3 +596,17 @@ def test_a_run_left_with_space_chains_is_repaired(store):
     assert not any(p.endswith(" ") for p in queued)
     assert "Gold|B" in queued
     assert store.get("space_fix") == "1"
+
+
+def test_each_run_recounts_the_levels_it_collects(store):
+    people = _members(900)
+    fc.collect(_by_name(900), store, stop=threading.Event(), delay_s=0,
+               levels=["Gold"])
+    store.put("level_total:Gold", 1)              # a stale count
+    grown = _FakeZenith(people + _members(40, start=20_000_000),
+                        number="exact", name="prefix")
+    store.seed(["Gold|Zz"])                       # so Gold has work left
+    fc.collect(grown, store, stop=threading.Event(), delay_s=0,
+               levels=["Gold"])
+    assert store.level_totals()["Gold"] == sum(
+        m.level == "Gold" for m in grown.members)

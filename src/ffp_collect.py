@@ -283,7 +283,15 @@ WILDCARDS = ("", "%", "*")
 _NAME_TAIL = "-.'"
 _UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _LOWER = _UPPER.lower()
+#: What a last name may begin with. Digits cost ten searches a level and
+#: are the only way to reach a name typed starting with one.
+_FIRST_EXTRA = DIGITS
 MAX_NAME = 30
+
+#: A search that fails (after its own retries) goes back in the queue and
+#: the run waits this long; this many failures in a row end the run.
+RETRY_WAIT_S = 60
+MAX_FAILURES_IN_A_ROW = 5
 
 NUMBER, NAME = "number", "name"
 
@@ -371,7 +379,7 @@ def _choose_method(searcher, store: FFPStore, log) -> None:
     store.put("case", "1" if case_sensitive else "0")
     # Where case matters, a name typed in lower case ("afrin") begins with a
     # lower-case letter and is only reached from one.
-    first = _UPPER + (_LOWER if case_sensitive else "")
+    first = _UPPER + (_LOWER if case_sensitive else "") + _FIRST_EXTRA
     totals = store.level_totals()
     for level in zf.LEVELS:
         if totals.get(level, 0) > zf.PAGE_CAP:
@@ -393,8 +401,11 @@ def _children(store: FFPStore, prefix: str):
     if store.get("mode") == NUMBER:
         return [prefix + d for d in DIGITS]
     letters = _LOWER + (_UPPER if store.get("case") == "1" else "")
-    out = [prefix + c for c in letters + _NAME_TAIL]
-    if not prefix.endswith(" "):
+    after_mark = prefix[-1:] in _NAME_TAIL + " "
+    # never two marks in a row: if Zenith ignored a dot or hyphen as it does
+    # a trailing space, "Md." would split into "Md..", "Md..." and so on
+    out = [prefix + c for c in letters + ("" if after_mark else _NAME_TAIL)]
+    if not after_mark:
         out += [prefix + " " + c for c in letters]
     return out
 
@@ -422,6 +433,16 @@ def repair_space_chains(store: FFPStore) -> int:
                    if not c.endswith(" "))
     store.put("space_fix", "1")
     return len(junk)
+
+
+def add_digit_starts(store: FFPStore) -> None:
+    """A run begun before digits were searched as first characters gets
+    them now, for every level too big for one search."""
+    totals = store.level_totals()
+    for level in zf.LEVELS:
+        if totals.get(level, 0) > zf.PAGE_CAP:
+            store.seed(f"{level}|{d}" for d in _FIRST_EXTRA)
+    store.put("digit_fix", "1")
 
 
 def _page_extra(store: FFPStore) -> dict:
@@ -474,8 +495,15 @@ def probe_page_limit(searcher, store: FFPStore, *, stop: threading.Event,
         for name in LIMIT_NAMES:
             if stop.is_set():
                 return None
-            page = searcher.search(level=level, **{
-                f"extra_{where}": {name: str(LIMIT_TRY)}})
+            try:
+                page = searcher.search(level=level, **{
+                    f"extra_{where}": {name: str(LIMIT_TRY)}})
+            except zf.FFPSessionError:
+                raise
+            except zf.FFPSearchError:
+                # a setting Zenith chokes on is simply not the one
+                log(f"{name} ({where}): Zenith returned an error; next.")
+                continue
             if len(page.members) <= shown:
                 continue
             store.save_members(page.members)
@@ -490,18 +518,21 @@ def probe_page_limit(searcher, store: FFPStore, *, stop: threading.Event,
     return None
 
 
-def _close_small_levels(searcher, store: FFPStore, levels, log) -> None:
-    """With a larger page, a whole level may fit in one search: take it
-    and drop that level's queued name searches."""
+def _refresh_levels(searcher, store: FFPStore, levels, log) -> None:
+    """Recount each level this run collects, so 'still to find' is measured
+    against today's membership, not the first run's.
+
+    With a larger page, a whole level may also fit in this one search: it
+    is taken, and that level's queued name searches are dropped.
+    """
     extra = _page_extra(store)
-    if not extra:
-        return
     for level in (levels or LEVEL_ORDER):
         if store.next_pending([level]) is None:
             continue
         page = searcher.search(level=level, **extra)
+        store.put(f"level_total:{level}", page.total)
+        store.save_members(page.members)
         if page.complete:
-            store.save_members(page.members)
             store.close_level(level)
             log(f"{level}: all {page.total:,} in one search.")
 
@@ -520,6 +551,9 @@ def _one_search(searcher, store: FFPStore, prefix: str, log):
     elif page.complete:
         store.save_members(page.members)
         store.mark(prefix, DONE, page.total)
+        if page.short:
+            log(f"'{prefix}': Zenith listed {page.total} but "
+                f"{page.short} row(s) could not be read.")
     elif _too_deep(store, prefix):
         store.save_members(page.members)
         store.mark(prefix, CAPPED, page.total)
@@ -560,8 +594,16 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
         if dropped:
             log(f"Dropped {dropped:,} queued searches that only added "
                 f"spaces (Zenith ignores a trailing space).")
-    _close_small_levels(searcher, store, levels, log)
+    if store.get("mode") == NAME and store.get("digit_fix") != "1":
+        add_digit_starts(store)
+    _refresh_levels(searcher, store, levels, log)
     errors: list = []
+    failures = {"in_a_row": 0}
+    lock = threading.Lock()
+
+    def give_up(exc) -> None:
+        errors.append(exc)
+        stop.set()
 
     def work() -> None:
         while not stop.is_set():
@@ -573,11 +615,30 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
                 continue
             try:
                 page = _one_search(searcher, store, prefix, log)
+            except zf.FFPSessionError as exc:
+                store.mark(prefix, PENDING, -1)
+                give_up(exc)         # only a new sign-in helps
+                return
+            except zf.FFPSearchError as exc:
+                # Zenith having a bad moment: hand the search back, wait,
+                # carry on -- an hours-long run should not end on one
+                store.mark(prefix, PENDING, -1)
+                with lock:
+                    failures["in_a_row"] += 1
+                    n = failures["in_a_row"]
+                if n >= MAX_FAILURES_IN_A_ROW:
+                    give_up(exc)
+                    return
+                log(f"{exc} Waiting {RETRY_WAIT_S} s, then carrying on "
+                    f"({n} of {MAX_FAILURES_IN_A_ROW}).")
+                stop.wait(RETRY_WAIT_S)
+                continue
             except Exception as exc:          # noqa: BLE001 - handed back
                 store.mark(prefix, PENDING, -1)
-                errors.append(exc)
-                stop.set()
+                give_up(exc)
                 return
+            with lock:
+                failures["in_a_row"] = 0
             on_progress(progress_of(store, searcher.searches,
                                     f"{prefix}: {page.total:,}"))
             if delay_s > 0:

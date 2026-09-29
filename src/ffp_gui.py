@@ -235,6 +235,7 @@ class FFPMixin:
         self._ffp_stop.clear()
         self.ffp_warning.configure(text="")
         self.btn_ffp_run.configure(state="disabled")
+        self.btn_ffp_limit.configure(state="disabled")
         self.btn_ffp_stop.configure(state="normal")
         self._ffp_log("Opening Zenith's FFP search…")
         self._ffp_worker = threading.Thread(
