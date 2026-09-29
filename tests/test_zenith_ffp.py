@@ -131,13 +131,17 @@ class _FakeZenith:
         self.calls.append((level, ffp_number, last_name))
         last_name = last_name.rstrip()      # as Zenith: trailing space trimmed
         norm = (lambda v: v) if self.case else (lambda v: v.upper())
+        # name="fullname": the text is matched against "Surname Firstname",
+        # as on the live system
+        field = ((lambda m: f"{m.last_name} {m.first_name}")
+                 if self.name == "fullname" else (lambda m: m.last_name))
+        how = "prefix" if self.name == "fullname" else self.name
         hits = [m for m in self.members
                 if (not level or m.level == level)
                 and (not ffp_number
                      or _match(m.ffp_number, ffp_number, self.number))
                 and (not last_name
-                     or _match(norm(m.last_name), norm(last_name),
-                               self.name))]
+                     or _match(norm(field(m)), norm(last_name), how))]
         cap = self._cap(extra_form, extra_query)
         return zf.SearchPage(total=len(hits), members=tuple(hits[:cap]),
                              truncated=len(hits) > cap)
@@ -610,3 +614,69 @@ def test_each_run_recounts_the_levels_it_collects(store):
                levels=["Gold"])
     assert store.level_totals()["Gold"] == sum(
         m.level == "Gold" for m in grown.members)
+
+
+# ---- skipping name starts already fully collected --------------------------
+
+_FIRSTS = ["Md", "Mohammad", "Abdul", "Nusrat", "Farhana", "Rakib", "Sadia",
+           "Tanvir", "Md Rafiq", "Shahid"]
+
+
+def _people(n, surnames=("Hossain", "Islam", "Rahman", "Ahmed", "Akter")):
+    """Many members sharing a few surnames, told apart by first name --
+    the shape that stalled the live run."""
+    levels = ["Silver"] * 17 + ["Gold"] * 2 + ["Platinum"]
+    out = []
+    for i in range(n):
+        first = f"{_FIRSTS[i % len(_FIRSTS)]} {chr(65 + (i // 10) % 26)}"                 f"{chr(97 + (i // 260) % 26)}"
+        out.append(zf.FFPMember(str(10_000_000 + i), str(10_000_000 + i),
+                                surnames[i % len(surnames)], first, "", "",
+                                "", "", levels[i % 20], "0"))
+    return out
+
+
+def test_shared_surnames_are_told_apart_by_first_name(store):
+    people = _people(2_000)
+    fake = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 2_000
+    assert store.get("prune_off") != "1"
+
+
+def test_pruning_saves_searches_and_misses_no_one(tmp_path):
+    people = _people(2_000)
+    pruned = fc.FFPStore(tmp_path / "a.sqlite")
+    fast = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(fast, pruned, stop=threading.Event(), delay_s=0)
+
+    full = fc.FFPStore(tmp_path / "b.sqlite")
+    full.put("prune_off", "1")
+    slow = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(slow, full, stop=threading.Event(), delay_s=0)
+
+    assert pruned.member_count() == full.member_count() == 2_000
+    assert fast.searches < slow.searches * 0.8
+    pruned.close()
+    full.close()
+
+
+def test_pruning_switches_itself_off_when_zenith_matches_differently(store):
+    """A Zenith matching the surname alone returns nobody for 'Hossain m';
+    the collected members say otherwise, so pruning must stop trusting its
+    rule rather than skip searches on it."""
+    people = _people(1_500)
+    fake = _FakeZenith(people, number="exact", name="prefix")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.get("prune_off") == "1"
+
+
+def test_the_start_up_sweep_trims_a_queue_already_covered(store):
+    people = _people(600)
+    fake = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    # a stale queue under a name start that is fully collected
+    split = store.con.execute(
+        "SELECT prefix FROM frontier WHERE state='split' LIMIT 1").fetchone()
+    assert split
+    store.seed([split[0] + "qqq9", split[0] + "qqq8"])   # new, surely
+    assert fc.prune_all(store) == 2

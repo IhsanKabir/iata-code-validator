@@ -50,6 +50,8 @@ PENDING, DONE, SPLIT, CAPPED = "pending", "done", "split", "capped"
 #: Taken by a worker and not yet answered. A run that stops leaves these
 #: behind; the next run hands them out again.
 RUNNING = "running"
+#: Not searched: every member it could list was already collected.
+COVERED = "covered"
 
 #: The order levels are collected in: the small, valuable ones first.
 LEVEL_ORDER = ("Gold", "Platinum", "Titanium", "Silver")
@@ -111,8 +113,31 @@ class FFPStore:
                 self.con.execute(
                     "UPDATE frontier SET rank=?, depth=? WHERE prefix=?",
                     (_rank(prefix), len(prefix), prefix))
-        self.con.execute("CREATE INDEX IF NOT EXISTS frontier_next ON "
-                         "frontier (state, rank, depth, prefix)")
+        # prio: 0 for a name start seen among an over-full search's listed
+        # members, 1 for one merely possible -- seen ones go first
+        if "prio" not in {r[1] for r in self.con.execute(
+                "PRAGMA table_info(frontier)")}:
+            self.con.execute("ALTER TABLE frontier ADD COLUMN prio INTEGER "
+                             "NOT NULL DEFAULT 1")
+        # fullkey: "surname firstname" in lower case, indexed with the level,
+        # so counting who begins with a name start is a range lookup, not a
+        # scan of 120,000 members after every search
+        if "fullkey" not in {r[1] for r in self.con.execute(
+                "PRAGMA table_info(members)")}:
+            self.con.execute("ALTER TABLE members ADD COLUMN fullkey TEXT "
+                             "NOT NULL DEFAULT ''")
+            self.con.execute(
+                "UPDATE members SET fullkey = lower(trim(last_name) || ' ' "
+                "|| trim(first_name))")
+        self.con.execute("CREATE INDEX IF NOT EXISTS members_fullkey ON "
+                         "members (level, fullkey)")
+        self.con.execute("DROP INDEX IF EXISTS frontier_next")
+        # seen name starts at ANY length go before unseen ones: a seen branch
+        # completes a name start, and coverage then drops its unseen siblings
+        # before they are searched
+        self.con.execute("DROP INDEX IF EXISTS frontier_order")
+        self.con.execute("CREATE INDEX IF NOT EXISTS frontier_seen_first ON "
+                         "frontier (state, rank, prio, depth, prefix)")
         self.con.commit()
 
     def close(self) -> None:
@@ -138,14 +163,14 @@ class FFPStore:
     # ---- members ---------------------------------------------------------
     def save_members(self, members) -> int:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        rows = [tuple(asdict(m)[c] for c in _MEMBER_COLS) + (now,)
-                for m in members if m.ffp_number]
+        rows = [tuple(asdict(m)[c] for c in _MEMBER_COLS)
+                + (now, _full_name(m)) for m in members if m.ffp_number]
         with self._lock:
             before = self.member_count()
             self.con.executemany(
                 f"INSERT OR REPLACE INTO members "
-                f"({', '.join(_MEMBER_COLS)}, found_at) "
-                f"VALUES ({', '.join('?' * (len(_MEMBER_COLS) + 1))})", rows)
+                f"({', '.join(_MEMBER_COLS)}, found_at, fullkey) "
+                f"VALUES ({', '.join('?' * (len(_MEMBER_COLS) + 2))})", rows)
             self.con.commit()
             return self.member_count() - before
 
@@ -168,13 +193,40 @@ class FFPStore:
             yield dict(zip(_MEMBER_COLS, row))
 
     # ---- frontier --------------------------------------------------------
-    def seed(self, prefixes) -> None:
+    def seed(self, prefixes, prio: int = 1) -> None:
         with self._lock:
             self.con.executemany(
-                "INSERT OR IGNORE INTO frontier (prefix, state, rank, depth) "
-                "VALUES (?, ?, ?, ?)",
-                [(p, PENDING, _rank(p), len(p)) for p in prefixes])
+                "INSERT OR IGNORE INTO frontier "
+                "(prefix, state, rank, depth, prio) VALUES (?, ?, ?, ?, ?)",
+                [(p, PENDING, _rank(p), len(p), prio) for p in prefixes])
             self.con.commit()
+
+    def state_of(self, prefix: str):
+        with self._lock:
+            row = self.con.execute(
+                "SELECT state, total FROM frontier WHERE prefix=?",
+                (prefix,)).fetchone()
+        return row if row else (None, -1)
+
+    def local_count(self, level: str, part: str) -> int:
+        """Members of `level` collected so far whose "Surname Firstname"
+        begins with `part` (case ignored)."""
+        want = part.lower()
+        with self._lock:
+            return self.con.execute(
+                "SELECT count(*) FROM members WHERE level=? AND fullkey >= ? "
+                "AND fullkey < ?", (level, want, want + "￿")
+            ).fetchone()[0]
+
+    def close_subtree(self, prefix: str) -> int:
+        """Drop every queued search under `prefix`; returns how many."""
+        with self._lock:
+            cur = self.con.execute(
+                "UPDATE frontier SET state=? WHERE state=? AND prefix != ? "
+                "AND substr(prefix, 1, ?) = ?",
+                (COVERED, PENDING, prefix, len(prefix), prefix))
+            self.con.commit()
+            return cur.rowcount
 
     def mark(self, prefix: str, state: str, total: int) -> None:
         with self._lock:
@@ -199,7 +251,7 @@ class FFPStore:
         with self._lock:
             row = self.con.execute(
                 "SELECT prefix FROM frontier WHERE state=?" + where
-                + " ORDER BY rank, depth, prefix LIMIT 1",
+                + " ORDER BY rank, prio, depth, prefix LIMIT 1",
                 (PENDING, *args)).fetchone()
         return row[0] if row else None
 
@@ -270,7 +322,8 @@ def progress_of(store: FFPStore, searches: int = 0, last: str = "") -> Progress:
     fc = store.frontier_counts()
     return Progress(members=store.member_count(), searches=searches,
                     pending=fc.get(PENDING, 0) + fc.get(RUNNING, 0),
-                    done=fc.get(DONE, 0) + fc.get(SPLIT, 0) + fc.get(CAPPED, 0),
+                    done=(fc.get(DONE, 0) + fc.get(SPLIT, 0)
+                          + fc.get(CAPPED, 0) + fc.get(COVERED, 0)),
                     last=last, level_totals=store.level_totals(),
                     level_found=store.counts_by_level())
 
@@ -561,9 +614,99 @@ def _one_search(searcher, store: FFPStore, prefix: str, log):
             f"are kept.")
     else:
         store.save_members(page.members)
-        store.seed(_children(store, prefix))
+        kids = _children(store, prefix)
+        seen = (_seen_children(prefix, page.members, kids)
+                if store.get("mode") == NAME else set())
+        store.seed(seen, prio=0)
+        store.seed(k for k in kids if k not in seen)
         store.mark(prefix, SPLIT, page.total)
+    if store.get("mode") == NAME:
+        _prune(store, prefix, page.total, log)
     return page
+
+
+def prune_all(store: FFPStore) -> int:
+    """One sweep over every over-full name start already searched: any now
+    fully collected has its queued searches dropped. Run when a collection
+    starts, so a queue built before pruning existed is trimmed at once."""
+    if store.get("mode") != NAME or store.get("prune_off") == "1"             or store.get("case") == "1":
+        return 0
+    with store._lock:
+        split = store.con.execute(
+            "SELECT prefix, total FROM frontier WHERE state=? "
+            "ORDER BY length(prefix)", (SPLIT,)).fetchall()
+    dropped = 0
+    for prefix, total in split:
+        level, part = prefix.split("|", 1)
+        if total > 0 and store.local_count(level, part) >= total:
+            dropped += store.close_subtree(prefix)
+    return dropped
+
+
+def _full_name(m) -> str:
+    return f"{m.last_name.strip()} {m.first_name.strip()}".lower()
+
+
+def _seen_children(prefix: str, members, kids) -> set:
+    """The children the listed members continue into -- the likeliest to
+    hold the members not listed. A space goes with the letter after it."""
+    level, part = prefix.split("|", 1)
+    want = part.lower()
+    kid_set = {k.lower(): k for k in kids}
+    seen = set()
+    for m in members:
+        name = _full_name(m)
+        if not name.startswith(want) or len(name) <= len(want):
+            continue
+        nxt = name[len(want)]
+        if nxt == " " and len(name) > len(want) + 1:
+            nxt = " " + name[len(want) + 1]
+        kid = kid_set.get(f"{level}|{part}{nxt}".lower())
+        if kid:
+            seen.add(kid)
+    return seen
+
+
+def _parent(prefix: str):
+    level, part = prefix.split("|", 1)
+    if len(part) <= 1:
+        return None
+    return f"{level}|{part[:-2] if part[-2] == ' ' else part[:-1]}"
+
+
+def _prune(store: FFPStore, prefix: str, total: int, log) -> None:
+    """Drop queued searches under any name start already fully collected.
+
+    Safe because a member whose "Surname Firstname" begins with the text is
+    always among Zenith's matches (true in all 1,004 searches checked on
+    the live system): once as many such members are collected as Zenith
+    counted, there is nobody left under that start. If a collected count
+    ever exceeds Zenith's, that premise is wrong and pruning is switched off
+    for good.
+    """
+    if store.get("prune_off") == "1" or store.get("case") == "1":
+        return
+    level, part = prefix.split("|", 1)
+    if total >= 0 and store.local_count(level, part) > total:
+        store.put("prune_off", "1")
+        log("Pruning switched off: Zenith's name matching is not what it "
+            "seemed, so every search is kept.")
+        return
+    node = prefix
+    dropped = 0
+    while node is not None:
+        state, t = store.state_of(node)
+        if state == SPLIT:
+            if store.local_count(level, node.split("|", 1)[1]) < t:
+                break            # not all in yet, so no shorter start is
+            dropped += store.close_subtree(node)
+        node = _parent(node)
+    found = store.counts_by_level().get(level, 0)
+    if found >= store.level_totals().get(level, -1) > 0:
+        store.close_level(level)
+    if dropped:
+        log(f"Skipped {dropped:,} searches under name starts already fully "
+            f"collected.")
 
 
 def pending_levels(store: FFPStore) -> list:
@@ -596,6 +739,10 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
                 f"spaces (Zenith ignores a trailing space).")
     if store.get("mode") == NAME and store.get("digit_fix") != "1":
         add_digit_starts(store)
+    swept = prune_all(store)
+    if swept:
+        log(f"Skipped {swept:,} queued searches under name starts already "
+            f"fully collected.")
     _refresh_levels(searcher, store, levels, log)
     errors: list = []
     failures = {"in_a_row": 0}
