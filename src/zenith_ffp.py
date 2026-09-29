@@ -200,19 +200,24 @@ class FFPSearcher:
 
     def search(self, *, level: str = "", ffp_number: str = "",
                last_name: str = "", email: str = "",
-               phone: str = "") -> SearchPage:
+               phone: str = "", extra_form: dict | None = None,
+               extra_query: dict | None = None) -> SearchPage:
+        """One search. `extra_form` / `extra_query` add fields the page does
+        not show -- used to test whether Zenith honours a larger page."""
         with self._lock:
             if not self._token:
                 self.bootstrap()
         data = {"__RequestVerificationToken": self._token,
                 "LastName": last_name, "FFPNumber": ffp_number,
-                "Email": email, "PhoneNumber": phone, "LevelName": level}
+                "Email": email, "PhoneNumber": phone, "LevelName": level,
+                **(extra_form or {})}
         rebooted = False
         for attempt in range(1, self.attempts + 1):
             last = attempt >= self.attempts
             try:
                 r = self.session.session.post(
-                    self.url, data=data, timeout=self.timeout_s,
+                    self.url, data=data, params=extra_query or None,
+                    timeout=self.timeout_s,
                     headers=self._headers(Referer=self.url, Origin=self.base))
             except Exception as exc:          # noqa: BLE001 - network
                 if last:

@@ -589,3 +589,13 @@ def test_an_ffp_stop_still_shows_the_level_counts(app, monkeypatch, tmp_path):
     rows = [app.ffp_tree.item(i, "values") for i in app.ffp_tree.get_children()]
     assert ("Silver", "119,848", "0", "119,848") in rows
     store.close()
+
+
+def test_the_limit_test_reports_what_zenith_did(app, monkeypatch):
+    _unlock_ffp(app, monkeypatch)
+    app._handle_msg("ffp_limit", {"where": "form", "name": "PageSize",
+                                  "value": 5000, "listed": 1050})
+    assert "up to 1,050 rows" in str(app.ffp_status.cget("text"))
+    app._handle_msg("ffp_limit", None)
+    assert "cannot be lifted" in str(app.ffp_status.cget("text"))
+    assert str(app.btn_ffp_limit.cget("state")) == "normal"

@@ -32,6 +32,7 @@ It holds customers' personal details: it stays on this machine.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -212,6 +213,14 @@ class FFPStore:
                 self.con.commit()
             return prefix
 
+    def close_level(self, level: str) -> None:
+        """Every queued search of `level` is answered by a single one."""
+        with self._lock:
+            self.con.execute(
+                "UPDATE frontier SET state=? WHERE rank=? AND state IN (?, ?)",
+                (DONE, LEVEL_ORDER.index(level), PENDING, RUNNING))
+            self.con.commit()
+
     def release_running(self) -> None:
         """Searches a stopped run left unanswered go back in the queue."""
         with self._lock:
@@ -381,12 +390,86 @@ def _children(store: FFPStore, prefix: str):
     return [prefix + c for c in tail]
 
 
+def _page_extra(store: FFPStore) -> dict:
+    """The larger-page setting a test found, as search() arguments."""
+    raw = store.get("page_param")
+    if not raw:
+        return {}
+    got = json.loads(raw)
+    return {f"extra_{got['where']}": {got["name"]: str(got["value"])}}
+
+
 def _search(searcher, store: FFPStore, prefix: str):
     wild = store.get("wild")
+    extra = _page_extra(store)
     if store.get("mode") == NUMBER:
-        return searcher.search(ffp_number=prefix + wild)
+        return searcher.search(ffp_number=prefix + wild, **extra)
     level, part = prefix.split("|", 1)
-    return searcher.search(level=level, last_name=part + wild)
+    return searcher.search(level=level, last_name=part + wild, **extra)
+
+
+# ---- does Zenith list more than 50 if asked? -------------------------------
+
+#: Names a "how many rows" setting commonly goes by. NbReponse is the one
+#: Zenith's own flight-load report takes.
+LIMIT_NAMES = ("PageSize", "pageSize", "MaxResults", "maxResults",
+               "NbReponse", "NbResults", "MaxRows", "maxRows", "Take",
+               "take", "Top", "top", "Limit", "limit", "ResultsPerPage",
+               "NumberOfResults", "RowCount", "Count")
+#: Asked for per search. Not more: a page of 5,000 members is ~14 MB of
+#: HTML, and all 120,000 Silver members in one page would be ~300 MB -- a
+#: request likely to time out and heavy on Zenith. If Zenith caps lower
+#: (say 500), whatever it lists is used as it is.
+LIMIT_TRY = 5000
+
+
+def probe_page_limit(searcher, store: FFPStore, *, stop: threading.Event,
+                    level: str = "Gold", log=lambda _m: None):
+    """Search `level` with each candidate setting at 5000; keep the first
+    that lists more rows than a plain search. Returns what it found (and
+    stores it, so every later search uses it), or None."""
+    base = searcher.search(level=level)
+    store.save_members(base.members)
+    shown = len(base.members)
+    log(f"{level}: {base.total:,} in Zenith, {shown} listed by a plain "
+        f"search. Trying larger pages…")
+    if base.total <= shown:
+        log(f"{level} is too small to tell -- pick a bigger level.")
+        return None
+    for where in ("form", "query"):
+        for name in LIMIT_NAMES:
+            if stop.is_set():
+                return None
+            page = searcher.search(level=level, **{
+                f"extra_{where}": {name: str(LIMIT_TRY)}})
+            if len(page.members) <= shown:
+                continue
+            store.save_members(page.members)
+            found = {"where": where, "name": name, "value": LIMIT_TRY,
+                     "listed": len(page.members)}
+            store.put("page_param", json.dumps(found))
+            log(f"Zenith listed {len(page.members):,} of {page.total:,} "
+                f"with {name}={LIMIT_TRY} (sent in the {where}). Every "
+                f"search will use it.")
+            return found
+    log("Zenith ignored every setting tried: 50 rows is a hard limit.")
+    return None
+
+
+def _close_small_levels(searcher, store: FFPStore, levels, log) -> None:
+    """With a larger page, a whole level may fit in one search: take it
+    and drop that level's queued name searches."""
+    extra = _page_extra(store)
+    if not extra:
+        return
+    for level in (levels or LEVEL_ORDER):
+        if store.next_pending([level]) is None:
+            continue
+        page = searcher.search(level=level, **extra)
+        if page.complete:
+            store.save_members(page.members)
+            store.close_level(level)
+            log(f"{level}: all {page.total:,} in one search.")
 
 
 def _too_deep(store: FFPStore, prefix: str) -> bool:
@@ -438,6 +521,7 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
     if store.get("mode") not in (NUMBER, NAME):
         _choose_method(searcher, store, log)
     store.release_running()
+    _close_small_levels(searcher, store, levels, log)
     errors: list = []
 
     def work() -> None:

@@ -4,6 +4,7 @@ Pages are built in the structure captured from Zenith's
 CustomerAccount/IframeSearch, with invented members -- no real customer
 appears here.
 """
+import json
 import threading
 
 import pytest
@@ -106,13 +107,26 @@ class _FakeZenith:
     (see _match); `case` whether last names are case-sensitive.
     """
 
-    def __init__(self, members, number="prefix", name="exact", case=False):
+    def __init__(self, members, number="prefix", name="exact", case=False,
+                 honours=None, server_cap=None):
         self.members = members
         self.number, self.name, self.case = number, name, case
+        # ("form" | "query", field name): a larger page it will list
+        self.honours, self.server_cap = honours, server_cap
         self.searches = 0
         self.calls = []
 
-    def search(self, *, level="", ffp_number="", last_name="", **_):
+    def _cap(self, extra_form, extra_query):
+        if self.honours:
+            where, name = self.honours
+            got = (extra_form if where == "form" else extra_query) or {}
+            if name in got:
+                asked = int(got[name])
+                return min(asked, self.server_cap or asked)
+        return 50
+
+    def search(self, *, level="", ffp_number="", last_name="",
+               extra_form=None, extra_query=None, **_):
         self.searches += 1
         self.calls.append((level, ffp_number, last_name))
         norm = (lambda v: v) if self.case else (lambda v: v.upper())
@@ -123,8 +137,9 @@ class _FakeZenith:
                 and (not last_name
                      or _match(norm(m.last_name), norm(last_name),
                                self.name))]
-        return zf.SearchPage(total=len(hits), members=tuple(hits[:50]),
-                             truncated=len(hits) > 50)
+        cap = self._cap(extra_form, extra_query)
+        return zf.SearchPage(total=len(hits), members=tuple(hits[:cap]),
+                             truncated=len(hits) > cap)
 
 
 _SYLLABLES = ["Ah", "med", "Kha", "n", "Ra", "hman", "Is", "lam", "Ho",
@@ -414,3 +429,60 @@ def test_a_progress_file_from_the_last_version_still_opens(tmp_path):
     s = fc.FFPStore(path)
     assert s.next_pending() == "Gold|B"           # Gold outranks Silver
     s.close()
+
+
+# ---- asking Zenith for more than 50 ----------------------------------------
+
+@pytest.mark.parametrize("where,name", [("form", "MaxResults"),
+                                        ("query", "NbReponse")])
+def test_a_setting_zenith_honours_is_found(store, where, name):
+    fake = _FakeZenith(_members(2_000), name="prefix", honours=(where, name))
+    found = fc.probe_page_limit(fake, store, stop=threading.Event())
+    assert (found["where"], found["name"]) == (where, name)
+    assert found["listed"] > 50
+    assert json.loads(store.get("page_param"))["name"] == name
+
+
+def test_no_honoured_setting_means_50_is_a_hard_limit(store):
+    fake = _FakeZenith(_members(2_000), name="prefix")
+    assert fc.probe_page_limit(fake, store, stop=threading.Event()) is None
+    assert store.get("page_param") == ""
+    # every candidate was tried, in the form and in the address
+    assert fake.searches == 1 + 2 * len(fc.LIMIT_NAMES)
+
+
+def test_a_larger_page_collects_everything_in_far_fewer_searches(tmp_path):
+    people = _members(3_000)
+    plain = fc.FFPStore(tmp_path / "plain.sqlite")
+    slow = _FakeZenith(people, number="exact", name="prefix")
+    fc.collect(slow, plain, stop=threading.Event(), delay_s=0)
+
+    big = fc.FFPStore(tmp_path / "big.sqlite")
+    fast = _FakeZenith(people, number="exact", name="prefix",
+                       honours=("form", "PageSize"), server_cap=500)
+    fc.probe_page_limit(fast, big, stop=threading.Event(), level="Silver")
+    fc.collect(fast, big, stop=threading.Event(), delay_s=0)
+
+    assert big.member_count() == plain.member_count() == 3_000
+    assert big.get("finished") == "1"
+    assert fast.searches < slow.searches / 3
+    plain.close()
+    big.close()
+
+
+def test_a_level_that_fits_one_page_drops_its_queued_searches(store):
+    """Gold was part-collected 50 at a time; once a page holds all of it,
+    one search finishes Gold and its queue is closed."""
+    people = _members(2_000)
+    slow = _FakeZenith(people, number="exact", name="prefix")
+    stop = threading.Event()
+    fc.collect(slow, store, stop=stop, delay_s=0,
+               on_progress=lambda p: stop.set())   # stop after one search
+    assert fc.pending_levels(store)
+    fast = _FakeZenith(people, number="exact", name="prefix",
+                       honours=("form", "PageSize"))
+    fc.probe_page_limit(fast, store, stop=threading.Event(), level="Silver")
+    before = fast.searches
+    fc.collect(fast, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 2_000
+    assert fast.searches - before <= 4             # one per level, at most

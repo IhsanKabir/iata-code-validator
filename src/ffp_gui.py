@@ -23,6 +23,7 @@ FFP_MSG_PROGRESS = "ffp_progress"    # payload: ffp_collect.Progress
 FFP_MSG_DONE = "ffp_done"            # payload: ffp_collect.Progress
 FFP_MSG_ERROR = "ffp_error"          # payload: str
 FFP_MSG_EXPORTED = "ffp_exported"    # payload: (path, rows)
+FFP_MSG_LIMIT = "ffp_limit"          # payload: dict found, or None
 
 _TITLE = "FFP Customers"
 
@@ -146,6 +147,9 @@ class FFPMixin:
         self.btn_ffp_open.pack(side="left", padx=(8, 0))
         ttk.Button(ctl, text="Start over", command=self._ffp_reset
                    ).pack(side="left", padx=(8, 0))
+        self.btn_ffp_limit = ttk.Button(ctl, text="Test the 50 limit",
+                                        command=self._ffp_test_limit)
+        self.btn_ffp_limit.pack(side="left", padx=(8, 0))
 
         self.ffp_status = ttk.Label(parent, text="Sign in to Zenith above, "
                                     "then press Collect.", style="Hint.TLabel")
@@ -263,6 +267,41 @@ class FFPMixin:
             self._post(FFP_MSG_ERROR, f"{type(exc).__name__}: {exc}  "
                                       "Progress so far is kept.")
 
+    def _ffp_test_limit(self) -> None:
+        """Does Zenith list more than 50 rows if a search asks for 5000?"""
+        if self._ffp_busy():
+            messagebox.showinfo(_TITLE, "Stop the collection first.")
+            return
+        if getattr(self, "_zenith_session", None) is None:
+            messagebox.showerror(_TITLE, "Sign in to Zenith first (top of "
+                                         "this tab).")
+            return
+        self._ffp_stop.clear()
+        self.ffp_warning.configure(text="")
+        for b in (self.btn_ffp_run, self.btn_ffp_limit):
+            b.configure(state="disabled")
+        self.btn_ffp_stop.configure(state="normal")
+        self._ffp_log("Testing whether Zenith lists more than 50 rows — "
+                      "about 40 searches…")
+
+        def work() -> None:
+            from . import ffp_collect as fc
+            from . import zenith_client
+            from . import zenith_ffp as zf
+            searcher = zf.FFPSearcher(self._zenith_session,
+                                      base_url=zenith_client.BASE_URL)
+            try:
+                got = fc.probe_page_limit(
+                    searcher, self._ffp_store(), stop=self._ffp_stop,
+                    log=lambda m: self._post(FFP_MSG_LOG, m))
+                self._post(FFP_MSG_LIMIT, got)
+            except Exception as exc:         # noqa: BLE001
+                log.exception("FFP limit test failed")
+                self._post(FFP_MSG_ERROR, f"The test stopped: {exc}")
+
+        self._ffp_worker = threading.Thread(target=work, daemon=True)
+        self._ffp_worker.start()
+
     def _ffp_stop_clicked(self) -> None:
         self._ffp_stop.set()
         self.btn_ffp_stop.configure(state="disabled")
@@ -341,6 +380,7 @@ class FFPMixin:
 
     def _ffp_finish(self) -> None:
         self.btn_ffp_run.configure(state="normal")
+        self.btn_ffp_limit.configure(state="normal")
         self.btn_ffp_stop.configure(state="disabled")
         self.btn_ffp_export.configure(state="normal")
 
@@ -378,6 +418,18 @@ class FFPMixin:
             if self._ffp_store_path().is_file():
                 from . import ffp_collect as fc
                 self._ffp_render(fc.progress_of(self._ffp_store()))
+        elif kind == FFP_MSG_LIMIT:
+            self._ffp_finish()
+            from . import ffp_collect as fc
+            self._ffp_render(fc.progress_of(self._ffp_store()))
+            if payload:
+                self._ffp_log(
+                    f"Zenith lists up to {payload['listed']:,} rows when "
+                    f"asked ({payload['name']}). Press Collect — whole "
+                    f"levels now come in one search.")
+            else:
+                self._ffp_log("Zenith lists 50 rows whatever is asked — "
+                              "the limit cannot be lifted from here.")
         elif kind == FFP_MSG_EXPORTED:
             path, rows = payload
             self._ffp_last_path = path
