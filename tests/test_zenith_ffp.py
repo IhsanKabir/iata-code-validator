@@ -650,7 +650,7 @@ def test_pruning_saves_searches_and_misses_no_one(tmp_path):
     fc.collect(fast, pruned, stop=threading.Event(), delay_s=0)
 
     full = fc.FFPStore(tmp_path / "b.sqlite")
-    full.put("prune_off", "1")
+    full.put("prune_disabled", "1")
     slow = _FakeZenith(people, number="exact", name="fullname")
     fc.collect(slow, full, stop=threading.Event(), delay_s=0)
 
@@ -686,3 +686,33 @@ def test_still_to_search_counts_only_the_levels_being_collected(store):
     store.seed(["Gold|A", "Gold|B", "Silver|A", "Silver|B", "Silver|C"])
     assert fc.progress_of(store, levels=["Gold"]).pending == 2
     assert fc.progress_of(store).pending == 5
+
+
+def test_one_odd_count_does_not_switch_pruning_off(store):
+    """On the live run one name start of 6,107 had a collected count above
+    Zenith's -- a duplicate record -- and that alone switched pruning off."""
+    store.put("mode", "name")
+    store.seed(["Titanium|Abc def ghi", "Titanium|Abc"])
+    store.mark("Titanium|Abc def ghi", fc.DONE, 1)
+    store.mark("Titanium|Abc", fc.SPLIT, 60)
+    twins = [zf.FFPMember(str(n), str(n), "Abc", "Def ghi", "", "", "", "",
+                          "Titanium", "0") for n in (1, 2)]
+    store.save_members(twins)
+    store.put("prune_off", "1")
+    assert fc.recheck_pruning(store) == 1
+    assert store.get("prune_off") == "0"
+    # the odd name start and those above it are never pruned
+    store.seed(["Titanium|Abcx"])
+    assert fc.prune_all(store) == 0
+
+
+def test_many_odd_counts_do_switch_pruning_off(store):
+    store.put("mode", "name")
+    for i in range(fc.MAX_DISAGREE + 1):
+        p = f"Gold|Zz{i}"
+        store.seed([p])
+        store.mark(p, fc.DONE, 0)
+        store.save_members([zf.FFPMember(f"9{i}", f"9{i}", f"Zz{i}", "A",
+                                         "", "", "", "", "Gold", "0")])
+    assert fc.recheck_pruning(store) == fc.MAX_DISAGREE + 1
+    assert store.get("prune_off") == "1"

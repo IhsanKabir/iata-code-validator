@@ -634,14 +634,17 @@ def prune_all(store: FFPStore) -> int:
     """One sweep over every over-full name start already searched: any now
     fully collected has its queued searches dropped. Run when a collection
     starts, so a queue built before pruning existed is trimmed at once."""
-    if store.get("mode") != NAME or store.get("prune_off") == "1"             or store.get("case") == "1":
+    if store.get("mode") != NAME or _pruning_off(store):
         return 0
     with store._lock:
         split = store.con.execute(
             "SELECT prefix, total FROM frontier WHERE state=? "
             "ORDER BY length(prefix)", (SPLIT,)).fetchall()
+    bad = _bad_prefixes(store)
     dropped = 0
     for prefix, total in split:
+        if _near_bad(prefix, bad):
+            continue
         level, part = prefix.split("|", 1)
         if total > 0 and store.local_count(level, part) >= total:
             dropped += store.close_subtree(prefix)
@@ -679,6 +682,49 @@ def _parent(prefix: str):
     return f"{level}|{part[:-2] if part[-2] == ' ' else part[:-1]}"
 
 
+#: Name starts where the collected count came out above Zenith's that are
+#: tolerated before pruning is switched off. One real case on the live run
+#: (6,107 searches) was a single duplicate record, not a wrong rule.
+MAX_DISAGREE = 5
+
+
+def _pruning_off(store: FFPStore) -> bool:
+    """Off when switched off on purpose ('prune_disabled', never reset),
+    when too many counts disagreed ('prune_off', re-derived each run), or
+    when names are case-sensitive (counts are made case-blind)."""
+    return (store.get("prune_disabled") == "1"
+            or store.get("prune_off") == "1" or store.get("case") == "1")
+
+
+def _bad_prefixes(store: FFPStore) -> list:
+    raw = store.get("prune_bad")
+    return json.loads(raw) if raw else []
+
+
+def _near_bad(node: str, bad) -> bool:
+    """`node` is, or is above, a name start whose count cannot be trusted --
+    its own count may be inflated by the same member."""
+    return any(b.startswith(node) for b in bad)
+
+
+def recheck_pruning(store: FFPStore) -> int:
+    """Re-derive which name starts disagree with Zenith from every search
+    done so far, and switch pruning on or off accordingly. Returns how many
+    disagree."""
+    if store.get("mode") != NAME:
+        return 0
+    with store._lock:
+        rows = store.con.execute(
+            "SELECT prefix, total FROM frontier WHERE state IN (?, ?) "
+            "AND total >= 0 AND instr(prefix, '|') > 0",
+            (DONE, SPLIT)).fetchall()
+    bad = [p for p, t in rows
+           if store.local_count(*p.split("|", 1)) > t]
+    store.put("prune_bad", json.dumps(bad))
+    store.put("prune_off", "1" if len(bad) > MAX_DISAGREE else "0")
+    return len(bad)
+
+
 def _prune(store: FFPStore, prefix: str, total: int, log) -> None:
     """Drop queued searches under any name start already fully collected.
 
@@ -689,17 +735,23 @@ def _prune(store: FFPStore, prefix: str, total: int, log) -> None:
     ever exceeds Zenith's, that premise is wrong and pruning is switched off
     for good.
     """
-    if store.get("prune_off") == "1" or store.get("case") == "1":
+    if _pruning_off(store):
         return
     level, part = prefix.split("|", 1)
+    bad = _bad_prefixes(store)
     if total >= 0 and store.local_count(level, part) > total:
-        store.put("prune_off", "1")
-        log("Pruning switched off: Zenith's name matching is not what it "
-            "seemed, so every search is kept.")
+        bad.append(prefix)
+        store.put("prune_bad", json.dumps(bad))
+        if len(bad) > MAX_DISAGREE:
+            store.put("prune_off", "1")
+            log("Pruning switched off: Zenith's name matching is not what "
+                "it seemed, so every search is kept.")
         return
     node = prefix
     dropped = 0
     while node is not None:
+        if _near_bad(node, bad):
+            break                # its count may be inflated: never prune it
         state, t = store.state_of(node)
         if state == SPLIT:
             if store.local_count(level, node.split("|", 1)[1]) < t:
@@ -744,6 +796,12 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
                 f"spaces (Zenith ignores a trailing space).")
     if store.get("mode") == NAME and store.get("digit_fix") != "1":
         add_digit_starts(store)
+    if store.get("mode") == NAME:
+        odd = recheck_pruning(store)
+        if odd:
+            log(f"{odd} name start(s) disagree with Zenith's count -- left "
+                f"unpruned" + (", and pruning is off." if odd > MAX_DISAGREE
+                               else "; pruning stays on elsewhere."))
     swept = prune_all(store)
     if swept:
         log(f"Skipped {swept:,} queued searches under name starts already "
