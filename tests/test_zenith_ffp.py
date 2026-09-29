@@ -1,0 +1,273 @@
+"""The FFP account search and the collection built on it.
+
+Pages are built in the structure captured from Zenith's
+CustomerAccount/IframeSearch, with invented members -- no real customer
+appears here.
+"""
+import threading
+
+import pytest
+from openpyxl import load_workbook
+
+from src import ffp_collect as fc
+from src import zenith_ffp as zf
+
+
+def _row(num, level="Silver", miles="0", last="Testsurname",
+         first="Testfirst"):
+    return (
+        '<tr class="customerRow">'
+        f'<input class="idCustomer" id="idCustomer" name="idCustomer" '
+        f'type="hidden" value="{num}" />'
+        f'<input class="customerFullName" id="customerFullName" '
+        f'name="customerFullName" type="hidden" value="{first} {last}" />'
+        '<td> <span class="label label-default"> <a style="color: white" '
+        f'href="/x/TravelAgency.ashx?IdCustomer={num}" target="_blank">{num}'
+        '</a> <span class="glyphicon glyphicon-comment" /> </span> </td>'
+        f'<td><span class="surname">{last}</span></td>'
+        f'<td><span class="firstname">{first} </span></td>'
+        '<td> <span class="birthdate">01/01/1990</span> </td>'
+        '<td style="width: 125px"><span class="email">a@example.test</span></td>'
+        '<td><span class="phone">+8800000000000</span></td>'
+        '<td><span class="documentId">X0000000</span></td>'
+        f'<td><span>{level}</span></td>'
+        f'<td><span>{miles}</span></td>'
+        '<td><button class="selectFFPCustomer">Select</button></td>'
+        '</tr>')
+
+
+def _page(rows, total=None, token="tok"):
+    total = len(rows) if total is None else total
+    note = ("<div> Results list not displaying all results. Please restrict "
+            "your search criterias. </div>") if total > len(rows) else ""
+    return (
+        '<html><body><form action="/Zenith/x/CustomerAccount/IframeSearch" '
+        'id="formIframeSearch" method="post">'
+        f'<input name="__RequestVerificationToken" type="hidden" '
+        f'value="{token}" /></form>'
+        '<li class="active"><a href="#ffpSearchResults">FFP Results '
+        f'<span class="badge">{total}</span></a></li>{note}'
+        '<table id="results"><tbody>' + "".join(rows) +
+        "</tbody></table></body></html>")
+
+
+# ---- reading the page -------------------------------------------------------
+
+def test_a_member_row_is_read_column_by_column():
+    page = zf.parse_search_results(_page([_row("12382185", "Gold", "70")]))
+    m = page.members[0]
+    assert (m.ffp_number, m.customer_id, m.level, m.miles) == \
+        ("12382185", "12382185", "Gold", "70")
+    assert (m.last_name, m.first_name) == ("Testsurname", "Testfirst")
+    assert m.birth_date == "01/01/1990" and m.id_number == "X0000000"
+
+
+def test_the_badge_is_the_full_count_even_when_only_50_are_listed():
+    """As captured: 'FFP Results 119847', 50 rows, and a warning."""
+    rows = [_row(str(10000000 + i)) for i in range(50)]
+    page = zf.parse_search_results(_page(rows, total=119847))
+    assert page.total == 119847 and len(page.members) == 50
+    assert page.truncated and not page.complete
+
+
+def test_a_small_search_is_complete():
+    page = zf.parse_search_results(_page([_row("1"), _row("2")]))
+    assert page.complete and page.total == 2
+
+
+def test_an_error_page_is_not_mistaken_for_no_results():
+    with pytest.raises(zf.FFPSearchError):
+        zf.parse_search_results("<html>504 Gateway Timeout</html>")
+
+
+def test_the_security_token_is_read():
+    assert zf.parse_token(_page([])) == "tok"
+    with pytest.raises(zf.FFPSearchError):
+        zf.parse_token("<html></html>")
+
+
+# ---- collecting -------------------------------------------------------------
+
+class _FakeZenith:
+    """An FFP search over invented members, with Zenith's 50-row limit.
+
+    `mode` is how the FFP number field matches: 'prefix', 'contains', or
+    'exact' (whole numbers only).
+    """
+
+    def __init__(self, members, mode="prefix"):
+        self.members = members
+        self.mode = mode
+        self.searches = 0
+        self.calls = []
+
+    def _hit(self, num, q):
+        return {"prefix": num.startswith(q), "contains": q in num,
+                "exact": num == q}[self.mode]
+
+    def search(self, *, level="", ffp_number="", **_):
+        self.searches += 1
+        self.calls.append((level, ffp_number))
+        hits = [m for m in self.members
+                if (not level or m.level == level)
+                and (not ffp_number or self._hit(m.ffp_number, ffp_number))]
+        return zf.SearchPage(total=len(hits), members=tuple(hits[:50]),
+                             truncated=len(hits) > 50)
+
+
+def _members(n, start=10_000_000, step=7):
+    levels = ["Silver"] * 17 + ["Gold"] * 2 + ["Platinum"]
+    return [zf.FFPMember(str(start + i * step), str(start + i * step),
+                         "S", "F", "", "", "", "", levels[i % 20], "0")
+            for i in range(n)]
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = fc.FFPStore(tmp_path / "ffp.sqlite")
+    yield s
+    s.close()
+
+
+@pytest.mark.parametrize("mode", ["prefix", "contains"])
+def test_every_member_is_collected_past_the_50_row_limit(store, mode):
+    people = _members(1_234)
+    fake = _FakeZenith(people, mode)
+    got = fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert got.members == len(people)
+    assert store.member_count() == 1_234
+    assert store.get("finished") == "1"
+
+
+def test_the_level_counts_are_kept_to_check_the_list_against(store):
+    people = _members(400)
+    fc.collect(_FakeZenith(people), store, stop=threading.Event(), delay_s=0)
+    totals = store.level_totals()
+    assert totals["Silver"] == sum(m.level == "Silver" for m in people)
+    assert store.counts_by_level()["Silver"] == totals["Silver"]
+    assert totals["Titanium"] == 0
+
+
+def test_whole_number_matching_stops_the_run_instead_of_a_partial_list(store):
+    with pytest.raises(fc.PartialMatchUnsupported):
+        fc.collect(_FakeZenith(_members(300), "exact"), store,
+                   stop=threading.Event(), delay_s=0)
+    assert store.get("finished") != "1"
+
+
+def test_stop_keeps_progress_and_the_next_run_carries_on(store):
+    people = _members(900)
+    fake = _FakeZenith(people)
+    stop = threading.Event()
+    seen = []
+
+    def halt_after_five(p):
+        seen.append(p)
+        if len(seen) == 5:
+            stop.set()
+
+    fc.collect(fake, store, stop=stop, on_progress=halt_after_five, delay_s=0)
+    assert store.get("finished") == "0"
+    finished = {p for p, in store.con.execute(
+        "SELECT prefix FROM frontier WHERE state != 'pending'")}
+    assert finished
+
+    again = _FakeZenith(people)
+    fc.collect(again, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 900
+    # the level check is not repeated, and finished searches are not redone
+    assert not any(level for level, _ in again.calls)
+    assert not finished & {num for _, num in again.calls}
+
+
+def test_the_workbook_lists_every_member_and_checks_the_counts(store,
+                                                               tmp_path):
+    people = _members(120)
+    fc.collect(_FakeZenith(people), store, stop=threading.Event(), delay_s=0)
+    out = tmp_path / "ffp.xlsx"
+    assert fc.export_workbook(store, out) == 120
+    wb = load_workbook(out, read_only=True)
+    assert wb.sheetnames == ["Summary", "Members"]
+    rows = list(wb["Members"].iter_rows(values_only=True))
+    assert rows[0][0] == "FFP number" and len(rows) == 121
+    summary = [r for r in wb["Summary"].iter_rows(values_only=True) if r]
+    assert "CONFIDENTIAL" in summary[0][0]
+    silver = next(r for r in summary if r[0] == "Silver")
+    assert silver[1] == silver[2] and silver[3] == 0
+    assert ("Collection", "complete") in [tuple(r[:2]) for r in summary]
+
+
+def test_start_over_clears_everything(store):
+    fc.collect(_FakeZenith(_members(60)), store, stop=threading.Event(),
+               delay_s=0)
+    store.reset()
+    assert store.member_count() == 0 and store.get("partial_ok") == ""
+
+
+# ---- talking to Zenith ------------------------------------------------------
+
+class _Resp:
+    def __init__(self, text, status=200, url="https://z.test/x"):
+        self.text, self.status_code, self.url = text, status, url
+
+
+class _HttpStub:
+    """Stands in for requests.Session: GETs answer PollSession and the
+    empty form; POSTs pop the next scripted response."""
+
+    def __init__(self, posts, poll_ok=True):
+        self.posts = list(posts)
+        self.poll_ok = poll_ok
+        self.sent = []
+        self.gets = []
+
+    def get(self, url, **_):
+        self.gets.append(url)
+        if "PollSession" in url:
+            return _Resp("PollSession Successful." if self.poll_ok else "no")
+        return _Resp(_page([], token="form-token"))
+
+    def post(self, url, data=None, **_):
+        self.sent.append(dict(data))
+        return self.posts.pop(0)
+
+
+class _Session:
+    def __init__(self, http):
+        self.session = http
+        self.state_values = {"ID_ADMIN": "1", "ID_SOCIETE": "2"}
+
+
+def _searcher(posts, **kw):
+    http = _HttpStub(posts, **kw)
+    return zf.FFPSearcher(_Session(http), base_url="https://z.test"), http
+
+
+def test_a_search_opens_the_modern_session_and_sends_the_form_token(
+        monkeypatch):
+    s, http = _searcher([_Resp(_page([_row("1")], token="next"))])
+    page = s.search(level="Gold")
+    assert page.total == 1
+    assert any("PollSession?idUser=1&idCompany=2" in u for u in http.gets)
+    assert http.sent[0]["__RequestVerificationToken"] == "form-token"
+    assert http.sent[0]["LevelName"] == "Gold"
+
+
+def test_a_timeout_is_retried(monkeypatch):
+    monkeypatch.setattr(zf.time, "sleep", lambda _s: None)
+    s, http = _searcher([_Resp("gateway", status=504),
+                         _Resp(_page([_row("1")]))])
+    assert s.search(ffp_number="1").total == 1 and len(http.sent) == 2
+
+
+def test_a_lost_modern_session_is_reopened_once(monkeypatch):
+    s, http = _searcher([_Resp("<html>ERROR PAGE</html>"),
+                         _Resp(_page([_row("1")]))])
+    assert s.search(ffp_number="1").total == 1
+    assert sum("PollSession" in u for u in http.gets) == 2
+
+
+def test_a_session_zenith_refuses_asks_for_a_new_sign_in():
+    s, _ = _searcher([], poll_ok=False)
+    with pytest.raises(zf.FFPSessionError):
+        s.search(level="Gold")

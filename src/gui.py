@@ -45,6 +45,7 @@ from . import (
     zenith_loads_index, zenith_pnr_client, zenith_pnr_history_analyzer,
     zenith_pnr_history_downloader,
 )
+from .ffp_gui import FFPMixin
 from .health_gui import HealthMixin
 from .mailer_log import MailerLog
 from .traffic_sources import SOURCES as TRAFFIC_SOURCES
@@ -273,7 +274,7 @@ _USAGE_ERRORS: "dict[str, str]" = {
 }
 
 
-class App(WhatsAppMixin, HealthMixin):
+class App(WhatsAppMixin, HealthMixin, FFPMixin):
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Travel Ops Console")
@@ -4214,6 +4215,8 @@ class App(WhatsAppMixin, HealthMixin):
             return
         if kind.startswith("health_") and self._health_handle_msg(kind, payload):
             return
+        if kind.startswith("ffp_") and self._ffp_handle_msg(kind, payload):
+            return
         # Central usage telemetry — fire for any registered completion message
         # before the feature-specific handling, so a handler that raises can't
         # swallow the event. Best-effort; never affects the UI.
@@ -6059,6 +6062,7 @@ class App(WhatsAppMixin, HealthMixin):
         self.zenith_inner_notebook = inner_nb
         inner_nb.pack(fill="both", expand=True, padx=4, pady=(8, 0))
         customer_inner = ttk.Frame(inner_nb)
+        ffp_inner = ttk.Frame(inner_nb)
         flight_inner = ttk.Frame(inner_nb)
         history_inner = ttk.Frame(inner_nb)
         pnr_bulk_inner = ttk.Frame(inner_nb)
@@ -6068,6 +6072,7 @@ class App(WhatsAppMixin, HealthMixin):
         route_inner = ttk.Frame(inner_nb)
         reports_inner = ttk.Frame(inner_nb)
         inner_nb.add(customer_inner, text="Customer Lookup")
+        inner_nb.add(ffp_inner, text="FFP Customers")
         inner_nb.add(flight_inner, text="Flight Loads")
         inner_nb.add(history_inner, text="Flight History Analyzer")
         inner_nb.add(pnr_bulk_inner, text="PNR Bulk Lookup")
@@ -6076,6 +6081,7 @@ class App(WhatsAppMixin, HealthMixin):
         inner_nb.add(movement_inner, text="Sales Movement")
         inner_nb.add(route_inner, text="Route Optimisation")
         inner_nb.add(reports_inner, text="Reports")
+        self._build_zenith_ffp_tab(ffp_inner)
         self._build_zenith_history_tab(history_inner)
         self._build_zenith_pnr_bulk_tab(pnr_bulk_inner)
         self._build_zenith_counter_tab(counter_inner)

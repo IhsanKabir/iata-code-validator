@@ -507,3 +507,31 @@ def test_a_failed_route_run_keeps_its_reason_on_the_tab(app, monkeypatch):
     app._handle_msg("ro_error", "No stored market schedule was found.")
     assert "No stored market schedule" in str(
         app.zenith_ro_warning.cget("text"))
+
+
+def test_the_ffp_tab_is_built_beside_customer_lookup(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    tabs = [app.zenith_inner_notebook.tab(t, "text")
+            for t in app.zenith_inner_notebook.tabs()]
+    assert tabs[:2] == ["Customer Lookup", "FFP Customers"]
+    assert str(app.btn_ffp_run.cget("text")) == "Collect FFP members"
+
+
+def test_ffp_collect_asks_for_a_sign_in_first(app, monkeypatch):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    monkeypatch.setattr(app, "_zenith_session", None, raising=False)
+    shown = {}
+    monkeypatch.setattr("src.ffp_gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app._ffp_run()
+    assert "Sign in to Zenith" in shown.get("msg", "")
+
+
+def test_an_ffp_failure_keeps_its_reason_on_the_tab(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    app._handle_msg("ffp_error", "Zenith signed the session out.")
+    assert "signed the session out" in str(app.ffp_warning.cget("text"))
+    assert str(app.btn_ffp_run.cget("state")) == "normal"
