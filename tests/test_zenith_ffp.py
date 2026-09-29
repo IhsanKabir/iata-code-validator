@@ -88,38 +88,60 @@ def test_the_security_token_is_read():
 
 # ---- collecting -------------------------------------------------------------
 
+def _match(value, q, how):
+    """How a fake field matches: 'prefix', 'contains', 'exact', or the
+    same three needing a trailing '%' before they match partly."""
+    if how.endswith("%"):
+        if not q.endswith("%"):
+            return value == q
+        q, how = q[:-1], how[:-1]
+    return {"prefix": value.startswith(q), "contains": q in value,
+            "exact": value == q}[how]
+
+
 class _FakeZenith:
     """An FFP search over invented members, with Zenith's 50-row limit.
 
-    `mode` is how the FFP number field matches: 'prefix', 'contains', or
-    'exact' (whole numbers only).
+    `number` / `name` say how the FFP number and last name fields match
+    (see _match); `case` whether last names are case-sensitive.
     """
 
-    def __init__(self, members, mode="prefix"):
+    def __init__(self, members, number="prefix", name="exact", case=False):
         self.members = members
-        self.mode = mode
+        self.number, self.name, self.case = number, name, case
         self.searches = 0
         self.calls = []
 
-    def _hit(self, num, q):
-        return {"prefix": num.startswith(q), "contains": q in num,
-                "exact": num == q}[self.mode]
-
-    def search(self, *, level="", ffp_number="", **_):
+    def search(self, *, level="", ffp_number="", last_name="", **_):
         self.searches += 1
-        self.calls.append((level, ffp_number))
+        self.calls.append((level, ffp_number, last_name))
+        norm = (lambda v: v) if self.case else (lambda v: v.upper())
         hits = [m for m in self.members
                 if (not level or m.level == level)
-                and (not ffp_number or self._hit(m.ffp_number, ffp_number))]
+                and (not ffp_number
+                     or _match(m.ffp_number, ffp_number, self.number))
+                and (not last_name
+                     or _match(norm(m.last_name), norm(last_name),
+                               self.name))]
         return zf.SearchPage(total=len(hits), members=tuple(hits[:50]),
                              truncated=len(hits) > 50)
 
 
+_SYLLABLES = ["Ah", "med", "Kha", "n", "Ra", "hman", "Is", "lam", "Ho",
+              "ssain", "Chow", "dhury", "Sar", "kar", "Al Am", "in"]
+
+
 def _members(n, start=10_000_000, step=7):
     levels = ["Silver"] * 17 + ["Gold"] * 2 + ["Platinum"]
-    return [zf.FFPMember(str(start + i * step), str(start + i * step),
-                         "S", "F", "", "", "", "", levels[i % 20], "0")
-            for i in range(n)]
+    out = []
+    for i in range(n):
+        a = _SYLLABLES[(i * 3) % len(_SYLLABLES)]
+        b = _SYLLABLES[(i * 5 + 1) % len(_SYLLABLES)].lower()
+        last = f"{a}{b}{chr(97 + i % 26)}{chr(97 + (i // 26) % 26)}"
+        out.append(zf.FFPMember(str(start + i * step), str(start + i * step),
+                                last, "F", "", "", "", "", levels[i % 20],
+                                "0"))
+    return out
 
 
 @pytest.fixture
@@ -132,7 +154,7 @@ def store(tmp_path):
 @pytest.mark.parametrize("mode", ["prefix", "contains"])
 def test_every_member_is_collected_past_the_50_row_limit(store, mode):
     people = _members(1_234)
-    fake = _FakeZenith(people, mode)
+    fake = _FakeZenith(people, number=mode)
     got = fc.collect(fake, store, stop=threading.Event(), delay_s=0)
     assert got.members == len(people)
     assert store.member_count() == 1_234
@@ -148,11 +170,41 @@ def test_the_level_counts_are_kept_to_check_the_list_against(store):
     assert totals["Titanium"] == 0
 
 
-def test_whole_number_matching_stops_the_run_instead_of_a_partial_list(store):
+def test_nothing_partial_stops_the_run_instead_of_a_partial_list(store):
     with pytest.raises(fc.PartialMatchUnsupported):
-        fc.collect(_FakeZenith(_members(300), "exact"), store,
-                   stop=threading.Event(), delay_s=0)
+        fc.collect(_FakeZenith(_members(300), number="exact", name="exact"),
+                   store, stop=threading.Event(), delay_s=0)
     assert store.get("finished") != "1"
+    # the level counts are kept, so the tab can still show them
+    assert store.level_totals()["Silver"] > 0
+
+
+def test_a_number_wildcard_is_found_and_used(store):
+    """As on the live system, a plain partial number finds nothing."""
+    people = _members(700)
+    fake = _FakeZenith(people, number="prefix%")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.get("mode") == "number" and store.get("wild") == "%"
+    assert store.member_count() == 700
+
+
+@pytest.mark.parametrize("case", [False, True])
+def test_whole_numbers_only_falls_back_to_last_names(store, case):
+    people = _members(1_500)
+    fake = _FakeZenith(people, number="exact", name="prefix", case=case)
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.get("mode") == "name"
+    assert store.get("case") == ("1" if case else "0")
+    assert store.member_count() == 1_500
+    assert store.get("finished") == "1"
+
+
+def test_a_last_name_wildcard_is_found_and_used(store):
+    people = _members(600)
+    fake = _FakeZenith(people, number="exact", name="contains%")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert (store.get("mode"), store.get("wild")) == ("name", "%")
+    assert store.member_count() == 600
 
 
 def test_stop_keeps_progress_and_the_next_run_carries_on(store):
@@ -176,8 +228,8 @@ def test_stop_keeps_progress_and_the_next_run_carries_on(store):
     fc.collect(again, store, stop=threading.Event(), delay_s=0)
     assert store.member_count() == 900
     # the level check is not repeated, and finished searches are not redone
-    assert not any(level for level, _ in again.calls)
-    assert not finished & {num for _, num in again.calls}
+    assert not any(level for level, _, _ in again.calls)
+    assert not finished & {num for _, num, _ in again.calls}
 
 
 def test_the_workbook_lists_every_member_and_checks_the_counts(store,
@@ -201,7 +253,7 @@ def test_start_over_clears_everything(store):
     fc.collect(_FakeZenith(_members(60)), store, stop=threading.Event(),
                delay_s=0)
     store.reset()
-    assert store.member_count() == 0 and store.get("partial_ok") == ""
+    assert store.member_count() == 0 and store.get("mode") == ""
 
 
 # ---- talking to Zenith ------------------------------------------------------

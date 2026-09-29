@@ -294,6 +294,11 @@ class FFPMixin:
             self._ffp_finish()
             self._ffp_log("Stopped — the reason is shown below.")
             self.ffp_warning.configure(text=str(payload))
+            # what the run did learn -- the level counts at least -- stays
+            # on screen; the message refers to it
+            if self._ffp_store_path().is_file():
+                from . import ffp_collect as fc
+                self._ffp_render(fc.progress_of(self._ffp_store()))
         elif kind == FFP_MSG_EXPORTED:
             path, rows = payload
             self._ffp_last_path = path

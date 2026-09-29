@@ -535,3 +535,19 @@ def test_an_ffp_failure_keeps_its_reason_on_the_tab(app):
     app._handle_msg("ffp_error", "Zenith signed the session out.")
     assert "signed the session out" in str(app.ffp_warning.cget("text"))
     assert str(app.btn_ffp_run.cget("state")) == "normal"
+
+
+def test_an_ffp_stop_still_shows_the_level_counts(app, monkeypatch, tmp_path):
+    """The message says 'the level counts are exact' -- so they are shown."""
+    from src import ffp_collect as fc
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    path = tmp_path / "ffp.sqlite"
+    store = fc.FFPStore(path)
+    store.put("level_total:Silver", 119848)
+    monkeypatch.setattr(app, "_ffp_store_path", lambda: path)
+    monkeypatch.setattr(app, "_ffp_store_obj", store)
+    app._handle_msg("ffp_error", "Only whole numbers match.")
+    rows = [app.ffp_tree.item(i, "values") for i in app.ffp_tree.get_children()]
+    assert ("Silver", "119,848", "0", "119,848") in rows
+    store.close()
