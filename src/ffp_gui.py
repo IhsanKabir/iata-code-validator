@@ -128,6 +128,15 @@ class FFPMixin:
         ttk.Label(row, text="Silver: ~120,000 members — days of searching",
                   style="Hint.TLabel").pack(side="left")
         self._form_row(io, 3, "Levels:", row, label_width=18)
+        self.ffp_thorough = tk.BooleanVar(value=False)
+        row = ttk.Frame(io)
+        ttk.Checkbutton(row, text="Thorough", variable=self.ffp_thorough
+                        ).pack(side="left")
+        ttk.Label(row, text="  off: follow only letters seen in real names "
+                            "(found ~90% here, fast).  On: also try every "
+                            "other letter — hours more for the last few %",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(io, 4, "Search:", row, label_width=18)
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -244,12 +253,13 @@ class FFPMixin:
         self.btn_ffp_stop.configure(state="normal")
         self._ffp_log("Opening Zenith's FFP search…")
         self._ffp_worker = threading.Thread(
-            target=self._ffp_worker_run, args=(delay, workers, levels),
+            target=self._ffp_worker_run,
+            args=(delay, workers, levels, bool(self.ffp_thorough.get())),
             daemon=True)
         self._ffp_worker.start()
 
     def _ffp_worker_run(self, delay: float, workers: int = 1,
-                        levels=None) -> None:
+                        levels=None, thorough: bool = False) -> None:
         from . import ffp_collect as fc
         from . import zenith_client
         from . import zenith_ffp as zf
@@ -261,7 +271,8 @@ class FFPMixin:
                 searcher, self._ffp_store(), stop=self._ffp_stop,
                 log=lambda m: self._post(FFP_MSG_LOG, m),
                 on_progress=lambda p: self._post(FFP_MSG_PROGRESS, p),
-                delay_s=delay, workers=workers, levels=levels)
+                delay_s=delay, workers=workers, levels=levels,
+                thorough=thorough)
             self._post(FFP_MSG_DONE, got)
         except fc.PartialMatchUnsupported as exc:
             self._post(FFP_MSG_ERROR, str(exc))
@@ -407,9 +418,17 @@ class FFPMixin:
             self._ffp_finish()
             from . import ffp_collect as fc
             store = self._ffp_store()
-            left = fc.pending_levels(store)
-            chosen = [lv for lv, var in self.ffp_levels.items() if var.get()]
-            if not left:
+            chosen = self._ffp_ticked()
+            thorough = bool(self.ffp_thorough.get())
+            left = fc.pending_levels(store, fc.GUESS if thorough
+                                     else fc.SEEN)
+            guesses = fc.progress_of(store, levels=chosen).pending
+            if not thorough and not set(left) & set(chosen) and guesses:
+                self._ffp_log(
+                    f"Quick pass complete for {', '.join(chosen)} — press "
+                    f"Export to Excel. {guesses:,} other searches remain; "
+                    f"tick Thorough to try them (slow, few finds).")
+            elif not left:
                 self._ffp_log("Collection complete — press Export to Excel.")
             elif not set(left) & set(chosen):
                 self._ffp_log(f"{', '.join(chosen)} complete — press Export "

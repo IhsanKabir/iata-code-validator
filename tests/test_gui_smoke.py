@@ -607,3 +607,8 @@ def test_the_status_says_which_level_is_being_collected(app, monkeypatch):
     app._handle_msg("ffp_progress", fc.Progress(members=1, searches=1,
                                                 last="Titanium|Ak: 16"))
     assert "Collecting Titanium" in str(app.ffp_status.cget("text"))
+
+
+def test_the_ffp_tab_runs_quick_unless_thorough_is_ticked(app, monkeypatch):
+    _unlock_ffp(app, monkeypatch)
+    assert app.ffp_thorough.get() is False

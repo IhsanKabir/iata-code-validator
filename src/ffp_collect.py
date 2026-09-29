@@ -47,6 +47,11 @@ DIGITS = "0123456789"
 MAX_DIGITS = 12
 
 PENDING, DONE, SPLIT, CAPPED = "pending", "done", "split", "capped"
+#: Search priority. SEEN: a starting character, a number, or a next letter
+#: some collected member's name actually continues with. GUESS: any other
+#: possible next letter -- on the live run nine in ten found no one, and
+#: after the seen ones were done the guesses added under 1%.
+SEEN, GUESS = 0, 1
 #: Taken by a worker and not yet answered. A run that stops leaves these
 #: behind; the next run hands them out again.
 RUNNING = "running"
@@ -246,19 +251,20 @@ class FFPStore:
         return (f" AND rank IN ({', '.join('?' * len(ranks))})",
                 tuple(ranks))
 
-    def next_pending(self, levels=None):
+    def next_pending(self, levels=None, max_prio: int = GUESS):
+        """The next search to run. `max_prio` SEEN skips the guesses."""
         where, args = self._level_filter(levels)
         with self._lock:
             row = self.con.execute(
-                "SELECT prefix FROM frontier WHERE state=?" + where
-                + " ORDER BY rank, prio, depth, prefix LIMIT 1",
-                (PENDING, *args)).fetchone()
+                "SELECT prefix FROM frontier WHERE state=? AND prio <= ?"
+                + where + " ORDER BY rank, prio, depth, prefix LIMIT 1",
+                (PENDING, max_prio, *args)).fetchone()
         return row[0] if row else None
 
-    def claim_next(self, levels=None):
+    def claim_next(self, levels=None, max_prio: int = GUESS):
         """Hand one pending search to a worker, so no two take the same."""
         with self._lock:
-            prefix = self.next_pending(levels)
+            prefix = self.next_pending(levels, max_prio)
             if prefix is not None:
                 self.con.execute("UPDATE frontier SET state=? WHERE prefix=?",
                                  (RUNNING, prefix))
@@ -286,14 +292,15 @@ class FFPStore:
                 "SELECT count(*) FROM frontier WHERE state=?",
                 (RUNNING,)).fetchone()[0]
 
-    def frontier_counts(self, levels=None) -> dict:
+    def frontier_counts(self, levels=None, max_prio: int = GUESS) -> dict:
         """Searches by state -- for `levels` only, when given, so levels not
-        being collected (Silver, unticked) do not swell 'still to search'."""
+        being collected (Silver, unticked) do not swell 'still to search';
+        and up to `max_prio`, so a quick run does not count the guesses."""
         where, args = self._level_filter(levels)
         with self._lock:
             return dict(self.con.execute(
-                "SELECT state, count(*) FROM frontier WHERE 1=1" + where
-                + " GROUP BY state", args))
+                "SELECT state, count(*) FROM frontier WHERE prio <= ?"
+                + where + " GROUP BY state", (max_prio, *args)))
 
     def capped(self) -> list:
         with self._lock:
@@ -323,8 +330,10 @@ class Progress:
 
 
 def progress_of(store: FFPStore, searches: int = 0, last: str = "",
-                levels=None) -> Progress:
-    fc = store.frontier_counts(levels)
+                levels=None, max_prio: int = None) -> Progress:
+    if max_prio is None:
+        max_prio = GUESS
+    fc = store.frontier_counts(levels, max_prio)
     return Progress(members=store.member_count(), searches=searches,
                     pending=fc.get(PENDING, 0) + fc.get(RUNNING, 0),
                     done=(fc.get(DONE, 0) + fc.get(SPLIT, 0)
@@ -419,7 +428,7 @@ def _choose_method(searcher, store: FFPStore, log) -> None:
     if wild is not None:
         store.put("mode", NUMBER)
         store.put("wild", wild)
-        store.seed(DIGITS)
+        store.seed(DIGITS, prio=SEEN)
         log("Narrowing by FFP number" + (f" (with '{wild}')" if wild else "")
             + ".")
         return
@@ -441,7 +450,7 @@ def _choose_method(searcher, store: FFPStore, log) -> None:
     totals = store.level_totals()
     for level in zf.LEVELS:
         if totals.get(level, 0) > zf.PAGE_CAP:
-            store.seed(f"{level}|{c}" for c in first)
+            store.seed((f"{level}|{c}" for c in first), prio=SEEN)
     log("Narrowing by last name within each level"
         + (f" (with '{wild}')" if wild else "")
         + (", case-sensitive" if case_sensitive else "") + ".")
@@ -499,7 +508,7 @@ def add_digit_starts(store: FFPStore) -> None:
     totals = store.level_totals()
     for level in zf.LEVELS:
         if totals.get(level, 0) > zf.PAGE_CAP:
-            store.seed(f"{level}|{d}" for d in _FIRST_EXTRA)
+            store.seed((f"{level}|{d}" for d in _FIRST_EXTRA), prio=SEEN)
     store.put("digit_fix", "1")
 
 
@@ -620,14 +629,60 @@ def _one_search(searcher, store: FFPStore, prefix: str, log):
     else:
         store.save_members(page.members)
         kids = _children(store, prefix)
-        seen = (_seen_children(prefix, page.members, kids)
-                if store.get("mode") == NAME else set())
-        store.seed(seen, prio=0)
-        store.seed(k for k in kids if k not in seen)
+        if store.get("mode") == NAME:
+            seen = _seen_children(prefix, page.members, kids)
+            store.seed(seen, prio=SEEN)
+            store.seed((k for k in kids if k not in seen), prio=GUESS)
+        else:
+            store.seed(kids, prio=SEEN)      # every digit is a real branch
         store.mark(prefix, SPLIT, page.total)
     if store.get("mode") == NAME:
         _prune(store, prefix, page.total, log)
     return page
+
+
+def reprioritise(store: FFPStore) -> int:
+    """Re-rank the queue from every member collected so far.
+
+    Starting characters and number searches are never guesses. Beyond that,
+    a queued name start is SEEN when some collected member's "surname
+    firstname" continues into it -- more evidence than the 50 rows its
+    parent listed, and the only evidence a queue saved before priorities
+    existed has. Returns how many searches were marked seen.
+    """
+    with store._lock:
+        store.con.execute(
+            "UPDATE frontier SET prio=? WHERE instr(prefix, '|') = 0 OR "
+            "length(prefix) - instr(prefix, '|') = 1", (SEEN,))
+        split = store.con.execute(
+            "SELECT prefix FROM frontier WHERE state=? AND "
+            "instr(prefix, '|') > 0", (SPLIT,)).fetchall()
+        store.con.commit()
+    if store.get("mode") != NAME or store.get("case") == "1":
+        return 0
+    marked = 0
+    for (prefix,) in split:
+        level, part = prefix.split("|", 1)
+        want = part.lower()
+        with store._lock:
+            keys = [k for (k,) in store.con.execute(
+                "SELECT fullkey FROM members WHERE level=? AND fullkey > ? "
+                "AND fullkey < ?", (level, want, want + "\uffff"))]
+        units = set()
+        for key in keys:
+            nxt = key[len(want):len(want) + 1]
+            if nxt == " ":
+                nxt = key[len(want):len(want) + 2]
+            if nxt.strip():
+                units.add(prefix + nxt)
+        if units:
+            with store._lock:
+                cur = store.con.executemany(
+                    "UPDATE frontier SET prio=? WHERE prefix=? AND prio != ?",
+                    [(SEEN, u, SEEN) for u in units])
+                marked += cur.rowcount
+                store.con.commit()
+    return marked
 
 
 def prune_all(store: FFPStore) -> int:
@@ -766,11 +821,11 @@ def _prune(store: FFPStore, prefix: str, total: int, log) -> None:
             f"collected.")
 
 
-def pending_levels(store: FFPStore) -> list:
+def pending_levels(store: FFPStore, max_prio: int = GUESS) -> list:
     """Levels that still have searches to run, in collection order."""
     left = []
     for level in LEVEL_ORDER:
-        if store.next_pending([level]) is not None:
+        if store.next_pending([level], max_prio) is not None:
             left.append(level)
     return left
 
@@ -778,11 +833,12 @@ def pending_levels(store: FFPStore) -> list:
 def collect(searcher, store: FFPStore, *, stop: threading.Event,
             log=lambda _m: None, on_progress=lambda _p: None,
             delay_s: float = 0.5, workers: int = 1,
-            levels=None) -> Progress:
+            levels=None, thorough: bool = True) -> Progress:
     """Collect members into `store`, carrying on from any earlier run.
 
     `levels` limits the run to those levels (None: all), taken in
-    LEVEL_ORDER -- the small levels first. `workers` searches run at once,
+    LEVEL_ORDER -- the small levels first. Without `thorough`, only SEEN
+    searches run: the guesses are kept in the queue for a thorough run. `workers` searches run at once,
     each claiming its own, so waiting on Zenith overlaps. The first error
     stops every worker; the search it was on goes back in the queue.
     """
@@ -802,11 +858,13 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
             log(f"{odd} name start(s) disagree with Zenith's count -- left "
                 f"unpruned" + (", and pruning is off." if odd > MAX_DISAGREE
                                else "; pruning stays on elsewhere."))
+    reprioritise(store)
     swept = prune_all(store)
     if swept:
         log(f"Skipped {swept:,} queued searches under name starts already "
             f"fully collected.")
     _refresh_levels(searcher, store, levels, log)
+    max_prio = GUESS if thorough else SEEN
     errors: list = []
     failures = {"in_a_row": 0}
     lock = threading.Lock()
@@ -817,7 +875,7 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
 
     def work() -> None:
         while not stop.is_set():
-            prefix = store.claim_next(levels)
+            prefix = store.claim_next(levels, max_prio)
             if prefix is None:
                 if store.running() == 0:
                     return
@@ -851,7 +909,7 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
                 failures["in_a_row"] = 0
             on_progress(progress_of(store, searcher.searches,
                                     f"{prefix}: {page.total:,}",
-                                    levels=levels))
+                                    levels=levels, max_prio=max_prio))
             if delay_s > 0:
                 stop.wait(delay_s)
 
@@ -863,9 +921,12 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
         t.join()
     store.release_running()
     store.put("finished", "1" if store.next_pending() is None else "0")
+    store.put("quick_done", "1" if store.next_pending(
+        levels, SEEN) is None else "0")
     if errors:
         raise errors[0]
-    return progress_of(store, searcher.searches, levels=levels)
+    return progress_of(store, searcher.searches, levels=levels,
+                       max_prio=max_prio)
 
 
 # ---- the workbook ---------------------------------------------------------

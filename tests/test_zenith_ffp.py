@@ -716,3 +716,41 @@ def test_many_odd_counts_do_switch_pruning_off(store):
                                          "", "", "", "", "Gold", "0")])
     assert fc.recheck_pruning(store) == fc.MAX_DISAGREE + 1
     assert store.get("prune_off") == "1"
+
+
+# ---- quick mode: seen letters only ------------------------------------------
+
+def test_a_quick_run_skips_the_guesses_and_keeps_them_queued(tmp_path):
+    people = _people(2_000)
+    quick = fc.FFPStore(tmp_path / "q.sqlite")
+    quick.put("prune_disabled", "1")      # isolate quick mode's own effect
+    fast = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(fast, quick, stop=threading.Event(), delay_s=0,
+               thorough=False)
+    thorough = fc.FFPStore(tmp_path / "t.sqlite")
+    thorough.put("prune_disabled", "1")
+    slow = _FakeZenith(people, number="exact", name="fullname")
+    fc.collect(slow, thorough, stop=threading.Event(), delay_s=0)
+    assert fast.searches < slow.searches / 3
+    assert quick.member_count() >= 0.9 * thorough.member_count()
+    assert quick.get("quick_done") == "1" and quick.get("finished") == "0"
+    # the guesses are still there for a thorough run to take up
+    fc.collect(fast, quick, stop=threading.Event(), delay_s=0)
+    assert quick.member_count() == thorough.member_count() == 2_000
+
+
+def test_a_saved_queue_is_reranked_from_the_members_collected(store):
+    store.put("mode", "name")
+    store.put("case", "0")
+    store.seed(["Silver|H", "Silver|Hossain", "Silver|Hossain m",
+                "Silver|Hossain q", "Silver|Hq"])        # all guesses
+    store.mark("Silver|H", fc.SPLIT, 90)
+    store.mark("Silver|Hossain", fc.SPLIT, 70)
+    store.save_members([zf.FFPMember("1", "1", "Hossain", "Mofiz", "", "",
+                                     "", "", "Silver", "0")])
+    fc.reprioritise(store)
+    prio = dict(store.con.execute("SELECT prefix, prio FROM frontier"))
+    assert prio["Silver|H"] == fc.SEEN              # a starting letter
+    assert prio["Silver|Hossain m"] == fc.SEEN      # a real first name
+    assert prio["Silver|Hossain q"] == fc.GUESS
+    assert prio["Silver|Hq"] == fc.GUESS
