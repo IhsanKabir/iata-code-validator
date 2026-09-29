@@ -680,3 +680,9 @@ def test_the_start_up_sweep_trims_a_queue_already_covered(store):
     assert split
     store.seed([split[0] + "qqq9", split[0] + "qqq8"])   # new, surely
     assert fc.prune_all(store) == 2
+
+
+def test_still_to_search_counts_only_the_levels_being_collected(store):
+    store.seed(["Gold|A", "Gold|B", "Silver|A", "Silver|B", "Silver|C"])
+    assert fc.progress_of(store, levels=["Gold"]).pending == 2
+    assert fc.progress_of(store).pending == 5

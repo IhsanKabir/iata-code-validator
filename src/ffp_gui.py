@@ -195,7 +195,8 @@ class FFPMixin:
             from . import ffp_collect as fc
             store = self._ffp_store()
             if store.member_count() or store.frontier_counts():
-                self._ffp_render(fc.progress_of(store))
+                self._ffp_render(fc.progress_of(
+                    store, levels=self._ffp_ticked()))
                 done = store.get("finished") == "1"
                 self._ffp_log("Collection complete — export any time."
                               if done else "An earlier collection stopped "
@@ -210,6 +211,10 @@ class FFPMixin:
             initialdir=self.ffp_output.get() or str(Path.home()))
         if got:
             self.ffp_output.set(got)
+
+    def _ffp_ticked(self) -> list:
+        return [lv for lv, var in getattr(self, "ffp_levels", {}).items()
+                if var.get()]
 
     def _ffp_busy(self) -> bool:
         return self._ffp_worker is not None and self._ffp_worker.is_alive()
@@ -394,6 +399,9 @@ class FFPMixin:
             self._ffp_log(str(payload))
         elif kind == FFP_MSG_PROGRESS:
             self._ffp_render(payload)
+            level = payload.last.split("|", 1)[0] if "|" in payload.last                 else ""
+            if level:
+                self._ffp_log(f"Collecting {level}…")
         elif kind == FFP_MSG_DONE:
             self._ffp_render(payload)
             self._ffp_finish()
@@ -418,11 +426,13 @@ class FFPMixin:
             # on screen; the message refers to it
             if self._ffp_store_path().is_file():
                 from . import ffp_collect as fc
-                self._ffp_render(fc.progress_of(self._ffp_store()))
+                self._ffp_render(fc.progress_of(self._ffp_store(),
+                                                levels=self._ffp_ticked()))
         elif kind == FFP_MSG_LIMIT:
             self._ffp_finish()
             from . import ffp_collect as fc
-            self._ffp_render(fc.progress_of(self._ffp_store()))
+            self._ffp_render(fc.progress_of(self._ffp_store(),
+                                                levels=self._ffp_ticked()))
             if payload:
                 self._ffp_log(
                     f"Zenith lists up to {payload['listed']:,} rows when "

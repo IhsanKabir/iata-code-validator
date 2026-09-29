@@ -286,10 +286,14 @@ class FFPStore:
                 "SELECT count(*) FROM frontier WHERE state=?",
                 (RUNNING,)).fetchone()[0]
 
-    def frontier_counts(self) -> dict:
+    def frontier_counts(self, levels=None) -> dict:
+        """Searches by state -- for `levels` only, when given, so levels not
+        being collected (Silver, unticked) do not swell 'still to search'."""
+        where, args = self._level_filter(levels)
         with self._lock:
             return dict(self.con.execute(
-                "SELECT state, count(*) FROM frontier GROUP BY state"))
+                "SELECT state, count(*) FROM frontier WHERE 1=1" + where
+                + " GROUP BY state", args))
 
     def capped(self) -> list:
         with self._lock:
@@ -318,8 +322,9 @@ class Progress:
         return sum(v for v in self.level_totals.values() if v > 0)
 
 
-def progress_of(store: FFPStore, searches: int = 0, last: str = "") -> Progress:
-    fc = store.frontier_counts()
+def progress_of(store: FFPStore, searches: int = 0, last: str = "",
+                levels=None) -> Progress:
+    fc = store.frontier_counts(levels)
     return Progress(members=store.member_count(), searches=searches,
                     pending=fc.get(PENDING, 0) + fc.get(RUNNING, 0),
                     done=(fc.get(DONE, 0) + fc.get(SPLIT, 0)
@@ -787,7 +792,8 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
             with lock:
                 failures["in_a_row"] = 0
             on_progress(progress_of(store, searcher.searches,
-                                    f"{prefix}: {page.total:,}"))
+                                    f"{prefix}: {page.total:,}",
+                                    levels=levels))
             if delay_s > 0:
                 stop.wait(delay_s)
 
@@ -801,7 +807,7 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
     store.put("finished", "1" if store.next_pending() is None else "0")
     if errors:
         raise errors[0]
-    return progress_of(store, searcher.searches)
+    return progress_of(store, searcher.searches, levels=levels)
 
 
 # ---- the workbook ---------------------------------------------------------

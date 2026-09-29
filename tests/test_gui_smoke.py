@@ -599,3 +599,11 @@ def test_the_limit_test_reports_what_zenith_did(app, monkeypatch):
     app._handle_msg("ffp_limit", None)
     assert "cannot be lifted" in str(app.ffp_status.cget("text"))
     assert str(app.btn_ffp_limit.cget("state")) == "normal"
+
+
+def test_the_status_says_which_level_is_being_collected(app, monkeypatch):
+    from src import ffp_collect as fc
+    _unlock_ffp(app, monkeypatch)
+    app._handle_msg("ffp_progress", fc.Progress(members=1, searches=1,
+                                                last="Titanium|Ak: 16"))
+    assert "Collecting Titanium" in str(app.ffp_status.cget("text"))
