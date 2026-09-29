@@ -280,7 +280,7 @@ def progress_of(store: FFPStore, searches: int = 0, last: str = "") -> Progress:
 WILDCARDS = ("", "%", "*")
 
 #: How a last name may continue after its first letter.
-_NAME_TAIL = " -.'"
+_NAME_TAIL = "-.'"
 _UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _LOWER = _UPPER.lower()
 MAX_NAME = 30
@@ -382,12 +382,46 @@ def _choose_method(searcher, store: FFPStore, log) -> None:
 
 
 def _children(store: FFPStore, prefix: str):
+    """The searches one character longer than an over-full one.
+
+    Never one ending in a space: Zenith trims it, so "A " matched exactly
+    what "A" did (219), was split again into "A  ", and so on for up to
+    30 spaces -- most of a live run's searches went down such chains and
+    found nothing new. A space only narrows with a letter after it
+    ("Al Amin"), so it is added together with one.
+    """
     if store.get("mode") == NUMBER:
         return [prefix + d for d in DIGITS]
-    tail = _LOWER + _NAME_TAIL
-    if store.get("case") == "1":
-        tail += _UPPER              # "Al Amin": capitals after a space
-    return [prefix + c for c in tail]
+    letters = _LOWER + (_UPPER if store.get("case") == "1" else "")
+    out = [prefix + c for c in letters + _NAME_TAIL]
+    if not prefix.endswith(" "):
+        out += [prefix + " " + c for c in letters]
+    return out
+
+
+def repair_space_chains(store: FFPStore) -> int:
+    """Clear what the space bug left in a saved run.
+
+    Queued searches whose name part ends in a space, or holds two in a
+    row, are dropped; each over-full name start that was split gets its
+    "space + letter" searches instead. Returns how many were dropped.
+    """
+    with store._lock:
+        rows = store.con.execute(
+            "SELECT prefix, state FROM frontier WHERE instr(prefix, '|') > 0"
+        ).fetchall()
+        junk = [p for p, st in rows
+                if st in (PENDING, RUNNING)
+                and (p.endswith(" ") or "  " in p.split("|", 1)[1])]
+        store.con.executemany("DELETE FROM frontier WHERE prefix=?",
+                              [(p,) for p in junk])
+        store.con.commit()
+    split = [p for p, st in rows if st == SPLIT and not p.endswith(" ")]
+    for p in split:
+        store.seed(c for c in _children(store, p)
+                   if not c.endswith(" "))
+    store.put("space_fix", "1")
+    return len(junk)
 
 
 def _page_extra(store: FFPStore) -> dict:
@@ -521,6 +555,11 @@ def collect(searcher, store: FFPStore, *, stop: threading.Event,
     if store.get("mode") not in (NUMBER, NAME):
         _choose_method(searcher, store, log)
     store.release_running()
+    if store.get("mode") == NAME and store.get("space_fix") != "1":
+        dropped = repair_space_chains(store)
+        if dropped:
+            log(f"Dropped {dropped:,} queued searches that only added "
+                f"spaces (Zenith ignores a trailing space).")
     _close_small_levels(searcher, store, levels, log)
     errors: list = []
 

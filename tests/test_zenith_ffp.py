@@ -129,6 +129,7 @@ class _FakeZenith:
                extra_form=None, extra_query=None, **_):
         self.searches += 1
         self.calls.append((level, ffp_number, last_name))
+        last_name = last_name.rstrip()      # as Zenith: trailing space trimmed
         norm = (lambda v: v) if self.case else (lambda v: v.upper())
         hits = [m for m in self.members
                 if (not level or m.level == level)
@@ -486,3 +487,31 @@ def test_a_level_that_fits_one_page_drops_its_queued_searches(store):
     fc.collect(fast, store, stop=threading.Event(), delay_s=0)
     assert store.member_count() == 2_000
     assert fast.searches - before <= 4             # one per level, at most
+
+
+# ---- Zenith trims a trailing space ------------------------------------------
+
+def test_no_search_ends_in_a_space_and_two_word_names_are_found(store):
+    """'A ' matched exactly what 'A' did on the live system, so splitting
+    it again only added spaces. A space now always comes with a letter."""
+    people = _members(1_500)           # includes "Al Am…" two-word names
+    assert any(" " in m.last_name for m in people)
+    fake = _FakeZenith(people, number="exact", name="contains")
+    fc.collect(fake, store, stop=threading.Event(), delay_s=0)
+    assert store.member_count() == 1_500
+    assert not any(name.endswith(" ") for _, _, name in fake.calls if name)
+
+
+def test_a_run_left_with_space_chains_is_repaired(store):
+    store.put("mode", "name")
+    store.seed(["Gold|A", "Gold|A ", "Gold|A  ", "Gold|Al  x", "Gold|B"])
+    store.mark("Gold|A", fc.SPLIT, 219)
+    store.mark("Gold|A ", fc.SPLIT, 219)
+    dropped = fc.repair_space_chains(store)
+    queued = {p for p, in store.con.execute(
+        "SELECT prefix FROM frontier WHERE state='pending'")}
+    assert dropped == 2                     # "A  " and "Al  x"
+    assert "Gold|A a" in queued and "Gold|A z" in queued
+    assert not any(p.endswith(" ") for p in queued)
+    assert "Gold|B" in queued
+    assert store.get("space_fix") == "1"
