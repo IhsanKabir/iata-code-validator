@@ -35,6 +35,11 @@ QS_COMMAND = ("/TTIDotNet/Transport/TransportNetBO2/Sales/"
               "SalesCrypticRequest.ashx")
 PENALTIES = "/newui/aerien/commercial/saisie_penalite.asp"
 TAXES = "/newui/aerien/commercial/saisie_IATAtaxes.asp"
+#: The browser's own "any new messages?" poll -- a tiny read on the older
+#: (classic ASP) side, which keeps that side's session from timing out.
+KEEP_ALIVE = "/newui/dash/IMSNewMessage.json.asp"
+#: Zenith's sign-out page; a redirect here means the session has ended.
+SIGNED_OUT = "/delog.asp"
 
 #: A Quick Sale fare display and nothing else: FDI, a six-letter city pair,
 #: a dated day with its year, and only the display options.
@@ -48,6 +53,10 @@ _PENALTY_VALUES = ("DelaiMin", "DelaiMax", "penMod", "penDevModif", "penRemb",
                    "penNoShowRemb", "penDevNoShowRemb")
 _TAX_READS = ("Seek", "Affiche_Result")
 _MAX_REDIRECTS = 5
+#: Zenith's two halves time out separately. A long run on the Fare Editor
+#: (.NET) let the tax/penalty side (classic ASP) expire, so it is touched
+#: at least this often.
+KEEP_ALIVE_S = 300
 
 
 class ReadOnlyViolation(Exception):
@@ -71,7 +80,7 @@ def check_allowed(method: str, url: str, data=None) -> None:
     form = data if isinstance(data, dict) else {}
     if method == "GET" and lower in (FARE_EDITOR.lower(), QS_INIT.lower(),
                                      QS_PAGE.lower(), PENALTIES.lower(),
-                                     TAXES.lower()):
+                                     TAXES.lower(), KEEP_ALIVE.lower()):
         return
     if method == "POST" and lower in (FARE_BASIS_LIST.lower(),
                                       LOAD_FARES.lower()):
@@ -112,6 +121,7 @@ class PricingClient:
         self.pause_s = max(0.0, pause_s)
         self.requests = 0
         self._task_id = ""
+        self._classic_at = time.monotonic()      # sign-in just touched it
 
     # ---- transport ---------------------------------------------------------
     def _send(self, method: str, path: str, *, params=None, data=None,
@@ -123,6 +133,10 @@ class PricingClient:
         check_allowed(method, url, data)
         from .zenith_client import USER_AGENT
         hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
+        if path.lower().startswith("/newui/"):
+            self._classic_at = time.monotonic()
+        elif time.monotonic() - self._classic_at > KEEP_ALIVE_S:
+            self.keep_alive()
         for attempt in range(1, self.attempts + 1):
             last = attempt >= self.attempts
             try:
@@ -174,7 +188,7 @@ class PricingClient:
                 return r
             target = urljoin(getattr(r, "url", "") or url,
                              r.headers.get("Location", ""))
-            if "/otds/" in target:
+            if "/otds/" in target or SIGNED_OUT in target.lower():
                 raise SessionLost("Zenith signed the session out — sign in "
                                   "again and re-run.")
             check_allowed("GET", target)
@@ -183,6 +197,10 @@ class PricingClient:
                                          timeout=self.timeout_s,
                                          allow_redirects=False)
         raise PricingError("Zenith redirected too many times.")
+
+    def keep_alive(self) -> None:
+        """Touch the classic side so it does not time out mid-run."""
+        self._send("GET", KEEP_ALIVE)
 
     # ---- Fare Editor -------------------------------------------------------
     def fare_editor_page(self, id_fare_basis: int) -> str:

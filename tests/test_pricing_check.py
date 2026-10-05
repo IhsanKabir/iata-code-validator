@@ -549,3 +549,29 @@ def test_the_workbook_lists_every_finding_and_what_was_not_checked(tmp_path):
                for r in fares)
     assert "No differences" in str(wb["Taxes"]["A4"].value)
     assert "Quick Sale said" in str(wb["Not checked"]["A4"].value)
+
+
+def test_a_redirect_to_zenith_sign_out_means_the_session_is_lost():
+    page = (BASE + cl.TAXES).lower()
+    sess = _Session({page: _Resp(BASE + cl.TAXES, 302,
+                                 "/newui/library/include/asp/delog.asp")})
+    client = cl.PricingClient(type("Z", (), {"session": sess})(),
+                              base_url=BASE, attempts=1)
+    with pytest.raises(cl.SessionLost):
+        client.tax_page()
+    assert all("delog" not in u for u in sess.sent)
+
+
+def test_a_long_fare_editor_run_keeps_the_tax_side_signed_in(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(cl.time, "monotonic", lambda: clock[0])
+    sess = _Session({})
+    client = cl.PricingClient(type("Z", (), {"session": sess})(),
+                              base_url=BASE, attempts=1)
+    client.fare_editor_page(1)
+    assert not any(cl.KEEP_ALIVE in u for u in sess.sent)
+    clock[0] += cl.KEEP_ALIVE_S + 1             # a long .NET-only stretch
+    client.fare_editor_page(1)
+    assert sum(cl.KEEP_ALIVE in u for u in sess.sent) == 1
+    client.fare_editor_page(1)                  # not again straight away
+    assert sum(cl.KEEP_ALIVE in u for u in sess.sent) == 1

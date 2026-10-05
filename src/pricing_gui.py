@@ -360,7 +360,8 @@ def _explain(exc: Exception) -> str:
     from . import pricing_client as cl
     from . import pricing_parse as pp
     if isinstance(exc, cl.SessionLost):
-        return f"{exc}"
+        return (f"{exc} The route list is saved — no need to rebuild it; "
+                f"just sign in and press Run again.")
     if isinstance(exc, cl.ReadOnlyViolation):
         return (f"Refused before sending: {exc} Nothing was changed in "
                 f"Zenith — please report this.")
