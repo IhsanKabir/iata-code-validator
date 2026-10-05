@@ -612,3 +612,74 @@ def test_the_status_says_which_level_is_being_collected(app, monkeypatch):
 def test_the_ffp_tab_runs_quick_unless_thorough_is_ticked(app, monkeypatch):
     _unlock_ffp(app, monkeypatch)
     assert app.ffp_thorough.get() is False
+
+
+# ---- Pricing: the season check, behind the same password -------------------
+
+def _unlock_pricing(app, monkeypatch):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    if not app._pricing_unlocked:
+        _use_test_password(monkeypatch)
+        app.pricing_pwd.insert(0, _TEST_PASSWORD)
+        app._pricing_unlock()
+
+
+def test_the_pricing_tab_is_locked_until_the_password(app, monkeypatch):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    tabs = [app.zenith_inner_notebook.tab(t, "text")
+            for t in app.zenith_inner_notebook.tabs()]
+    assert "Pricing" in tabs
+    assert not app._pricing_unlocked and not hasattr(app, "btn_pricing_run")
+    _use_test_password(monkeypatch)
+    app.pricing_pwd.insert(0, "wrong")
+    app._pricing_unlock()
+    assert not app._pricing_unlocked
+    assert "Wrong password" in str(app.pricing_gate_msg.cget("text"))
+    assert app.pricing_pwd.get() == ""
+    assert app._pricing_handle_msg("pricing_log", "x") is True
+
+
+def test_the_pricing_tab_opens_with_next_season_and_every_part(
+        app, monkeypatch, tmp_path):
+    monkeypatch.setattr("src.config.APP_DIR", str(tmp_path), raising=False)
+    _unlock_pricing(app, monkeypatch)
+    assert str(app.btn_pricing_run.cget("text")) == "Run season check"
+    assert app.pricing_mode.get() == "next"
+    assert all(v.get() for v in app.pricing_parts.values())
+    assert app.pricing_return.get() is True
+
+
+def test_the_season_check_asks_for_a_sign_in_first(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    monkeypatch.setattr(app, "_zenith_session", None, raising=False)
+    shown = {}
+    monkeypatch.setattr("src.pricing_gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app._pricing_run()
+    assert "Sign in to Zenith" in shown.get("msg", "")
+
+
+def test_a_finished_season_check_shows_its_summary(app, monkeypatch):
+    from src.pricing_check import CheckResult, Finding
+    _unlock_pricing(app, monkeypatch)
+    res = CheckResult(base="Summer 2026", others=["Winter 2026-27"],
+                      routes=["DAC-CCU"], compared={"Fares": 3},
+                      problems=["DAC-CCU: Quick Sale said 'x'."])
+    res.findings.append(Finding("Fares", "missing", "DAC-CCU", "Y · CH", "",
+                                "Summer 2026", "present", "Winter 2026-27",
+                                "MISSING"))
+    app._handle_msg("pricing_done", ("C:/x/Season_Check.xlsx", res))
+    assert "Fares: 3 compared — 1 to look at" in str(
+        app.pricing_summary.cget("text"))
+    assert "could not be checked" in str(app.pricing_warning.cget("text"))
+    assert str(app.btn_pricing_open.cget("state")) == "normal"
+
+
+def test_a_pricing_failure_keeps_its_reason_on_the_tab(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    app._handle_msg("pricing_error", "Zenith signed the session out.")
+    assert "signed the session out" in str(
+        app.pricing_warning.cget("text"))
+    assert str(app.btn_pricing_run.cget("state")) == "normal"
