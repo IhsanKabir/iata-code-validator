@@ -38,6 +38,7 @@ from html import unescape as _html_unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 
@@ -383,6 +384,54 @@ def parse_state_values(landing_html: str) -> dict[str, str]:
     return dict(_STATE_KV_RE.findall(m.group(1)))
 
 
+#: Since Oct 2026 a password sign-in can redirect here; Zenith emails a code
+#: and the page posts it back (ID_User, ID_Company, VerificationCode).
+VERIFY_PATH = "/User/VerificationCode"
+VERIFY_ATTEMPTS = 3
+_VERIFY_CODE_RE = re.compile(r"^[A-Za-z0-9]{1,6}$")
+_VERIFY_SENT_RE = re.compile(r"sent to your email\s*:\s*([^<\s]+)", re.I)
+
+
+def _hidden(html: str, name: str) -> str:
+    m = re.search(r'<input[^>]*name="' + re.escape(name) + r'"[^>]*>', html)
+    v = re.search(r'\b[vV]alue="([^"]*)"', m.group(0)) if m else None
+    return v.group(1) if v else ""
+
+
+def _verify_code(sess, resp, ask_code, timeout_s: float):
+    """Answer Zenith's emailed-code page; returns the response after it."""
+    if ask_code is None:
+        raise LoginError("Zenith asked for the verification code it emailed "
+                         "you — sign in from the app window to enter it.")
+    page_url = resp.url
+    problem = ""
+    for _attempt in range(VERIFY_ATTEMPTS):
+        html = resp.text or ""
+        sent = _VERIFY_SENT_RE.search(_html_unescape(html))
+        code = ask_code(sent.group(1) if sent else "your email", problem)
+        if code is None:
+            raise LoginError("Sign-in cancelled at the verification code.")
+        code = code.strip().upper()
+        if not _VERIFY_CODE_RE.match(code):
+            problem = "The code is up to 6 letters or digits — try again."
+            continue
+        query = parse_qs(urlsplit(page_url).query)
+        try:
+            resp = sess.post(page_url, data={
+                "ID_User": _hidden(html, "ID_User")
+                or (query.get("idUser") or [""])[0],
+                "ID_Company": _hidden(html, "ID_Company")
+                or (query.get("idCompany") or [""])[0],
+                "VerificationCode": code},
+                allow_redirects=True, timeout=timeout_s)
+        except requests.RequestException as exc:
+            raise LoginError(f"Network error sending the code: {exc}") from exc
+        if VERIFY_PATH not in resp.url:
+            return resp
+        problem = "Zenith did not accept that code — check the newest email."
+    raise LoginError("Zenith did not accept the verification code.")
+
+
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
@@ -410,8 +459,13 @@ class ZenithSession:
         *,
         company_code: str = "usba",
         timeout_s: float = 30.0,
+        ask_code: Callable[[str, str], str | None] | None = None,
     ) -> "ZenithSession":
-        """Run the full login + init-context handshake."""
+        """Run the full login + init-context handshake.
+
+        `ask_code(where_sent, problem)` is called when Zenith emails a
+        verification code; it returns the code, or None to give up.
+        """
         sess = requests.Session()
         sess.headers["User-Agent"] = USER_AGENT
 
@@ -435,6 +489,10 @@ class ZenithSession:
             )
         except requests.RequestException as exc:
             raise LoginError(f"Network error during login: {exc}") from exc
+
+        # Step 1b: Zenith may now ask for a code it emails to the user.
+        if VERIFY_PATH in resp.url:
+            resp = _verify_code(sess, resp, ask_code, timeout_s)
 
         # If the final page is still on /otds/, the login failed.
         if "/otds/" in resp.url and "f_index" not in resp.url:

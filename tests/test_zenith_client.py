@@ -170,3 +170,87 @@ def test_parse_state_values_finds_admin_and_company_ids():
 def test_parse_state_values_raises_when_block_missing():
     with pytest.raises(LoginError):
         parse_state_values("<html>nothing here</html>")
+
+
+# ---- the emailed verification code (added to sign-in Oct 2026) -------------
+
+_VERIFY_URL = ("https://z.test/Zenith/BackOffice/tti/en-GB/User/"
+               "VerificationCode?idCompany=77&idUser=12")
+_VERIFY_PAGE = (
+    '<form action="/Zenith/BackOffice/tti/en-GB/User/VerificationCode?'
+    'idCompany=77&amp;idUser=12" method="post">'
+    '<input Value="12" id="ID_User" name="ID_User" type="hidden" value="" />'
+    '<input Value="77" id="ID_Company" name="ID_Company" type="hidden" '
+    'value="" /><input id="VerificationCode" maxlength="6" '
+    'name="VerificationCode" type="text" value="" />'
+    'A verification code has been sent to your email : ab*****@example.com'
+    '</form>')
+_LANDING = ('<script>var stateValues = {"ID_ADMIN": "12", "ID_SOCIETE": '
+            '"77", "ID_APPLICATION": "3"};</script>')
+
+
+class _Resp:
+    def __init__(self, url, text=""):
+        self.url, self.text, self.status_code = url, text, 200
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeZenith:
+    """Password -> code page; the right code -> the dashboard."""
+    posted: list = []
+
+    def __init__(self):
+        self.headers = {}
+
+    def post(self, url, data=None, **_kw):
+        _FakeZenith.posted.append((url, dict(data or {})))
+        if "TESTLOGIN" in url:
+            return _Resp(_VERIFY_URL, _VERIFY_PAGE)
+        if data.get("VerificationCode") == "XLOHJN":
+            return _Resp("https://z.test/NewUI/aerien/f_index.asp", _LANDING)
+        return _Resp(_VERIFY_URL, _VERIFY_PAGE)
+
+    def get(self, url, **_kw):
+        return _Resp(url)
+
+
+@pytest.fixture
+def fake_zenith(monkeypatch):
+    import src.zenith_client as zc
+    _FakeZenith.posted = []
+    monkeypatch.setattr(zc.requests, "Session", _FakeZenith)
+    return zc
+
+
+def test_sign_in_asks_for_the_emailed_code_and_sends_it(fake_zenith):
+    asked = []
+    sess = fake_zenith.ZenithSession.from_credentials(
+        "u", "p", ask_code=lambda sent, problem: asked.append(
+            (sent, problem)) or " xlohjn ")
+    assert sess.state_values["ID_ADMIN"] == "12"
+    assert asked == [("ab*****@example.com", "")]
+    url, form = _FakeZenith.posted[-1]
+    assert url == _VERIFY_URL
+    assert form == {"ID_User": "12", "ID_Company": "77",
+                    "VerificationCode": "XLOHJN"}
+
+
+def test_a_wrong_code_is_asked_again_with_the_reason(fake_zenith):
+    codes = iter(["WRONG1", "XLOHJN"])
+    problems = []
+    fake_zenith.ZenithSession.from_credentials(
+        "u", "p", ask_code=lambda s, p: problems.append(p) or next(codes))
+    assert problems[0] == "" and "did not accept" in problems[1]
+
+
+def test_cancelling_the_code_stops_the_sign_in(fake_zenith):
+    with pytest.raises(LoginError, match="cancelled"):
+        fake_zenith.ZenithSession.from_credentials(
+            "u", "p", ask_code=lambda s, p: None)
+
+
+def test_without_a_way_to_ask_the_code_page_is_explained(fake_zenith):
+    with pytest.raises(LoginError, match="verification code"):
+        fake_zenith.ZenithSession.from_credentials("u", "p")

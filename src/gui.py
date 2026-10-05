@@ -133,6 +133,8 @@ MSG_ZENITH_DONE = "zenith_done"            # payload: str (output path)
 MSG_ZENITH_ERROR = "zenith_error"
 MSG_ZENITH_LOGGED_IN = "zenith_logged_in"  # payload: dict(state_values)
 MSG_ZENITH_LOGIN_FAILED = "zenith_login_failed"
+ZENITH_CODE_WAIT_S = 600                   # a code left unanswered gives up
+MSG_ZENITH_NEED_CODE = "zenith_need_code"  # payload: (sent_to, problem, answer dict, Event)
 # Zenith Flight Loads sub-tab
 MSG_ZENITH_FL_LOG = "zenith_fl_log"
 MSG_ZENITH_FL_PROGRESS = "zenith_fl_progress"  # (chunk_label, done_chunks, total_chunks, rows)
@@ -4777,6 +4779,8 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
             # Collapse the form to a one-line strip — the credentials
             # row is dead UI once auth is established.
             self._zenith_collapse_login()
+        elif kind == MSG_ZENITH_NEED_CODE:
+            self._zenith_ask_code(*payload)
         elif kind == MSG_ZENITH_LOGIN_FAILED:
             self.btn_zenith_login.configure(state="normal", text="Sign in to Zenith")
             self.zenith_login_status.configure(
@@ -10331,10 +10335,19 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
         self.btn_zenith_login.configure(state="disabled", text="Signing in…")
         self.zenith_login_status.configure(text="Connecting…")
 
+        def ask_code(sent_to: str, problem: str):
+            """From the sign-in thread: ask on the window, wait for the answer."""
+            answer: dict = {}
+            done = threading.Event()
+            self._post(MSG_ZENITH_NEED_CODE, (sent_to, problem, answer, done))
+            if not done.wait(ZENITH_CODE_WAIT_S):
+                return None
+            return answer.get("code")
+
         def worker() -> None:
             try:
                 sess = zenith_client.ZenithSession.from_credentials(
-                    user, pwd, company_code=company,
+                    user, pwd, company_code=company, ask_code=ask_code,
                 )
                 self._post(MSG_ZENITH_LOGGED_IN, sess)
             except zenith_client.LoginError as exc:
@@ -10344,6 +10357,20 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 self._post(MSG_ZENITH_LOGIN_FAILED, f"{type(exc).__name__}: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _zenith_ask_code(self, sent_to: str, problem: str, answer: dict,
+                         done: threading.Event) -> None:
+        """Zenith emailed a verification code: ask for it, hand it back."""
+        from tkinter import simpledialog
+        self.zenith_login_status.configure(text="Waiting for the emailed code…")
+        try:
+            lead = f"{problem}\n\n" if problem else ""
+            prompt = (f"{lead}Zenith sent a verification code to "
+                      f"{sent_to}.\nEnter the code from the NEWEST email:")
+            answer["code"] = simpledialog.askstring(
+                "Zenith verification code", prompt, parent=self.root)
+        finally:
+            done.set()
 
     def _zenith_run(self) -> None:
         if self._zenith_session is None:

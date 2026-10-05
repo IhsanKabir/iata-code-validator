@@ -683,3 +683,12 @@ def test_a_pricing_failure_keeps_its_reason_on_the_tab(app, monkeypatch):
     assert "signed the session out" in str(
         app.pricing_warning.cget("text"))
     assert str(app.btn_pricing_run.cget("state")) == "normal"
+
+
+def test_the_emailed_code_is_asked_for_on_the_window(app, monkeypatch):
+    import threading
+    monkeypatch.setattr("tkinter.simpledialog.askstring",
+                        lambda title, prompt, parent=None: "XLOHJN")
+    answer, done = {}, threading.Event()
+    app._handle_msg("zenith_need_code", ("ab***@x.com", "", answer, done))
+    assert done.is_set() and answer["code"] == "XLOHJN"
