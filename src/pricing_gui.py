@@ -100,21 +100,26 @@ class PricingMixin:
         self._form_row(box, 1, "", ttk.Checkbutton(
             box, text="Include the return direction (DAC-CCU → also CCU-DAC)",
             variable=self.pricing_return), label_width=18)
+        from .pricing_check import SEASON_MODES
         self.pricing_mode = tk.StringVar(value="next")
+        by_label = {v: k for k, v in SEASON_MODES.items()}
         row = ttk.Frame(box)
-        ttk.Radiobutton(row, text="Current vs next season", value="next",
-                        variable=self.pricing_mode).pack(side="left")
-        ttk.Radiobutton(row, text="Current vs ALL later seasons", value="all",
-                        variable=self.pricing_mode).pack(side="left",
-                                                         padx=(12, 0))
+        pick = ttk.Combobox(row, state="readonly", width=36,
+                            values=list(SEASON_MODES.values()))
+        pick.set(SEASON_MODES["next"])
+        pick.bind("<<ComboboxSelected>>", lambda _e: self.pricing_mode.set(
+            by_label[pick.get()]))
+        pick.pack(side="left")
+        self.pricing_mode_pick = pick
         self._form_row(box, 2, "Seasons:", row, label_width=18)
-        self.pricing_parts = {p: tk.BooleanVar(value=True)
-                              for p in ("Fares", "Taxes", "Penalties")}
+        self.pricing_parts = {p: tk.BooleanVar(value=True) for p in
+                              ("Fares", "Quick Sale", "Taxes", "Penalties")}
         row = ttk.Frame(box)
         for p, var in self.pricing_parts.items():
             ttk.Checkbutton(row, text=p, variable=var).pack(side="left",
                                                             padx=(0, 10))
-        ttk.Label(row, text="Fares includes the Quick Sale sales check",
+        ttk.Label(row, text="Fares + Quick Sale together also check each "
+                            "fare is on sale at its amount",
                   style="Hint.TLabel").pack(side="left")
         self._form_row(box, 3, "Parts:", row, label_width=18)
         self.pricing_output = tk.StringVar(value=str(Path.home() /
@@ -223,14 +228,21 @@ class PricingMixin:
         if not any(parts.values()):
             messagebox.showerror(_TITLE, "Tick at least one part.")
             return
-        if not self._pricing_index().load():
+        # Quick Sale and taxes go by route alone; only the Fare Editor and
+        # penalty reads need to know which fare bases fly where
+        needs_list = parts["Fares"] or parts["Penalties"]
+        if needs_list and not self._pricing_index().load():
             messagebox.showerror(_TITLE, "Build the route list first — "
-                                         "press 'Rebuild route list'.")
+                                         "press 'Rebuild route list'. "
+                                         "(Quick Sale and Taxes alone work "
+                                         "without it.)")
             return
         settings = Settings(routes_text=self.pricing_routes.get(),
                             include_return=bool(self.pricing_return.get()),
                             mode=self.pricing_mode.get(),
-                            fares=parts["Fares"], taxes=parts["Taxes"],
+                            fares=parts["Fares"],
+                            quick_sale=parts["Quick Sale"],
+                            taxes=parts["Taxes"],
                             penalties=parts["Penalties"])
         out_dir = Path(self.pricing_output.get().strip() or str(Path.home()))
         self.pricing_summary.configure(text="")

@@ -47,16 +47,31 @@ def current_season(seasons, today: date):
     return None
 
 
+#: Which later seasons are compared with the current one.
+SEASON_MODES = {
+    "next": "Current vs next season",
+    "after_next": "Current vs the season after next",
+    "next_two": "Current vs next two seasons",
+    "all": "Current vs ALL later seasons",
+}
+
+
 def seasons_to_compare(seasons, today: date, mode: str = "next"):
-    """(base season, [seasons compared with it]). mode 'next' or 'all'."""
+    """(base season, [seasons compared with it]); mode from SEASON_MODES."""
     base = current_season(seasons, today)
     if base is None:
         raise ValueError("No season covers today's date.")
     later = sorted((s for s in seasons if _d(s.start) > _d(base.start)),
                    key=lambda s: _d(s.start))
-    if not later:
-        raise ValueError("There is no season after the current one.")
-    return base, (later[:1] if mode == "next" else later)
+    picked = {"next": later[:1], "after_next": later[1:2],
+              "next_two": later[:2], "all": later}.get(mode)
+    if picked is None:
+        raise ValueError(f"Unknown season choice {mode!r}.")
+    if not picked:
+        raise ValueError("Zenith has no such season set up yet — "
+                         f"seasons after {base.name}: "
+                         + (", ".join(s.name for s in later) or "none") + ".")
+    return base, picked
 
 
 def check_date(season, today: date) -> date:
@@ -168,8 +183,20 @@ class CheckResult:
     findings: list = field(default_factory=list)
     compared: dict = field(default_factory=dict)   # part -> items compared
     problems: list = field(default_factory=list)   # couldn't check
+    #: every value read: part -> {(route, item): {season: {field: value}}}
+    values: dict = field(default_factory=dict)
+    value_fields: dict = field(default_factory=dict)   # part -> fields
     started: str = ""
     finished: str = ""
+
+    @property
+    def seasons(self) -> list:
+        return [self.base] + list(self.others)
+
+    def keep(self, part, key, season, row, fields) -> None:
+        self.value_fields[part] = tuple(fields)
+        self.values.setdefault(part, {}).setdefault(key, {})[season] = {
+            f: row.get(f) for f in fields}
 
     def count(self, part: str) -> dict:
         out: dict = {}
@@ -202,19 +229,27 @@ def compare_rows(part, route_of, item_of, rows_a, rows_b, fields, season_a,
                  season_b, result):
     """Rows keyed by (route, item); every field compared, both directions."""
     def index(rows):
-        out, dup = {}, set()
+        # an item set up twice in one season is kept as "#2", not lost
+        out, dup, seen = {}, set(), {}
         for r in rows:
             k = (route_of(r), item_of(r))
-            if k in out:
+            seen[k] = seen.get(k, 0) + 1
+            if seen[k] > 1:
                 dup.add(k)
+                k = (k[0], f"{k[1]} #{seen[k]}")
             out[k] = r
         return out, dup
     a, dup_a = index(rows_a)
     b, dup_b = index(rows_b)
+    for k, r in a.items():
+        result.keep(part, k, season_a, r, fields)
+    for k, r in b.items():
+        result.keep(part, k, season_b, r, fields)
     for k in sorted(dup_a | dup_b):
         where = season_a if k in dup_a else season_b
         result.findings.append(Finding(part, DUPLICATE, k[0], k[1],
-                                       "same item twice", where, "", "", ""))
+                                       "set up twice (see #2)", where, "", "",
+                                       ""))
     for k in sorted(set(a) | set(b)):
         if k not in b:
             result.findings.append(Finding(part, MISSING, k[0], k[1], "",
@@ -282,16 +317,22 @@ def _qs(client, command, result, route, season_name):
     return shown
 
 
+#: Quick Sale columns kept and compared (taxes = with-tax minus without).
+QS_FIELDS = ("Currency", "OW", "RT", "OW tax", "RT tax", "Class", "Level",
+             "Refund", "Change", "Min stay", "Max stay")
+
+
 def check_quick_sale(client, legs, base, others, today, adults, result, *,
                      stop, progress):
-    """Sales-side view: total tax per fare between seasons, and the Fare
-    Editor's adult fares against what Quick Sale shows (in their own
-    currency, so no exchange rate stands between them)."""
+    """What sales sees, per route and season: every fare Quick Sale lists,
+    without and with taxes, compared season against season. With the Fare
+    Editor's adult fares (`adults`), also each one against Quick Sale in its
+    own currency, so no exchange rate stands between them."""
     for i, leg in enumerate(sorted(legs), 1):
         if stop.is_set():
             raise InterruptedError("Stopped.")
         od = leg.replace("-", "")
-        taxes, seen = {}, {}
+        shown = {}
         for s in [base] + others:
             day = fdi_date(check_date(s, today))
             net = _qs(client, f"FDI{od}/D{day}/R,NP,WT", result, leg, s.name)
@@ -299,18 +340,24 @@ def check_quick_sale(client, legs, base, others, today, adults, result, *,
             if net is None or gross is None:
                 continue
             g = {f.fare_basis: f for f in gross.fares}
-            taxes[s.id] = [{"code": f.fare_basis,
-                            "OW tax": _minus(g.get(f.fare_basis), f, "ow"),
-                            "RT tax": _minus(g.get(f.fare_basis), f, "rt")}
+            shown[s.id] = [_qs_row(f, g.get(f.fare_basis), net.currency)
                            for f in net.fares]
-            seen[s.id] = _sales_check(client, od, day, leg, s, adults, result)
+            if adults:
+                _sales_check(client, od, day, leg, s, adults, result)
         for other in others:
-            if base.id in taxes and other.id in taxes:
-                compare_rows("QS taxes", lambda r: leg, lambda r: r["code"],
-                             taxes[base.id], taxes[other.id],
-                             ("OW tax", "RT tax"), base.name, other.name,
-                             result)
+            if base.id in shown and other.id in shown:
+                compare_rows("Quick Sale", lambda r: leg, lambda r: r["code"],
+                             shown[base.id], shown[other.id], QS_FIELDS,
+                             base.name, other.name, result)
         progress(f"Quick Sale: {i:,} of {len(legs):,} routes")
+
+
+def _qs_row(net, gross, currency) -> dict:
+    return {"code": net.fare_basis, "Currency": currency, "OW": net.ow,
+            "RT": net.rt, "OW tax": _minus(gross, net, "ow"),
+            "RT tax": _minus(gross, net, "rt"), "Class": net.booking_class,
+            "Level": net.level, "Refund": net.refund, "Change": net.change,
+            "Min stay": net.min_stay, "Max stay": net.max_stay}
 
 
 def _minus(gross, net, side):
@@ -319,8 +366,30 @@ def _minus(gross, net, side):
     return None if a is None or b is None else round(a - b, 2)
 
 
+SALES_FIELDS = ("Currency", "Fare Editor OW", "Quick Sale OW",
+                "Fare Editor RT", "Quick Sale RT", "Status")
+ON_SALE = "on sale, same amount"
+
+
+def _sales_status(row, f) -> tuple:
+    """(status, is a problem). Quick Sale "-" on one side is how a fare
+    sold return-only (or one-way only) shows -- the Fare Editor may still
+    hold an amount there that is never sold; that is noted, not flagged."""
+    if f is None:
+        return "not in Quick Sale", True
+    notes = []
+    for side, fld in (("ow", "AmountOW"), ("rt", "AmountRT")):
+        v, fe = getattr(f, side), _norm(fld, row.get(fld))
+        if v is None:
+            if fe:
+                notes.append(f"{side.upper()} not sold")
+        elif round(v, 2) != fe:
+            return f"{side.upper()} amount differs", True
+    return (", ".join(notes) or ON_SALE), False
+
+
 def _sales_check(client, od, day, leg, season, adults, result):
-    """Each adult fare in the Fare Editor must show for sale at its amount."""
+    """Each adult fare in the Fare Editor against Quick Sale's display."""
     mine = {code: row for (code, lg), row in adults.get(season.id, {}).items()
             if lg == leg}
     by_currency: dict = {}
@@ -334,23 +403,23 @@ def _sales_check(client, od, day, leg, season, adults, result):
         qs = {f.fare_basis: f for f in shown.fares}
         for code, row in sorted(rows.items()):
             f = qs.get(code)
-            if f is None:
+            status, bad = _sales_status(row, f)
+            values = {"Currency": currency,
+                      "Fare Editor OW": row.get("AmountOW"),
+                      "Fare Editor RT": row.get("AmountRT"),
+                      "Quick Sale OW": f.ow if f else None,
+                      "Quick Sale RT": f.rt if f else None,
+                      "Status": status}
+            result.keep("Sales check", (leg, code), season.name, values,
+                        SALES_FIELDS)
+            if bad:
                 result.findings.append(Finding(
-                    "Sales check", "set up, not on sale", leg, code, currency,
-                    season.name, "in Fare Editor", season.name,
-                    "not shown in Quick Sale"))
-                continue
-            for side, fld in (("ow", "AmountOW"), ("rt", "AmountRT")):
-                v = getattr(f, side)
-                # "-" in Quick Sale is no fare on that side: right only when
-                # the Fare Editor has none either
-                shown = 0.0 if v is None else round(v, 2)
-                if shown != _norm(fld, row.get(fld)):
-                    result.findings.append(Finding(
-                        "Sales check", "amount differs", leg, code,
-                        f"{side.upper()} {currency}", season.name,
-                        f"Fare Editor {_show(row.get(fld))}", season.name,
-                        f"Quick Sale {_show(v)}"))
+                    "Sales check", "not on sale" if f is None
+                    else "amount differs", leg, code, status, season.name,
+                    f"Fare Editor OW {_show(row.get('AmountOW'))} / RT "
+                    f"{_show(row.get('AmountRT'))} {currency}", season.name,
+                    "not listed" if f is None else
+                    f"Quick Sale OW {_show(f.ow)} / RT {_show(f.rt)}"))
         result.compared["Sales check"] = (result.compared.get("Sales check", 0)
                                           + len(rows))
 
@@ -450,8 +519,9 @@ def _penalty_rows(client, classes, season_ids, lid, pax_ids, result, leg):
 class Settings:
     routes_text: str = ""            # empty = all routes
     include_return: bool = True
-    mode: str = "next"               # or "all"
+    mode: str = "next"               # a SEASON_MODES key
     fares: bool = True
+    quick_sale: bool = True
     taxes: bool = True
     penalties: bool = True
 
@@ -481,7 +551,7 @@ def run_check(client, index: RouteIndex, settings: Settings, *,
     if not legs:
         raise ValueError("No route to check.")
     result.routes = sorted(legs)
-    if not index.legs:
+    if (settings.fares or settings.penalties) and not index.legs:
         raise ValueError("The route list has not been built yet — press "
                          "'Rebuild route list' first.")
     fb_by_id = {f.id: f for f in enabled}
@@ -490,15 +560,13 @@ def run_check(client, index: RouteIndex, settings: Settings, *,
     if settings.fares:
         adults = check_fares(client, lookups, fb_by_id, ids, legs, base,
                              others, result, stop=stop, progress=progress)
+    if settings.quick_sale:
         check_quick_sale(client, legs, base, others, today, adults, result,
                          stop=stop, progress=progress)
     if settings.taxes:
         airports = pp.parse_tax_airports(client.tax_page())
         check_taxes(client, airports, legs, base, others, today, result,
                     stop=stop, progress=progress)
-        if not settings.fares:
-            check_quick_sale(client, legs, base, others, today, {}, result,
-                             stop=stop, progress=progress)
     if settings.penalties:
         options = pp.parse_penalty_page(client.penalty_page())
         check_penalties(client, options, index, lookups, legs, base, others,

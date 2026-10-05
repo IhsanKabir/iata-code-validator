@@ -692,3 +692,16 @@ def test_the_emailed_code_is_asked_for_on_the_window(app, monkeypatch):
     answer, done = {}, threading.Event()
     app._handle_msg("zenith_need_code", ("ab***@x.com", "", answer, done))
     assert done.is_set() and answer["code"] == "XLOHJN"
+
+
+def test_picking_the_season_after_next_reaches_the_check(app, monkeypatch,
+                                                         tmp_path):
+    from src.pricing_check import SEASON_MODES
+    monkeypatch.setattr("src.config.APP_DIR", str(tmp_path), raising=False)
+    _unlock_pricing(app, monkeypatch)
+    assert list(app.pricing_parts) == ["Fares", "Quick Sale", "Taxes",
+                                       "Penalties"]
+    app.pricing_mode_pick.set(SEASON_MODES["after_next"])
+    app.pricing_mode_pick.event_generate("<<ComboboxSelected>>")
+    app.root.update()
+    assert app.pricing_mode.get() == "after_next"

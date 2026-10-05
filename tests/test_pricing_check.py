@@ -360,8 +360,12 @@ def test_a_fare_set_up_but_not_selling_is_caught_by_quick_sale(tmp_path):
                                                          None)]
     res = run(z, tmp_path)
     sales = [f for f in res.findings if f.part == "Sales check"]
-    assert [(f.kind, f.item) for f in sales] == [("set up, not on sale",
+    assert [(f.kind, f.item) for f in sales] == [("not on sale",
                                                   "YBDCCUR")]
+    # and the values say what the Fare Editor holds for it
+    kept = res.values["Sales check"][("DAC-CCU", "YBDCCUR")]
+    assert kept["Winter 2026-27"]["Fare Editor RT"] == 500
+    assert kept["Winter 2026-27"]["Status"] == "not in Quick Sale"
 
 
 def test_a_tax_changed_between_seasons_is_reported(tmp_path):
@@ -381,8 +385,12 @@ def test_quick_sale_total_tax_is_compared_too(tmp_path):
                                                        ("YBDCCUR", None,
                                                         72443)]
     res = run(z, tmp_path)
-    qs = [f for f in res.findings if f.part == "QS taxes"]
+    qs = [f for f in res.findings if f.part == "Quick Sale"]
     assert [(f.item, f.detail) for f in qs] == [("YBDCCUO", "OW tax")]
+    shown = res.values["Quick Sale"][("DAC-CCU", "YBDCCUO")]
+    assert shown["Summer 2026"]["OW"] == 37097
+    assert shown["Summer 2026"]["OW tax"] == 43100 - 37097
+    assert shown["Winter 2026-27"]["OW tax"] == 44000 - 37097
 
 
 def test_a_penalty_missing_next_season_is_reported(tmp_path):
@@ -438,15 +446,18 @@ def test_a_tax_row_of_the_wrong_shape_stops_the_read():
     assert len(pp.parse_tax_list(ok)) == 1
 
 
-def test_a_fare_quick_sale_shows_as_dash_is_reported(tmp_path):
+def test_a_side_quick_sale_does_not_sell_is_noted_not_flagged(tmp_path):
+    """A return fare with a one-way amount in the Fare Editor shows "-" for
+    OW in Quick Sale (seen live: BBDQAR OW 640 USD). That is how the fare
+    is sold, not an error -- it is shown in the values, not flagged."""
     z = same_both_seasons(FakeZenith())
-    z.qs[("DACCCU", "WINTER 2026-27", False, "USD")] = [
-        ("YBDCCUO", 300, None), ("YBDCCUR", None, None)]
+    z.fares[(12, 34199)] = [fare(68, 1, "USD", 640, rt=500)]
+    z.fares[(12, 34198)] = [fare(68, 1, "USD", 640, rt=500)]
     res = run(z, tmp_path)
-    sales = [(f.kind, f.item, f.detail, f.value_b) for f in res.findings
-             if f.part == "Sales check"]
-    assert sales == [("amount differs", "YBDCCUR", "RT USD",
-                      "Quick Sale —")]
+    assert not [f for f in res.findings if f.part == "Sales check"]
+    kept = res.values["Sales check"][("DAC-CCU", "YBDCCUR")]
+    assert kept["Summer 2026"]["Status"] == "OW not sold"
+    assert kept["Summer 2026"]["Fare Editor OW"] == 640
 
 
 # ---- redirects never skip the safety rule ------------------------------------
@@ -542,12 +553,29 @@ def test_the_workbook_lists_every_finding_and_what_was_not_checked(tmp_path):
     path = tmp_path / "check.xlsx"
     pr.build_workbook(res, path)
     wb = load_workbook(path)
-    assert wb.sheetnames == ["Summary", "Fares", "Sales check", "QS taxes",
-                             "Taxes", "Penalties", "Not checked"]
-    fares = [[c.value for c in row] for row in wb["Fares"].iter_rows()]
+    parts = ["Fares", "Sales check", "Quick Sale", "Taxes", "Penalties"]
+    assert wb.sheetnames == ["Summary"] + [
+        n for p in parts for n in (p, f"{p} - differences")] + [
+        "Not checked"]
+    diffs = [[c.value for c in row]
+             for row in wb["Fares - differences"].iter_rows()]
     assert any(r[2] == "Currency" and r[5] == "USD" and r[7] == "BDT"
-               for r in fares)
-    assert "No differences" in str(wb["Taxes"]["A4"].value)
+               for r in diffs)
+    # the values sheet: every season side by side, the change highlighted
+    ws = wb["Fares"]
+    heads = [c.value for c in ws[4]]
+    assert heads[:3] == ["Route", "Item", "Status"]
+    cur_a = heads.index("Currency\nSummer 2026") + 1
+    cur_b = heads.index("Currency\nWinter 2026-27") + 1
+    adult = next(r for r in range(5, ws.max_row + 1)
+                 if "Adult" in str(ws.cell(r, 2).value))
+    assert ws.cell(adult, cur_a).value == "USD"
+    assert ws.cell(adult, cur_b).value == "BDT"
+    assert ws.cell(adult, cur_b).fill.fgColor.rgb.endswith("FFEB9C")
+    assert "differs: Currency" in ws.cell(adult, 3).value
+    ow = heads.index("OW\nWinter 2026-27") + 1
+    assert ws.cell(adult, ow).value == 300              # a real number
+    assert "No differences" in str(wb["Taxes - differences"]["A4"].value)
     assert "Quick Sale said" in str(wb["Not checked"]["A4"].value)
 
 
@@ -575,3 +603,42 @@ def test_a_long_fare_editor_run_keeps_the_tax_side_signed_in(monkeypatch):
     assert sum(cl.KEEP_ALIVE in u for u in sess.sent) == 1
     client.fare_editor_page(1)                  # not again straight away
     assert sum(cl.KEEP_ALIVE in u for u in sess.sent) == 1
+
+
+# ---- choosing seasons, Quick Sale alone, repeats -----------------------------
+
+def test_the_season_after_next_can_be_chosen():
+    seasons = pp.parse_fare_editor_page(fe_page()).seasons
+    base, picked = pc.seasons_to_compare(seasons, TODAY, "after_next")
+    assert base.name == "Summer 2026"
+    assert [s.name for s in picked] == ["Summer 2027"]
+    _, two = pc.seasons_to_compare(seasons, TODAY, "next_two")
+    assert [s.name for s in two] == ["Winter 2026-27", "Summer 2027"]
+    # in Winter there is only one later season: say so, plainly
+    with pytest.raises(ValueError, match="no such season"):
+        pc.seasons_to_compare(seasons, date(2026, 11, 1), "after_next")
+
+
+def test_quick_sale_alone_needs_no_route_list(tmp_path):
+    z = same_both_seasons(FakeZenith())
+    res = pc.run_check(z, pc.RouteIndex(tmp_path / "none.json"), pc.Settings(
+        routes_text="DAC-CCU", include_return=False, fares=False,
+        quick_sale=True, taxes=False, penalties=False), today=TODAY)
+    assert res.compared == {"Quick Sale": 2}
+    assert set(res.values) == {"Quick Sale"}
+    assert not any(isinstance(c, str) and "FC-" in c for c in z.sent)
+
+
+def test_a_fare_set_up_twice_is_compared_copy_by_copy(tmp_path):
+    z = same_both_seasons(FakeZenith())
+    for season in (34198, 34199):
+        z.fares[(11, season)] = z.fares[(11, season)] + [
+            fare(68, 1, "USD", 350)]
+    z.fares[(11, 34199)][-1] = fare(68, 1, "USD", 360)
+    res = run(z, tmp_path)
+    fares = [(f.kind, f.item, f.detail) for f in res.findings
+             if f.part == "Fares"]
+    assert ("different", "YBDCCUO · AD - Adult(s) #2", "AmountOW") in fares
+    kept = res.values["Fares"][("DAC-CCU", "YBDCCUO · AD - Adult(s) #2")]
+    assert kept["Summer 2026"]["AmountOW"] == 350
+    assert kept["Winter 2026-27"]["AmountOW"] == 360
