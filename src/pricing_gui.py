@@ -71,10 +71,9 @@ class PricingMixin(PricingLookupMixin):
         parent = self._make_scrollable(parent)
         self._pricing_folds: dict = {}
         top = parent
-        parent = self._pricing_fold(top, "check", "Season check  ·  compare "
-                                    "one season's pricing with another's")
-        self._section(
-            parent, "Season check  ·  is the next season set up like this one?",
+        parent = self._pricing_fold(
+            top, "check", "Season check",
+            "compare one season's fares, taxes and penalties with another's",
             help_text=(
                 "Reads Zenith and compares the current season with the next "
                 "one (or every later season):\n\n"
@@ -128,13 +127,6 @@ class PricingMixin(PricingLookupMixin):
                             "fare is on sale at its amount",
                   style="Hint.TLabel").pack(side="left")
         self._form_row(box, 3, "Parts:", row, label_width=18)
-        self.pricing_output = tk.StringVar(value=str(Path.home() /
-                                                     "Documents"))
-        self._form_row(box, 4, "Output folder:",
-                       ttk.Entry(box, textvariable=self.pricing_output),
-                       label_width=18,
-                       suffix=ttk.Button(box, text="Browse…",
-                                         command=self._pricing_pick_output))
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -158,13 +150,25 @@ class PricingMixin(PricingLookupMixin):
                                            style="Hint.TLabel")
         self.pricing_index_lbl.pack(anchor="w", padx=8)
 
-        lookup = self._pricing_fold(top, "lookup", "Look up  ·  everything "
-                                    "set for a fare basis or a route")
+        lookup = self._pricing_fold(
+            top, "lookup", "Look up",
+            "everything set for a fare basis or a route, for any seasons",
+            help_text=self.LOOKUP_HELP)
         self._pricing_build_lookup(lookup)
 
         parent = top
-        self.pricing_status = ttk.Label(parent, text="Sign in to Zenith "
-                                        "above, then press Run.",
+        # both sections save here, so it sits outside them
+        out = ttk.Frame(parent)
+        out.pack(fill="x", padx=4, pady=(12, 0))
+        self.pricing_output = tk.StringVar(value=str(Path.home() /
+                                                     "Documents"))
+        self._form_row(out, 0, "Workbooks go to:",
+                       ttk.Entry(out, textvariable=self.pricing_output),
+                       label_width=18,
+                       suffix=ttk.Button(out, text="Browse…",
+                                         command=self._pricing_pick_output))
+        self.pricing_status = ttk.Label(parent, text="Click a section to "
+                                        "open it.",
                                         style="Hint.TLabel")
         self.pricing_status.pack(anchor="w", padx=8)
         self.pricing_summary = ttk.Label(parent, text="", justify="left",
@@ -176,13 +180,35 @@ class PricingMixin(PricingLookupMixin):
         self.pricing_warning.pack(anchor="w", padx=8)
         self._pricing_show_index()
 
-    def _pricing_fold(self, parent, key: str, title: str) -> ttk.Frame:
-        """A section that opens and closes on its header; starts closed."""
-        head = ttk.Button(parent, text=f"▸  {title}", style="Toolbutton",
-                          command=lambda: self._pricing_toggle(key))
-        head.pack(fill="x", anchor="w", padx=4, pady=(8, 0))
+    def _pricing_fold(self, parent, key: str, title: str,
+                      about: str = "", help_text: str = "") -> ttk.Frame:
+        """A section that opens and closes on its header; starts closed.
+        The header looks like the app's other section titles -- the whole
+        row is clickable."""
+        row = ttk.Frame(parent, cursor="hand2")
+        row.pack(fill="x", anchor="w", padx=4, pady=(12, 0))
+        head = ttk.Label(row, text=f"▸  {title}", style="Section.TLabel",
+                         cursor="hand2")
+        head.pack(side="left")
+        widgets = [row, head]
+        if about:
+            note = ttk.Label(row, text=f"   {about}", style="Hint.TLabel",
+                             cursor="hand2")
+            note.pack(side="left")
+            widgets.append(note)
+        for w in widgets:
+            w.bind("<Button-1>", lambda _e: self._pricing_toggle(key))
+        if help_text:
+            info = ttk.Label(row, text="ⓘ", foreground=self._COLOR_MUTED,
+                             font=("Segoe UI", 10), cursor="question_arrow")
+            info.pack(side="left", padx=(6, 0))
+            self._attach_tooltip(info, help_text)
+        rule = ttk.Separator(parent)
+        rule.pack(fill="x", padx=4, pady=(4, 0))
         body = ttk.Frame(parent)
         self._pricing_folds[key] = (head, body, title)
+        self._pricing_fold_rule = getattr(self, "_pricing_fold_rule", {})
+        self._pricing_fold_rule[key] = rule
         return body
 
     def _pricing_toggle(self, key: str, show: bool | None = None) -> None:
@@ -190,7 +216,8 @@ class PricingMixin(PricingLookupMixin):
         is_open = bool(body.winfo_manager())       # packed = open
         show = (not is_open) if show is None else show
         if show:
-            body.pack(fill="x", after=head, padx=(16, 0))
+            body.pack(fill="x", after=self._pricing_fold_rule[key],
+                      padx=(16, 0))
         else:
             body.pack_forget()
         head.configure(text=f"{'▾' if show else '▸'}  {title}")
@@ -216,7 +243,7 @@ class PricingMixin(PricingLookupMixin):
     # ---- actions ----------------------------------------------------------
     def _pricing_pick_output(self) -> None:
         got = filedialog.askdirectory(
-            title="Where should the season check workbook go?",
+            title="Where should the pricing workbooks go?",
             initialdir=self.pricing_output.get() or str(Path.home()))
         if got:
             self.pricing_output.set(got)

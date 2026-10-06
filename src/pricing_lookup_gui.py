@@ -22,10 +22,8 @@ _TITLE = "Pricing lookup"
 
 
 class PricingLookupMixin:
-    def _pricing_build_lookup(self, parent: ttk.Frame) -> None:
-        self._section(
-            parent, "Look up  ·  read out a fare basis or a route",
-            help_text=(
+    #: Shown on the section header's ⓘ.
+    LOOKUP_HELP = (
                 "Everything Zenith holds for the fare bases or routes you "
                 "name, for the seasons you tick — no comparison:\n\n"
                 "• Fare basis — its settings and rules (level, stays, "
@@ -40,7 +38,9 @@ class PricingLookupMixin:
                 "(current and later seasons only).\n\n"
                 "Fare basis: codes, or patterns — YBD* is every code starting "
                 "YBD. Route alone: every fare basis on it (from the route "
-                "list). READ ONLY, like the season check."))
+                "list). READ ONLY, like the season check.")
+
+    def _pricing_build_lookup(self, parent: ttk.Frame) -> None:
         box = self._section(parent, "What to look up")
         self.lookup_fare_bases = tk.StringVar(value="")
         row = ttk.Frame(box)
