@@ -705,3 +705,59 @@ def test_picking_the_season_after_next_reaches_the_check(app, monkeypatch,
     app.pricing_mode_pick.event_generate("<<ComboboxSelected>>")
     app.root.update()
     assert app.pricing_mode.get() == "after_next"
+
+
+def test_the_pricing_sections_start_folded_and_open_on_click(
+        app, monkeypatch, tmp_path):
+    monkeypatch.setattr("src.config.APP_DIR", str(tmp_path), raising=False)
+    _unlock_pricing(app, monkeypatch)
+    for key in ("check", "lookup"):
+        head, body, _title = app._pricing_folds[key]
+        assert not body.winfo_manager()          # folded
+        assert str(head.cget("text")).startswith("▸")
+        app._pricing_toggle(key)
+        assert body.winfo_manager() == "pack"
+        assert str(head.cget("text")).startswith("▾")
+        app._pricing_toggle(key)
+        assert not body.winfo_manager()
+
+
+def test_lookup_seasons_come_from_the_last_read_with_today_ticked(
+        app, monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr("src.config.APP_DIR", str(tmp_path), raising=False)
+    (tmp_path / "pricing_seasons.json").write_text(json.dumps([
+        {"id": 1, "name": "Long ago", "start": "2001/01/01",
+         "end": "2001/06/01"},
+        {"id": 2, "name": "Forever", "start": "2001/06/01",
+         "end": "2999/01/01"}]), encoding="utf-8")
+    _unlock_pricing(app, monkeypatch)
+    app.lookup_seasons = {}                  # as when the tab first opens
+    app._lookup_show_seasons(app._lookup_saved_seasons())
+    assert {i: v.get() for i, v in app.lookup_seasons.items()} == {
+        1: False, 2: True}
+
+
+def test_a_lookup_needs_a_fare_basis_or_route(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    monkeypatch.setattr(app, "_zenith_session", object(), raising=False)
+    shown = {}
+    monkeypatch.setattr("src.pricing_lookup_gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app.lookup_fare_bases.set("")
+    app.lookup_routes.set("")
+    app._lookup_run()
+    assert "fare basis or a route" in shown.get("msg", "")
+
+
+def test_a_finished_lookup_shows_what_it_read(app, monkeypatch):
+    from src.pricing_lookup import LookupResult
+    _unlock_pricing(app, monkeypatch)
+    res = LookupResult(seasons=["Summer 2026"], routes=["DAC-CCU"],
+                       fare_bases=[{"Code": "YBDCCUO"}],
+                       fares=[{}, {}], taxes=[{}], notes=["x"])
+    app._handle_msg("pricing_lookup_done", ("C:/x/Pricing_Lookup.xlsx", res))
+    assert "1 fare bases" in str(app.pricing_summary.cget("text"))
+    assert "Fares 2 rows" in str(app.pricing_summary.cget("text"))
+    assert str(app.btn_lookup_open.cget("state")) == "normal"
+    assert str(app.btn_pricing_open.cget("state")) == "normal"

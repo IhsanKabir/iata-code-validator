@@ -17,6 +17,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .pricing_lookup_gui import PricingLookupMixin
+
 log = logging.getLogger(__name__)
 
 PRICING_MSG_LOG = "pricing_log"            # payload: str
@@ -27,7 +29,7 @@ PRICING_MSG_ERROR = "pricing_error"        # payload: str
 _TITLE = "Pricing"
 
 
-class PricingMixin:
+class PricingMixin(PricingLookupMixin):
     # ---- building ---------------------------------------------------------
     def _build_zenith_pricing_tab(self, parent: ttk.Frame) -> None:
         """A password screen first; the tab itself is built on unlock."""
@@ -67,6 +69,10 @@ class PricingMixin:
 
     def _pricing_build_contents(self, parent: ttk.Frame) -> None:
         parent = self._make_scrollable(parent)
+        self._pricing_folds: dict = {}
+        top = parent
+        parent = self._pricing_fold(top, "check", "Season check  ·  compare "
+                                    "one season's pricing with another's")
         self._section(
             parent, "Season check  ·  is the next season set up like this one?",
             help_text=(
@@ -151,6 +157,12 @@ class PricingMixin:
         self.pricing_index_lbl = ttk.Label(parent, text="",
                                            style="Hint.TLabel")
         self.pricing_index_lbl.pack(anchor="w", padx=8)
+
+        lookup = self._pricing_fold(top, "lookup", "Look up  ·  everything "
+                                    "set for a fare basis or a route")
+        self._pricing_build_lookup(lookup)
+
+        parent = top
         self.pricing_status = ttk.Label(parent, text="Sign in to Zenith "
                                         "above, then press Run.",
                                         style="Hint.TLabel")
@@ -163,6 +175,25 @@ class PricingMixin:
                                          foreground="#B00020")
         self.pricing_warning.pack(anchor="w", padx=8)
         self._pricing_show_index()
+
+    def _pricing_fold(self, parent, key: str, title: str) -> ttk.Frame:
+        """A section that opens and closes on its header; starts closed."""
+        head = ttk.Button(parent, text=f"▸  {title}", style="Toolbutton",
+                          command=lambda: self._pricing_toggle(key))
+        head.pack(fill="x", anchor="w", padx=4, pady=(8, 0))
+        body = ttk.Frame(parent)
+        self._pricing_folds[key] = (head, body, title)
+        return body
+
+    def _pricing_toggle(self, key: str, show: bool | None = None) -> None:
+        head, body, title = self._pricing_folds[key]
+        is_open = bool(body.winfo_manager())       # packed = open
+        show = (not is_open) if show is None else show
+        if show:
+            body.pack(fill="x", after=head, padx=(16, 0))
+        else:
+            body.pack_forget()
+        head.configure(text=f"{'▾' if show else '▸'}  {title}")
 
     # ---- the route list ---------------------------------------------------
     @staticmethod
@@ -206,9 +237,10 @@ class PricingMixin:
     def _pricing_start(self, target, args, msg: str) -> None:
         self._pricing_stop.clear()
         self.pricing_warning.configure(text="")
-        for b in (self.btn_pricing_run, self.btn_pricing_index):
+        for b in self._pricing_buttons("go"):
             b.configure(state="disabled")
-        self.btn_pricing_stop.configure(state="normal")
+        for b in self._pricing_buttons("stop"):
+            b.configure(state="normal")
         self._pricing_log(msg)
         self._pricing_worker = threading.Thread(target=target, args=args,
                                                 daemon=True)
@@ -299,7 +331,8 @@ class PricingMixin:
 
     def _pricing_stop_clicked(self) -> None:
         self._pricing_stop.set()
-        self.btn_pricing_stop.configure(state="disabled")
+        for b in self._pricing_buttons("stop"):
+            b.configure(state="disabled")
         self._pricing_log("Stopping after the current read…")
 
     def _pricing_open(self) -> None:
@@ -317,9 +350,18 @@ class PricingMixin:
             pass
 
     def _pricing_finish(self) -> None:
-        for b in (self.btn_pricing_run, self.btn_pricing_index):
+        for b in self._pricing_buttons("go"):
             b.configure(state="normal")
-        self.btn_pricing_stop.configure(state="disabled")
+        for b in self._pricing_buttons("stop"):
+            b.configure(state="disabled")
+
+    def _pricing_buttons(self, kind: str) -> list:
+        """Each section has its own copy (either may be folded shut)."""
+        names = {"go": ("btn_pricing_run", "btn_pricing_index",
+                        "btn_lookup_run", "btn_lookup_seasons"),
+                 "stop": ("btn_pricing_stop", "btn_lookup_stop"),
+                 "open": ("btn_pricing_open", "btn_lookup_open")}[kind]
+        return [getattr(self, n) for n in names if hasattr(self, n)]
 
     def _pricing_handle_msg(self, kind: str, payload) -> bool:
         if not kind.startswith("pricing_"):
@@ -332,7 +374,8 @@ class PricingMixin:
             path, res = payload
             self._pricing_finish()
             self._pricing_last_path = path
-            self.btn_pricing_open.configure(state="normal")
+            for b in self._pricing_buttons("open"):
+                b.configure(state="normal")
             self._pricing_log(f"Done — saved {Path(path).name}.")
             self.pricing_summary.configure(text=summary_text(res))
             if res.problems:
@@ -349,7 +392,7 @@ class PricingMixin:
             self._pricing_log("Stopped — the reason is shown below.")
             self.pricing_warning.configure(text=str(payload))
         else:
-            return False
+            return self._lookup_handle_msg(kind, payload)
         return True
 
 

@@ -297,6 +297,7 @@ class Tax:
     value: str          # "500 BDT", "10 USD", "30 %"
     international: bool
     domestic: bool
+    tax_id: int = 0     # opens its details: Affiche(<id>) on the name
 
 
 _TAX_HEADER = ("Tax Name", "Tax Code", "Departure Airport", "Arrival Airport",
@@ -326,8 +327,90 @@ def parse_tax_list(html: str) -> list:
                 for t, h in zip(texts, _TAX_HEADER)]
         # the tick is an icon-font character, written as an HTML entity
         ticked = ["" in unescape(c) for c in cells]
+        opens = re.search(r"Affiche\((\d+)\)", cells[0])
         out.append(Tax(vals[0], vals[1], vals[2], vals[3], vals[4],
-                       ticked[5], ticked[6]))
+                       ticked[5], ticked[6],
+                       int(opens.group(1)) if opens else 0))
     if not header_seen and "Tax Code" in body:
         raise LayoutChanged("Tax list columns changed.")
     return out
+
+
+# ---- one tax's details: who is exempt ----------------------------------------
+
+#: Exemption lists on a tax's detail page (checkbox name -> what it lists).
+EXEMPT_LISTS = {
+    "ClasseTarifaireExempted": "Fare bases",
+    "TypePassagerExempt": "Passenger types",
+    "PointOfSaleExempted": "Points of sale",
+    "DistributionChannelExempted": "Sales channels",
+    "OriginAirportExempted": "Origin airports",
+    "ClassOfServiceExempted": "Cabins",
+}
+
+
+def tax_detail_form(tax_id: int, dep_id: int, arr_id: int,
+                    date_ddmmyyyy: str) -> dict:
+    """Open one tax, exactly as clicking its name does."""
+    return {"hAction": "Affiche_Result", "DuplicateTaxe": "0",
+            "Id_TaxeAeropackHidden": str(int(tax_id)), "RT_OrderHidden": "1",
+            "RecCodeDestGeo": str(dep_id), "RecCodeDestGeoLinked": str(arr_id),
+            "RecEffDate": date_ddmmyyyy, "ShowNotInUseTaxes": "on"}
+
+
+@dataclass
+class TaxDetail:
+    code: str
+    name: str
+    #: list name -> {id: label} of what is exempt from this tax
+    exempt: dict = field(default_factory=dict)
+
+    def exempt_fare_bases(self) -> set:
+        return {int(k) for k in self.exempt.get("ClasseTarifaireExempted", {})
+                if str(k).isdigit()}
+
+
+def _field_value(html: str, name: str) -> str:
+    m = re.search(r'<input[^>]*name="' + name + r'"[^>]*>', html)
+    v = re.search(r'value="([^"]*)"', m.group(0)) if m else None
+    return _text(v.group(1)) if v else ""
+
+
+def parse_tax_detail(html: str) -> TaxDetail:
+    """The page ticks its exemptions with a script after loading --
+    set_chk(document.taxe.<list>, '<id>') -- so those calls are read, as
+    well as any box already ticked in the markup."""
+    html = re.sub(r"<!--.*?-->", "", html or "", flags=re.S)
+    if 'name="ClasseTarifaireExempted"' not in html:
+        raise LayoutChanged("Tax details have no exemption list.")
+    labels: dict = {}
+    for m in re.finditer(r'<input\b[^>]*>', html):
+        tag = m.group(0)
+        name = re.search(r'name="(\w+)"', tag)
+        if not name or name.group(1) not in EXEMPT_LISTS:
+            continue
+        value = re.search(r'value="([^"]*)"', tag)
+        ident = re.search(r'id="([^"]*)"', tag)
+        if not value:
+            continue
+        label = ""
+        if ident:
+            lab = re.search(r'<label[^>]*for="' + re.escape(ident.group(1))
+                            + r'"[^>]*>(.*?)</label>', html[m.end():
+                                                            m.end() + 2000],
+                            re.S)
+            label = _text(lab.group(1)) if lab else ""
+        labels.setdefault(name.group(1), {}).setdefault(value.group(1), label)
+        if re.search(r"\bchecked\b", tag, re.I):
+            labels.setdefault("_ticked", set()).add((name.group(1),
+                                                     value.group(1)))
+    ticked = set(labels.pop("_ticked", set()))
+    ticked |= set(re.findall(
+        r"set_chk\(\s*document\.taxe\.(\w+)\s*,\s*'([^']*)'\s*\)", html))
+    exempt: dict = {}
+    for name, value in sorted(ticked):
+        if name in EXEMPT_LISTS:
+            exempt.setdefault(name, {})[value] = labels.get(name, {}).get(
+                value, value)
+    return TaxDetail(_field_value(html, "CodeTaxe"),
+                     _field_value(html, "Libelle"), exempt)
