@@ -139,8 +139,9 @@ class RoeMixin:
         t = self.roe_tree
         t.delete(*t.get_children())
         for row in preview_rows(plan):
-            tags = ("bad",) if "BIG" in row[5] or row[4] == "—" and \
-                "not a currency" in row[5] else ()
+            alarm = ("BIG" in row[5] or "NOT saved" in row[5]
+                     or "not a currency" in row[5])
+            tags = ("bad",) if alarm else ()
             t.insert("", "end", values=row, tags=tags)
         n = len(plan.changes)
         self.roe_notes.configure(text="\n".join(plan.warnings))
