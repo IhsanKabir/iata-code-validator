@@ -839,3 +839,24 @@ def test_the_newest_rate_sheet_is_offered(tmp_path):
         os.utime(p, (time.time() + i, time.time() + i))
     (tmp_path / "~$07th Oct ROW.xlsx").write_bytes(b"x")
     assert latest_sheet(tmp_path) == str(new)
+
+
+def test_preview_looks_again_for_todays_sheet(app, monkeypatch, tmp_path):
+    """The app may have been open since yesterday: the auto-picked sheet is
+    refreshed on Preview; one the user chose by hand is kept."""
+    _unlock_pricing(app, monkeypatch)
+    old, new = tmp_path / "ROE 07.xlsx", tmp_path / "ROE 08.xlsx"
+    for p in (old, new):
+        p.write_bytes(b"x")
+    monkeypatch.setattr(app, "_zenith_session", object(), raising=False)
+    monkeypatch.setattr(app, "_pricing_start", lambda *a, **k: None)
+    monkeypatch.setattr("src.roe_gui.latest_sheet", lambda _f: str(new))
+    app._roe_auto_sheet = str(old)
+    app.roe_sheet.set(str(old))
+    app._roe_preview()
+    assert app.roe_sheet.get() == str(new)
+    mine = tmp_path / "my pick.xlsx"
+    mine.write_bytes(b"x")
+    app.roe_sheet.set(str(mine))
+    app._roe_preview()
+    assert app.roe_sheet.get() == str(mine)

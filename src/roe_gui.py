@@ -52,8 +52,8 @@ class RoeMixin:
     def _roe_build(self, parent: ttk.Frame) -> None:
         self._roe_plan = None
         box = self._section(parent, "Today's rates")
-        self.roe_sheet = tk.StringVar(
-            value=latest_sheet(Path.home() / "Downloads"))
+        self._roe_auto_sheet = latest_sheet(Path.home() / "Downloads")
+        self.roe_sheet = tk.StringVar(value=self._roe_auto_sheet)
         self._form_row(box, 0, "Rate sheet:",
                        ttk.Entry(box, textvariable=self.roe_sheet),
                        label_width=18,
@@ -110,6 +110,13 @@ class RoeMixin:
     def _roe_preview(self) -> None:
         if not self._pricing_ready():
             return
+        # left on the sheet picked for you? then look again -- the app may
+        # have been open since yesterday, and today's sheet is newer
+        if self.roe_sheet.get().strip() in ("", self._roe_auto_sheet):
+            newest = latest_sheet(Path.home() / "Downloads")
+            if newest:
+                self._roe_auto_sheet = newest
+                self.roe_sheet.set(newest)
         path = Path(self.roe_sheet.get().strip())
         if not path.is_file():
             messagebox.showerror(_TITLE, "Pick today's rate sheet first.")
@@ -191,6 +198,7 @@ class RoeMixin:
             try:
                 res = roe.apply(self._pricing_client(), plan,
                                 update_linked=update_linked,
+                                stop=self._pricing_stop,
                                 progress=lambda m: self._post(
                                     PRICING_MSG_LOG, m))
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -223,12 +231,13 @@ class RoeMixin:
         self.roe_notes.configure(text="Every other currency: " + (
             "unchanged ✓" if res.untouched_ok
             else " · ".join(res.untouched_notes)))
-        ok = not res.failed and res.untouched_ok and all(c.ok for c in
-                                                         res.checks)
+        ok = (not res.failed and not res.verify_problem and res.untouched_ok
+              and all(c.ok for c in res.checks))
         self._pricing_log(("Saved and checked ✓ — " if ok else
                            "Saved with problems — ") + Path(path).name)
-        if res.failed:
-            self.pricing_warning.configure(text=res.failed)
+        problems = " ".join(x for x in (res.failed, res.verify_problem) if x)
+        if problems:
+            self.pricing_warning.configure(text=problems)
 
     def _roe_handle_msg(self, kind: str, payload) -> bool:
         if kind == PRICING_MSG_ROE_PLAN:

@@ -38,9 +38,11 @@ def build_workbook(plan, res, out_path) -> None:
                     f"{res.finished} · linked taxes "
                     f"{'updated' if res.update_linked else 'not updated'}",
           size=9, color=GREY)
-    verdict = ("All saved and checked." if not res.failed and res.untouched_ok
+    verdict = ("All saved and checked." if not res.failed
+               and not res.verify_problem and res.untouched_ok
                and all(c.ok for c in res.checks)
-               else res.failed or "Saved — but see the checks marked ✗.")
+               else res.failed or res.verify_problem
+               or "Saved — but see the checks marked ✗.")
     _cell(ws, 3, 1, verdict, bold=True,
           fill=GOOD if verdict.startswith("All") else BAD)
     r = _headers(ws, 5, HEADERS)
@@ -72,12 +74,23 @@ def build_workbook(plan, res, out_path) -> None:
     for w in plan.warnings:
         _cell(ws, r, 1, f"Note: {w}", fill=PAPER)
         r += 1
+    linked = sorted({t for c in plan.changes if c.code in {
+        k.code for k in res.checks if k.saved.startswith("✓")}
+        for t in c.linked_taxes})
+    if linked and res.update_linked:
+        _cell(ws, r, 1, "Linked taxes " + ", ".join(linked) + " were sent "
+              "for update with the rate (Zenith's 'Yes'); their own amounts "
+              "are not re-checked here — look at them in the tax screen.",
+              fill=WARN)
+        r += 1
     ws.freeze_panes = "B6"
     wb.save(str(out_path))
 
 
 def default_filename() -> str:
-    return f"ROE_Update_{date.today():%Y-%m-%d}.xlsx"
+    """Date AND time: a second run the same day keeps the first's record."""
+    from datetime import datetime
+    return f"ROE_Update_{datetime.now():%Y-%m-%d_%H%M}.xlsx"
 
 
 def preview_rows(plan) -> list:

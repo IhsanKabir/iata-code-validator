@@ -81,6 +81,10 @@ class FakeRoe:
         self.history = {c: [] for c in self.state}
         self.saves = []                 # (nav, form dict)
         self.fail_on_save = set()       # navs whose save raises
+        self.lose_reply = set()         # navs saved, but the reply is lost
+        self.fail_reads_after_save = False
+        self.broken = False
+        self.qs_none = set()            # routes Quick Sale shows no fares on
         self.reply_differs = {}         # code -> value the reply shows
         self.qs_lag = set()             # codes Quick Sale still shows old
 
@@ -100,6 +104,8 @@ class FakeRoe:
             if nav in self.fail_on_save:
                 raise cl.PricingError("Zenith returned 500 3 times.")
             self.saves.append((nav, f))
+            if self.fail_reads_after_save:
+                self.broken = True
             for n, code in enumerate(PAGES[nav], start=1):
                 new = f[f"DeviseTaux{n}"]
                 old, _m, _b, hid = self.state[code]
@@ -108,10 +114,14 @@ class FakeRoe:
                                         hid)
                     self.history[code].insert(0, ("08/10/2026 09:00:00",
                                                   "Tester", old, new))
+            if nav in self.lose_reply:
+                raise cl.PricingError("Network error: timed out")
             shown = dict(self.state)
             for code, v in self.reply_differs.items():
                 shown[code] = (v,) + shown[code][1:]
             return page_html(nav, shown)
+        if self.broken:
+            raise cl.SessionLost("Zenith signed the session out")
         return page_html(nav, self.state)
 
     def roe_history(self, hid):
@@ -124,6 +134,8 @@ class FakeRoe:
         self._check("GET", cl.QS_COMMAND + "?taskId=x&txtRequest="
                     + quote(command))
         code = command.rsplit("FC-", 1)[1]
+        if command[3:9] in self.qs_none:
+            return "<span>NO FARES</span>"
         rate = self.state[code][0]
         if code in self.qs_lag:
             rate = "0.1"
@@ -309,7 +321,7 @@ def test_a_failed_page_is_reported_and_the_saved_one_kept():
     plan = plan_for(z, {"KWD": "399.84", "USD": "120.5"})
     z.fail_on_save = {2}
     res = roe.apply(z, plan, today=TODAY)
-    assert "Saving page 2 failed" in res.failed
+    assert "Saving page 2: no proper reply" in res.failed
     by = {c.code: c for c in res.checks}
     assert by["KWD"].ok
     assert by["USD"].saved == "✗ not saved"
@@ -431,3 +443,78 @@ def test_a_click_handler_cannot_change_the_rebuilt_form():
         "</html>", "<script>function go(){ theForm.hAction.value = 'Save'; "
                    "}</script></html>")
     assert dict(roe.browser_form(html, "frmDevise"))["hAction"] == ""
+
+
+# ---- the second weakness pass -------------------------------------------------
+
+def test_the_rate_is_worked_like_a_calculator_before_cutting():
+    """1/399.840064 = 0.0025009999...: the team's calculator shows 0.002501."""
+    assert roe.zenith_rate(Decimal("399.840064")) == Decimal("0.002501")
+
+
+def test_a_lost_reply_is_checked_against_zenith():
+    z = FakeRoe()
+    plan = plan_for(z, {"KWD": "399.84"})
+    z.lose_reply = {1}
+    res = roe.apply(z, plan, today=TODAY)
+    assert "no proper reply" in res.failed
+    assert res.checks[0].saved == "✓ saved (Zenith's reply was lost)"
+    assert res.checks[0].reread.startswith("✓")
+
+
+def test_checks_that_cannot_finish_still_leave_a_record(tmp_path):
+    from openpyxl import load_workbook
+    from src import roe_report as rr
+    z = FakeRoe()
+    plan = plan_for(z, {"KWD": "399.84"})
+    z.fail_reads_after_save = True
+    res = roe.apply(z, plan, today=TODAY)
+    assert z.state["KWD"][0] == "0.002501"           # it did save
+    assert res.checks[0].saved.startswith("✓")
+    assert "could not finish" in res.verify_problem
+    assert res.checks[0].history == "? not checked"
+    path = tmp_path / "r.xlsx"
+    rr.build_workbook(plan, res, path)
+    assert "could not finish" in load_workbook(path)["ROE update"]["A3"].value
+
+
+def test_stop_takes_effect_between_pages():
+    import threading
+    z = FakeRoe()
+    plan = plan_for(z, {"KWD": "399.84", "USD": "120.5"})
+    stop = threading.Event()
+    real = z.roe_post
+
+    def post(form, permit=None):
+        out = real(form, permit)
+        if permit is not None:
+            stop.set()                                # pressed during page 1
+        return out
+    z.roe_post = post
+    res = roe.apply(z, plan, today=TODAY, stop=stop)
+    assert [nav for nav, _f in z.saves] == [1]
+    assert "Stopped before page 2" in res.failed
+    assert {c.code: c.saved[:1] for c in res.checks} == {"KWD": "✓",
+                                                         "USD": "✗"}
+
+
+def test_quick_sale_tries_a_second_route():
+    z = FakeRoe()
+    plan = plan_for(z, {"KWD": "399.84"})
+    z.qs_none = {"DACDXB"}
+    res = roe.apply(z, plan, today=TODAY)
+    assert res.checks[0].quick_sale.startswith("✓")
+
+
+def test_the_record_keeps_each_run_and_names_linked_taxes(tmp_path):
+    from openpyxl import load_workbook
+    from src import roe_report as rr
+    assert rr.default_filename().count("_") == 3           # date and time
+    z = FakeRoe()
+    plan = plan_for(z, {"USD": "120.5"})
+    res = roe.apply(z, plan, today=TODAY)
+    path = tmp_path / "r.xlsx"
+    rr.build_workbook(plan, res, path)
+    text = " ".join(str(c.value) for row in load_workbook(path)[
+        "ROE update"].iter_rows() for c in row if c.value)
+    assert "Linked taxes E5, T6 were sent" in text

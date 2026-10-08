@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from html import unescape
 
 #: A change bigger than this (either way) is flagged for a second look.
@@ -26,7 +26,7 @@ BIG_CHANGE_PCT = Decimal("2")
 #: (40.1 for 401) rather than a market move.
 BLOCK_CHANGE_PCT = Decimal("10")
 #: Quick Sale needs a route and a day to show a conversion; any will do.
-QS_PROBE = "DACDXB"
+QS_PROBES = ("DACDXB", "DACCCU")
 SIX = Decimal("0.000001")
 
 
@@ -101,9 +101,19 @@ def read_rate_sheet(path) -> SheetRates:
     return out
 
 
+#: What a calculator or Excel shows for 1/x before the team cuts it.
+CALC = Decimal("1e-12")
+
+
 def zenith_rate(bdt_per_unit: Decimal) -> Decimal:
-    """1 XXX = 401.00799 BDT -> 1 BDT = 0.002493 XXX (cut, never rounded)."""
-    return (Decimal(1) / bdt_per_unit).quantize(SIX, rounding=ROUND_DOWN)
+    """1 XXX = 401.00799 BDT -> 1 BDT = 0.002493 XXX (cut, never rounded).
+
+    Worked like a calculator first (12 decimals), then cut: 1/399.840064 is
+    0.0025009999..., which a calculator shows -- and the team types -- as
+    0.002501, where cutting the exact value would give 0.002500."""
+    shown = (Decimal(1) / bdt_per_unit).quantize(CALC,
+                                                 rounding=ROUND_HALF_UP)
+    return shown.quantize(SIX, rounding=ROUND_DOWN)
 
 
 def rate_text(rate: Decimal) -> str:
@@ -427,16 +437,21 @@ class RoeResult:
     untouched_ok: bool = False
     untouched_notes: list = field(default_factory=list)
     saved_pages: list = field(default_factory=list)
+    unsure_pages: list = field(default_factory=list)   # reply lost
     failed: str = ""
+    verify_problem: str = ""
     update_linked: bool = True
     started: str = ""
     finished: str = ""
 
 
 def apply(client, plan: RoePlan, *, update_linked: bool = True,
-          today: date | None = None, progress=lambda _m: None) -> RoeResult:
+          today: date | None = None, stop=None,
+          progress=lambda _m: None) -> RoeResult:
     """Save the plan page by page, then verify. Stops before any page whose
-    rates moved since the preview."""
+    rates moved since the preview, and between pages when `stop` is set.
+    Always returns a result -- a check that cannot run says so -- so a save
+    that happened is never left without its record."""
     today = today or date.today()
     res = RoeResult(update_linked=update_linked,
                     started=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -445,8 +460,17 @@ def apply(client, plan: RoePlan, *, update_linked: bool = True,
     check_of = {c.code: c for c in res.checks}
     navs = sorted({c.nav for c in plan.changes})
     for nav in navs:
+        if stop is not None and stop.is_set():
+            res.failed = ("Stopped before page " + str(nav) + " — "
+                          "only the pages listed as saved were saved.")
+            break
         progress(f"Re-reading page {nav} before saving…")
-        fresh = read_all_pages(client)[nav]
+        try:
+            fresh = read_all_pages(client)[nav]
+        except Exception as exc:                      # noqa: BLE001
+            res.failed = (f"Could not re-read page {nav} before saving "
+                          f"({exc}); it was not saved.")
+            break
         moved = [code for code, row in plan.pages[nav].rows.items()
                  if code in fresh.rows and (fresh.rows[code].rate != row.rate
                                             or fresh.rows[code].index
@@ -462,8 +486,11 @@ def apply(client, plan: RoePlan, *, update_linked: bool = True,
             reply = parse_roe_page(client.roe_post(
                 form, permit=plan.permits(fresh, update_linked)))
         except Exception as exc:                      # noqa: BLE001
-            res.failed = (f"Saving page {nav} failed: {exc}. Check the "
-                          f"rates in Zenith before trying again.")
+            # the reply was lost -- Zenith may still have saved it; the
+            # fresh read in _verify says which
+            res.unsure_pages.append(nav)
+            res.failed = (f"Saving page {nav}: no proper reply ({exc}). "
+                          f"The checks below show whether Zenith saved it.")
             break
         res.saved_pages.append(nav)
         for c in plan.changes_on(nav):
@@ -471,19 +498,39 @@ def apply(client, plan: RoePlan, *, update_linked: bool = True,
             check_of[c.code].saved = (
                 "✓ shows " + rate_text(got.rate) if got and got.rate == c.new
                 else f"✗ shows {rate_text(got.rate) if got else 'nothing'}")
-    _verify(client, plan, res, today, progress)
+    try:
+        _verify(client, plan, res, today, progress)
+    except Exception as exc:                          # noqa: BLE001
+        res.verify_problem = (f"The checks could not finish ({exc}) — "
+                              f"look at the rates in Zenith.")
+        for chk in res.checks:
+            for name in ("reread", "modified", "history", "quick_sale"):
+                if getattr(chk, name) == "—":
+                    setattr(chk, name, "? not checked")
     res.finished = time.strftime("%Y-%m-%d %H:%M:%S")
     return res
 
 
 def _verify(client, plan, res, today, progress) -> None:
-    saved = {c.code for c in plan.changes if c.nav in res.saved_pages}
     check_of = {c.code: c for c in res.checks}
+    for chk in res.checks:                 # not even attempted
+        if not any(c.code == chk.code and c.nav in res.saved_pages
+                   + res.unsure_pages for c in plan.changes):
+            chk.saved = "✗ not saved"
     progress("Checking: reading every page again…")
     after = read_all_pages(client)
     now = {code: row for p in after.values() for code, row in p.rows.items()}
     before = {code: row for p in plan.pages.values()
               for code, row in p.rows.items()}
+    for c in plan.changes:                 # reply lost: did it save?
+        if c.nav in res.unsure_pages and c.code in now:
+            check_of[c.code].saved = (
+                "✓ saved (Zenith's reply was lost)"
+                if now[c.code].rate == c.new else "✗ not saved")
+    saved = {c.code for c in plan.changes
+             if c.nav in res.saved_pages
+             or (c.nav in res.unsure_pages
+                 and check_of[c.code].saved.startswith("✓"))}
     wanted = {c.code: c.new for c in plan.changes if c.code in saved}
     for code, row in before.items():
         if code not in now:
@@ -517,18 +564,26 @@ def _verify(client, plan, res, today, progress) -> None:
                                f"{first.old} → {first.new}" if first
                                else "none"))
         progress(f"Checking: Quick Sale in {code}…")
-        day = (today + timedelta(days=7)).strftime("%d%b%y").upper()
+        chk.quick_sale = _quick_sale_check(client, code, wanted[code], today)
+
+
+def _quick_sale_check(client, code, want, today) -> str:
+    """The rate Quick Sale converts with -- any route showing fares will do,
+    so a second is tried when the first shows none."""
+    day = (today + timedelta(days=7)).strftime("%d%b%y").upper()
+    seen = None
+    for route in QS_PROBES:
         try:
-            cur, rate = quick_sale_rate(client.quick_sale(
-                f"FDI{QS_PROBE}/D{day}/R,NP,FC-{code}"))
+            _cur, rate = quick_sale_rate(client.quick_sale(
+                f"FDI{route}/D{day}/R,NP,FC-{code}"))
         except Exception as exc:                      # noqa: BLE001
-            chk.quick_sale = f"? could not ask ({exc})"
+            seen = f"could not ask ({exc})"
             continue
-        chk.quick_sale = ("✓ 1 BDT = " + rate_text(rate) if rate is not None
-                          and rate.quantize(SIX) == wanted[code]
-                          else "? shows " + (rate_text(rate) if rate
-                                             is not None else "no rate")
-                          + " — may take a moment to refresh")
-    for chk in res.checks:
-        if chk.code not in saved:
-            chk.saved = "✗ not saved"
+        if rate is None:
+            seen = "no rate shown"
+            continue
+        if rate.quantize(SIX) == want:
+            return "✓ 1 BDT = " + rate_text(rate)
+        return ("? shows " + rate_text(rate)
+                + " — may take a moment to refresh")
+    return "? " + (seen or "no rate shown")
