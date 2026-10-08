@@ -18,6 +18,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .pricing_lookup_gui import PricingLookupMixin
+from .roe_gui import ROE_HELP, RoeMixin
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ PRICING_MSG_ERROR = "pricing_error"        # payload: str
 _TITLE = "Pricing"
 
 
-class PricingMixin(PricingLookupMixin):
+class PricingMixin(PricingLookupMixin, RoeMixin):
     # ---- building ---------------------------------------------------------
     def _build_zenith_pricing_tab(self, parent: ttk.Frame) -> None:
         """A password screen first; the tab itself is built on unlock."""
@@ -155,6 +156,12 @@ class PricingMixin(PricingLookupMixin):
             "everything set for a fare basis or a route, for any seasons",
             help_text=self.LOOKUP_HELP)
         self._pricing_build_lookup(lookup)
+
+        rates = self._pricing_fold(
+            top, "roe", "Exchange rates (ROE)",
+            "update Zenith's rates from today's rate sheet, then check them",
+            help_text=ROE_HELP)
+        self._roe_build(rates)
 
         parent = top
         # both sections save here, so it sits outside them
@@ -385,9 +392,11 @@ class PricingMixin(PricingLookupMixin):
     def _pricing_buttons(self, kind: str) -> list:
         """Each section has its own copy (either may be folded shut)."""
         names = {"go": ("btn_pricing_run", "btn_pricing_index",
-                        "btn_lookup_run", "btn_lookup_seasons"),
+                        "btn_lookup_run", "btn_lookup_seasons",
+                        "btn_roe_preview"),
                  "stop": ("btn_pricing_stop", "btn_lookup_stop"),
-                 "open": ("btn_pricing_open", "btn_lookup_open")}[kind]
+                 "open": ("btn_pricing_open", "btn_lookup_open",
+                          "btn_roe_open")}[kind]
         return [getattr(self, n) for n in names if hasattr(self, n)]
 
     def _pricing_handle_msg(self, kind: str, payload) -> bool:
@@ -419,7 +428,8 @@ class PricingMixin(PricingLookupMixin):
             self._pricing_log("Stopped — the reason is shown below.")
             self.pricing_warning.configure(text=str(payload))
         else:
-            return self._lookup_handle_msg(kind, payload)
+            return (self._lookup_handle_msg(kind, payload)
+                    or self._roe_handle_msg(kind, payload))
         return True
 
 

@@ -16,6 +16,11 @@ tickets, voids and cancels (BS, TKT, VOID, XP, XS, FOP...). This client can
 do none of that. Every request passes `check_allowed`, which knows exactly
 the reads above -- and for the forms, that no penalty or tax value is being
 sent -- and refuses anything else BEFORE it leaves the machine.
+
+One write exists: saving exchange rates on the ROE screen
+(SaisieTauxDevises.asp). It passes only with a `permit` -- the approved
+plan's own check that the form is the page just read with nothing changed
+but the approved rates (roe.RoePlan.permits).
 """
 from __future__ import annotations
 
@@ -38,6 +43,9 @@ TAXES = "/newui/aerien/commercial/saisie_IATAtaxes.asp"
 #: The browser's own "any new messages?" poll -- a tiny read on the older
 #: (classic ASP) side, which keeps that side's session from timing out.
 KEEP_ALIVE = "/newui/dash/IMSNewMessage.json.asp"
+#: Exchange rates (ROE): the screen and one currency's history.
+ROE = "/newui/ADMIN/gstlists/Devises/SaisieTauxDevises.asp"
+ROE_HISTORY = "/newui/admin/gstlists/devises/DeviseLog.asp"
 #: Zenith's sign-out page; a redirect here means the session has ended.
 SIGNED_OUT = "/delog.asp"
 
@@ -71,13 +79,22 @@ class SessionLost(PricingError):
     """Zenith no longer accepts the session -- sign in again."""
 
 
-def check_allowed(method: str, url: str, data=None) -> None:
-    """Raise ReadOnlyViolation unless this is one of the known reads."""
+def check_allowed(method: str, url: str, data=None, permit=None) -> None:
+    """Raise ReadOnlyViolation unless this is one of the known reads -- or
+    the one write there is: an ROE save that `permit` (the approved plan's
+    own check of the exact form) accepts."""
     parts = urlsplit(url)
     path = parts.path
     lower = path.lower()
     method = method.upper()
-    form = data if isinstance(data, dict) else {}
+    form = dict(data) if isinstance(data, (dict, list, tuple)) else {}
+    if lower == ROE.lower():
+        if parts.query:
+            raise ReadOnlyViolation("ROE screen refused: nothing may ride "
+                                    "in the address.")
+        return _check_roe(method, form, data, permit)
+    if method == "GET" and lower == ROE_HISTORY.lower():
+        return
     if method == "GET" and lower in (FARE_EDITOR.lower(), QS_INIT.lower(),
                                      QS_PAGE.lower(), PENALTIES.lower(),
                                      TAXES.lower(), KEEP_ALIVE.lower()):
@@ -109,6 +126,32 @@ def check_allowed(method: str, url: str, data=None) -> None:
     raise ReadOnlyViolation(f"{method} {path} is not a pricing read.")
 
 
+def _check_roe(method: str, form: dict, data, permit) -> None:
+    if method == "GET":
+        return
+    if method != "POST":
+        raise ReadOnlyViolation(f"{method} on the ROE screen refused.")
+    pairs = list(data.items()) if isinstance(data, dict) else list(data or [])
+    folded = [str(k).lower() for k, _v in pairs]
+    if len(folded) != len(set(folded)):
+        raise ReadOnlyViolation("ROE form refused: a field appears twice.")
+    action = next((str(v) for k, v in pairs if str(k).lower() == "haction"),
+                  "")
+    if action == "":
+        # moving between pages posts the form back: no rate may differ
+        moved = [k for k in form if re.fullmatch(r"DeviseTaux\d+", k)
+                 and str(form[k]).strip() != str(form.get("SAVE_" + k,
+                                                          "")).strip()]
+        if not moved:
+            return
+        raise ReadOnlyViolation("ROE page change refused: it carries "
+                                "changed rates.")
+    if action == "Save" and permit is not None and permit(data):
+        return
+    raise ReadOnlyViolation(
+        f"ROE form refused: hAction {action!r} is not an approved save.")
+
+
 class PricingClient:
     """Pricing reads on a signed-in ZenithSession, one request at a time."""
 
@@ -125,12 +168,12 @@ class PricingClient:
 
     # ---- transport ---------------------------------------------------------
     def _send(self, method: str, path: str, *, params=None, data=None,
-              json_body=None, headers=None):
+              json_body=None, headers=None, permit=None):
         url = self.base + path
         if params:
             from urllib.parse import urlencode
             url += "?" + urlencode(params)
-        check_allowed(method, url, data)
+        check_allowed(method, url, data, permit)
         from .zenith_client import USER_AGENT
         hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
         if path.lower().startswith("/newui/"):
@@ -251,6 +294,26 @@ class PricingClient:
     # ---- taxes -------------------------------------------------------------
     def tax_page(self) -> str:
         return self._send("GET", TAXES).text or ""
+
+    # ---- exchange rates (ROE) ----------------------------------------------
+    def roe_page(self) -> str:
+        return self._send("GET", ROE).text or ""
+
+    def roe_post(self, form, permit=None) -> str:
+        """A page change -- or, with the approved plan's permit, a save.
+        A save is sent ONCE: a retry after a timeout could save twice."""
+        if permit is None:
+            return self._send("POST", ROE, data=list(form)).text or ""
+        attempts, self.attempts = self.attempts, 1
+        try:
+            return self._send("POST", ROE, data=list(form),
+                              permit=permit).text or ""
+        finally:
+            self.attempts = attempts
+
+    def roe_history(self, history_id: int) -> str:
+        return self._send("GET", ROE_HISTORY,
+                          params={"IDDevise": int(history_id)}).text or ""
 
     def tax_search(self, form: dict) -> str:
         return self._send("POST", TAXES, data=form).text or ""

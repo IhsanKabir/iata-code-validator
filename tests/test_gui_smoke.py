@@ -761,3 +761,81 @@ def test_a_finished_lookup_shows_what_it_read(app, monkeypatch):
     assert "Fares 2 rows" in str(app.pricing_summary.cget("text"))
     assert str(app.btn_lookup_open.cget("state")) == "normal"
     assert str(app.btn_pricing_open.cget("state")) == "normal"
+
+
+# ---- Exchange rates (ROE) ------------------------------------------------------
+
+def _roe_plan():
+    from datetime import date
+    from tests.test_roe import FakeRoe, plan_for
+    z = FakeRoe()
+    return z, plan_for(z, {"KWD": "399.84", "AED": "33.643623"})
+
+
+def test_the_roe_section_is_folded_with_save_off_until_a_preview(
+        app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    head, body, _t = app._pricing_folds["roe"]
+    assert not body.winfo_manager()
+    assert str(app.btn_roe_save.cget("state")) == "disabled"
+    shown = {}
+    monkeypatch.setattr("src.roe_gui.messagebox.showinfo",
+                        lambda t, m: shown.setdefault("msg", m))
+    app._roe_plan = None
+    app._roe_save()
+    assert "Preview first" in shown["msg"]
+
+
+def test_a_roe_preview_lists_the_changes_and_allows_saving(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    _z, plan = _roe_plan()
+    app._handle_msg("pricing_roe_plan", plan)
+    rows = [app.roe_tree.item(i, "values")
+            for i in app.roe_tree.get_children()]
+    assert rows[0][:4] == ("KWD", "399.84", "0.002498", "0.002501")
+    assert any(r[0] == "AED" and r[4] == "same" for r in rows)
+    assert str(app.btn_roe_save.cget("state")) == "normal"
+    assert "1 rate(s) to change" in str(app.pricing_status.cget("text"))
+
+
+def test_a_roe_save_asks_first_and_a_no_saves_nothing(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    _z, plan = _roe_plan()
+    app._handle_msg("pricing_roe_plan", plan)
+    asked = {}
+    monkeypatch.setattr(app, "_zenith_session", object(), raising=False)
+    monkeypatch.setattr("src.roe_gui.messagebox.askyesno",
+                        lambda t, m, **k: asked.setdefault("msg", m) and False)
+    started = []
+    monkeypatch.setattr(app, "_pricing_start",
+                        lambda *a, **k: started.append(a))
+    app._roe_save()
+    assert "KWD: 0.002498 → 0.002501" in asked["msg"]
+    assert not started
+
+
+def test_a_finished_roe_save_shows_each_check(app, monkeypatch):
+    from datetime import date
+    from src import roe
+    _unlock_pricing(app, monkeypatch)
+    z, plan = _roe_plan()
+    res = roe.apply(z, plan, today=date(2026, 10, 8))
+    app._handle_msg("pricing_roe_done", ("C:/x/ROE_Update.xlsx", plan, res))
+    row = app.roe_tree.item(app.roe_tree.get_children()[0], "values")
+    assert row[0] == "KWD" and "history ✓" in row[5]
+    assert "Saved and checked ✓" in str(app.pricing_status.cget("text"))
+    assert str(app.btn_roe_open.cget("state")) == "normal"
+
+
+def test_the_newest_rate_sheet_is_offered(tmp_path):
+    import os
+    import time
+    from src.roe_gui import latest_sheet
+    old = tmp_path / "ROE 04th October.xlsx"
+    new = tmp_path / "07th Oct ROW.xlsx"
+    other = tmp_path / "Schedule.xlsx"
+    for i, p in enumerate((old, new, other)):
+        p.write_bytes(b"x")
+        os.utime(p, (time.time() + i, time.time() + i))
+    (tmp_path / "~$07th Oct ROW.xlsx").write_bytes(b"x")
+    assert latest_sheet(tmp_path) == str(new)
