@@ -24,8 +24,9 @@ from datetime import date, datetime, timedelta
 from . import pricing_check as pc
 from . import pricing_parse as pp
 
-#: A lookup is for a handful of fare bases or routes; more is the check's job.
-MAX_FARE_BASES = 150
+#: A lookup is for some fare bases or routes; more is the check's job. Two
+#: busy routes both ways come to a few hundred.
+MAX_FARE_BASES = 400
 
 #: Fare-basis settings shown, in this order (names as Zenith gives them).
 #: Codes such as Refundable / Combinability are shown as Zenith stores them.
@@ -40,6 +41,7 @@ FARE_BASIS_FIELDS = (
 @dataclass
 class LookupSettings:
     fare_bases_text: str = ""        # "YBDCCUO, BBD*" -- wildcards allowed
+    rbd_text: str = ""               # booking classes: "E, S, V, K"
     routes_text: str = ""            # "DAC-CCU, DAC-DXB"
     include_return: bool = True
     season_ids: list = field(default_factory=list)
@@ -48,6 +50,9 @@ class LookupSettings:
     taxes: bool = True
     tax_exemptions: bool = True      # opens each tax: ~3 s and 4 MB each
     quick_sale: bool = True
+    #: Quick Sale amounts in: "" = each fare's own currency (as filed in
+    #: the Fare Editor), or a code such as "USD" for all of them
+    qs_currency: str = ""
 
 
 @dataclass
@@ -83,6 +88,16 @@ def match_fare_bases(text: str, rows: list) -> tuple:
     return list(picked.values()), unmatched
 
 
+def booking_classes(text: str) -> set:
+    """'E, S, V, K' / 'E S V K' / 'ESVK' -> {'E', 'S', 'V', 'K'}."""
+    return {ch for ch in re.sub(r"[^A-Za-z]", "", text or "").upper()}
+
+
+def by_class(rows: list, classes: set) -> list:
+    return [r for r in rows
+            if str(r.get("BookingClassCode") or "").upper() in classes]
+
+
 def lookup_date(season, today: date) -> date:
     """A day inside the season: for one still to come, the check's rule (a
     future day); for one already over, a week after it began."""
@@ -105,10 +120,13 @@ def _when(stamp) -> str:
 # ---- the parts ---------------------------------------------------------------
 
 def _read_fares(client, lookups, chosen, seasons, legs_filter, res, stop,
-                progress, keep_rows):
-    """Fare rows per fare basis and season. Returns {fb id: set of legs}."""
+                progress, keep_rows, currency_of=None):
+    """Fare rows per fare basis and season. Returns {fb id: set of legs};
+    fills `currency_of[(code, leg, season)]` with the filed currency (the
+    adult row's, else the first)."""
     pax = lookups.passenger_types
     legs_of: dict = {}
+    currency_of = {} if currency_of is None else currency_of
     for i, fb in enumerate(chosen, 1):
         for s in seasons:
             if stop.is_set():
@@ -118,6 +136,11 @@ def _read_fares(client, lookups, chosen, seasons, legs_filter, res, stop,
                 if not leg or (legs_filter and leg not in legs_filter):
                     continue
                 legs_of.setdefault(int(fb["IdFareBasis"]), set()).add(leg)
+                key = (fb["Code"], leg, s.name)
+                cur = str(row.get("Currency") or "")
+                if cur and (key not in currency_of
+                            or int(row.get("IdPassengerType") or 0) == 1):
+                    currency_of[key] = cur
                 if keep_rows:
                     res.fares.append({
                         "Season": s.name, "Route": leg, "Fare basis":
@@ -228,7 +251,10 @@ def _exemption_columns(detail, fb_code: dict) -> dict:
 
 
 def _read_quick_sale(client, chosen, legs, seasons, today, res, stop,
-                     progress):
+                     progress, currency_of, forced=""):
+    """How each fare sells, in its own filed currency (Quick Sale's ,FC-XXX)
+    -- or in `forced` for all. Quick Sale shows the selling currency (BDT)
+    unless asked, which is why amounts came out in BDT before."""
     codes = {fb["Code"] for fb in chosen}
     later = [s for s in seasons if pc._d(s.end) > today + timedelta(days=1)]
     for s in seasons:
@@ -242,27 +268,40 @@ def _read_quick_sale(client, chosen, legs, seasons, today, res, stop,
             if stop.is_set():
                 raise InterruptedError("Stopped.")
             day = pc.fdi_date(pc.check_date(s, today))
-            check = pc.CheckResult()
-            net = pc._qs(client, f"FDI{od}/D{day}/R,NP,WT", check, leg, s.name)
-            gross = pc._qs(client, f"FDI{od}/D{day}/R,NP", check, leg, s.name)
-            res.notes.extend(check.problems)
-            if net is None or gross is None:
-                continue
-            g = {f.fare_basis: f for f in gross.fares}
-            listed = set()
-            for f in net.fares:
-                if codes and f.fare_basis not in codes:
-                    continue
-                listed.add(f.fare_basis)
-                row = pc._qs_row(f, g.get(f.fare_basis), net.currency)
-                res.quick_sale.append({"Season": s.name, "Route": leg,
-                                       "Travel date": day,
-                                       "Fare basis": row.pop("code"), **row})
-            for code in sorted(codes - listed):
-                res.quick_sale.append({"Season": s.name, "Route": leg,
-                                       "Travel date": day, "Fare basis": code,
-                                       "Currency": "not listed in Quick Sale"})
+            groups: dict = {}
+            for code in sorted(codes):
+                cur = forced or currency_of.get((code, leg, s.name), "")
+                groups.setdefault(cur, set()).add(code)
+            for cur, mine in sorted(groups.items()):
+                _quick_sale_in(client, od, leg, s, day, cur, mine, res)
         progress(f"Quick Sale: {i:,} of {len(legs):,} routes")
+
+
+def _quick_sale_in(client, od, leg, season, day, cur, codes, res) -> None:
+    """One currency's display (without and with tax) for these fares."""
+    convert = f",FC-{cur}" if cur else ""
+    check = pc.CheckResult()
+    net = pc._qs(client, f"FDI{od}/D{day}/R,NP,WT{convert}", check, leg,
+                 season.name)
+    gross = pc._qs(client, f"FDI{od}/D{day}/R,NP{convert}", check, leg,
+                   season.name)
+    res.notes.extend(check.problems)
+    if net is None or gross is None:
+        return
+    g = {f.fare_basis: f for f in gross.fares}
+    listed = set()
+    for f in net.fares:
+        if f.fare_basis not in codes:
+            continue
+        listed.add(f.fare_basis)
+        row = pc._qs_row(f, g.get(f.fare_basis), net.currency)
+        res.quick_sale.append({"Season": season.name, "Route": leg,
+                               "Travel date": day,
+                               "Fare basis": row.pop("code"), **row})
+    for code in sorted(codes - listed):
+        res.quick_sale.append({"Season": season.name, "Route": leg,
+                               "Travel date": day, "Fare basis": code,
+                               "Currency": "not listed in Quick Sale"})
 
 
 # ---- the whole lookup --------------------------------------------------------
@@ -296,6 +335,7 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
             raise ValueError("None of those routes is in Zenith.")
     by_id = {int(r["IdFareBasis"]): r for r in rows
              if r.get("IdFareBasis") is not None}
+    classes = booking_classes(settings.rbd_text)
     if settings.fare_bases_text.strip():
         chosen, unmatched = match_fare_bases(settings.fare_bases_text, rows)
         if unmatched:
@@ -308,10 +348,21 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
         res.notes.append(f"Fare bases on these routes come from the route "
                          f"list built {index.built} (enabled fare bases "
                          f"only).")
+    elif classes:
+        chosen = [r for r in rows if r.get("IsEnabled")
+                  and r.get("IdFareBasis") is not None]
+        res.notes.append("Booking class alone: every ENABLED fare basis in "
+                         "those classes, on whatever routes it flies.")
     else:
-        raise ValueError("Enter a fare basis or a route (or both).")
+        raise ValueError("Enter a fare basis, a booking class (RBD) or a "
+                         "route.")
+    if classes:
+        chosen = by_class(chosen, classes)
+        res.notes.append("Booking classes: " + ", ".join(sorted(classes)))
     if not chosen:
-        raise ValueError("No fare basis to look up.")
+        raise ValueError("No fare basis to look up" + (
+            f" in booking class {', '.join(sorted(classes))}"
+            if classes else "") + ".")
     if len(chosen) > MAX_FARE_BASES:
         raise ValueError(f"That is {len(chosen):,} fare bases — narrow it to "
                          f"{MAX_FARE_BASES} or fewer (a code pattern or a "
@@ -321,8 +372,10 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
                       for r in chosen]
 
     # which routes each fare basis flies -- from its fare rows
+    currency_of: dict = {}
     legs_of = _read_fares(client, lookups, chosen, seasons, legs, res, stop,
-                          progress, keep_rows=settings.fares)
+                          progress, keep_rows=settings.fares,
+                          currency_of=currency_of)
     if legs:
         routes = set(legs)
     else:
@@ -338,8 +391,12 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
         _read_taxes(client, chosen, routes, seasons, today,
                     settings.tax_exemptions, res, stop, progress)
     if settings.quick_sale and routes:
+        forced = settings.qs_currency.strip().upper()
         _read_quick_sale(client, chosen, routes, seasons, today, res, stop,
-                         progress)
+                         progress, currency_of, forced)
+        res.notes.append("Quick Sale amounts are in " + (
+            forced if forced else "each fare's own currency, as filed in the "
+            "Fare Editor") + " — see the Currency column.")
     res.finished = time.strftime("%Y-%m-%d %H:%M")
     return res
 

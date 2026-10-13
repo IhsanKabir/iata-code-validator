@@ -10,7 +10,8 @@ import pytest
 from src import pricing_check as pc
 from src import pricing_lookup as pl
 from src import pricing_parse as pp
-from tests.test_pricing_check import TODAY, FakeZenith, same_both_seasons
+from tests.test_pricing_check import (TODAY, FakeZenith, fare,
+                                      same_both_seasons)
 
 SUMMER, WINTER, SUMMER27 = 34198, 34199, 42946
 
@@ -77,6 +78,9 @@ class LookupZenith(FakeZenith):
 
 def zenith():
     z = same_both_seasons(LookupZenith())
+    for season in ("SUMMER 2026", "WINTER 2026-27"):     # USD with taxes
+        z.qs[("DACCCU", season, True, "USD")] = [("YBDCCUO", 352, None),
+                                                 ("YBDCCUR", None, 590)]
     for season in (SUMMER, WINTER):
         for row in z.fares[(11, season)]:
             row.update({"Modifier": "A. Staff",
@@ -165,14 +169,16 @@ def test_penalties_and_quick_sale_are_read_for_the_fare_basis(tmp_path):
     assert res.penalties[0]["Fare basis"] == "YBDCCUO"
     assert res.penalties[0]["Fare class (as shown)"] == "Y one way"
     qs = [q for q in res.quick_sale if q["Fare basis"] == "YBDCCUO"]
-    assert [q["OW"] for q in qs] == [37097, 37097]
-    assert qs[0]["OW tax"] == 43100 - 37097
+    # in the fare's own currency (filed in USD), not the BDT display
+    assert [(q["Currency"], q["OW"]) for q in qs] == [("USD", 300),
+                                                      ("USD", 300)]
+    assert qs[0]["OW tax"] == 52
 
 
 def test_a_fare_basis_quick_sale_does_not_list_is_said_so(tmp_path):
     z = zenith()
-    z.qs[("DACCCU", "WINTER 2026-27", False, "BDT")] = [("YBDCCUR", None,
-                                                         61828)]
+    z.qs[("DACCCU", "WINTER 2026-27", False, "USD")] = [("YBDCCUR", None,
+                                                         500)]
     res = look(z, tmp_path, fare_bases_text="YBDCCUO")
     winter = [q for q in res.quick_sale if q["Season"] == "Winter 2026-27"]
     assert winter == [{"Season": "Winter 2026-27", "Route": "DAC-CCU",
@@ -201,7 +207,7 @@ def test_too_broad_a_lookup_asks_to_narrow_it(tmp_path, monkeypatch):
 
 
 def test_nothing_to_look_up_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="fare basis or a route"):
+    with pytest.raises(ValueError, match="fare basis, a booking class"):
         look(zenith(), tmp_path)
     with pytest.raises(ValueError, match="season"):
         look(zenith(), tmp_path, fare_bases_text="YBDCCUO", season_ids=[])
@@ -222,3 +228,51 @@ def test_the_lookup_workbook_has_a_sheet_per_part(tmp_path):
     assert "Miles OW" not in heads          # empty on every row: left out
     taxes = [c.value for c in wb["Taxes"][4]]
     assert "Looked-up fare bases exempt" in taxes
+
+
+# ---- currency, booking class, several routes --------------------------------
+
+def test_quick_sale_can_be_shown_in_one_chosen_currency(tmp_path):
+    z = zenith()
+    res = look(z, tmp_path, fare_bases_text="YBDCCUO", qs_currency="bdt")
+    qs = [q for q in res.quick_sale if q["Fare basis"] == "YBDCCUO"]
+    assert {q["Currency"] for q in qs} == {"BDT"}
+    assert qs[0]["OW"] == 37097
+    assert any("Quick Sale amounts are in BDT" in n for n in res.notes)
+    assert all("FC-BDT" in c for c in z.sent if isinstance(c, str))
+
+
+def test_fares_filed_in_different_currencies_each_show_in_their_own(tmp_path):
+    z = zenith()
+    for season in (34198, 34199):
+        z.fares[(12, season)] = [fare(68, 1, "BDT", 0, rt=61828)]
+    res = look(z, tmp_path, fare_bases_text="YBDCCU*")
+    cur = {(q["Fare basis"], q["Currency"]) for q in res.quick_sale}
+    assert ("YBDCCUO", "USD") in cur and ("YBDCCUR", "BDT") in cur
+
+
+def test_a_booking_class_narrows_or_alone_picks_fare_bases(tmp_path):
+    rows = LookupZenith().fare_basis_list()
+    assert pl.booking_classes("e, s v;K") == {"E", "S", "V", "K"}
+    assert pl.booking_classes("ESVK") == {"E", "S", "V", "K"}
+    assert [r["Code"] for r in pl.by_class(rows, {"X"})] == ["OLDX"]
+    # alone: enabled fare bases in that class
+    res = look(zenith(), tmp_path, rbd_text="Y")
+    assert [f["Code"] for f in res.fare_bases] == ["YBDCCUO", "YBDCCUR"]
+    # with a pattern: narrows it
+    with pytest.raises(ValueError, match="booking class E"):
+        look(zenith(), tmp_path, fare_bases_text="YBD*", rbd_text="E")
+
+
+def test_two_routes_however_typed(tmp_path):
+    idx = pc.RouteIndex(tmp_path / "routes.json")
+    idx.legs = {11: {"DAC-CCU"}, 12: {"DAC-DXB"}}
+    idx.built = "today"
+    idx.save()
+    for typed in ("DAC-CCU, DAC-DXB", "DAC-CCU DAC-DXB", "dac ccu\ndac dxb"):
+        res = pl.run_lookup(zenith(), idx, pl.LookupSettings(
+            routes_text=typed, include_return=False, season_ids=[SUMMER],
+            penalties=False, taxes=False, quick_sale=False), today=TODAY)
+        assert [f["Code"] for f in res.fare_bases] == ["YBDCCUO",
+                                                       "YBDCCUR"], typed
+        assert not any("Not Zenith routes" in n for n in res.notes), typed

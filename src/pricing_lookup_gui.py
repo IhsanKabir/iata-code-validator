@@ -19,6 +19,19 @@ PRICING_MSG_LOOKUP_DONE = "pricing_lookup_done"   # payload: (path, result)
 PRICING_MSG_SEASONS = "pricing_seasons"           # payload: [Season]
 
 _TITLE = "Pricing lookup"
+OWN_CURRENCY = "Each fare's own currency"
+
+
+def qs_currency(choice: str) -> str:
+    """The combobox's text -> '' (own currency) or a 3-letter code."""
+    import re
+    text = (choice or "").strip()
+    if not text or text == OWN_CURRENCY:
+        return ""
+    if not re.fullmatch(r"[A-Za-z]{3}", text):
+        raise ValueError(f"'{text}' is not a currency code — use 3 letters "
+                         f"such as USD.")
+    return text.upper()
 
 
 class PricingLookupMixin:
@@ -49,19 +62,28 @@ class PricingLookupMixin:
         ttk.Label(row, text="  e.g. YBDCCUO, BBDQAR or YBD*",
                   style="Hint.TLabel").pack(side="left")
         self._form_row(box, 0, "Fare basis:", row, label_width=18)
+        self.lookup_rbd = tk.StringVar(value="")
+        row = ttk.Frame(box)
+        ttk.Entry(row, textvariable=self.lookup_rbd, width=20
+                  ).pack(side="left")
+        ttk.Label(row, text="  e.g. E, S, V, K — alone, or to narrow a route "
+                            "or fare basis pattern",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(box, 1, "Booking class (RBD):", row, label_width=18)
         self.lookup_routes = tk.StringVar(value="")
         row = ttk.Frame(box)
         ttk.Entry(row, textvariable=self.lookup_routes, width=50
                   ).pack(side="left")
-        ttk.Label(row, text="  e.g. DAC-DOH — optional with a fare basis",
-                  style="Hint.TLabel").pack(side="left")
-        self._form_row(box, 1, "Routes:", row, label_width=18)
+        ttk.Label(row, text="  e.g. DAC-DOH, DAC-DXB — commas, spaces or "
+                            "one per line", style="Hint.TLabel"
+                  ).pack(side="left")
+        self._form_row(box, 2, "Routes:", row, label_width=18)
         self.lookup_return = tk.BooleanVar(value=True)
-        self._form_row(box, 2, "", ttk.Checkbutton(
+        self._form_row(box, 3, "", ttk.Checkbutton(
             box, text="Include the return direction",
             variable=self.lookup_return), label_width=18)
         self.lookup_season_row = ttk.Frame(box)
-        self._form_row(box, 3, "Seasons:", self.lookup_season_row,
+        self._form_row(box, 4, "Seasons:", self.lookup_season_row,
                        label_width=18)
         self.lookup_seasons: dict = {}          # season id -> BooleanVar
         self.lookup_parts = {p: tk.BooleanVar(value=True) for p in
@@ -71,12 +93,21 @@ class PricingLookupMixin:
         for p, var in self.lookup_parts.items():
             ttk.Checkbutton(row, text=p, variable=var).pack(side="left",
                                                             padx=(0, 10))
-        self._form_row(box, 4, "Parts:", row, label_width=18)
+        self._form_row(box, 5, "Parts:", row, label_width=18)
         self.lookup_exemptions = tk.BooleanVar(value=True)
-        self._form_row(box, 5, "", ttk.Checkbutton(
+        self._form_row(box, 6, "", ttk.Checkbutton(
             box, text="Tax exemptions — opens each tax (about 3 s each, ~40 s "
                       "per route and season)",
             variable=self.lookup_exemptions), label_width=18)
+        self.lookup_qs_currency = tk.StringVar(value=OWN_CURRENCY)
+        row = ttk.Frame(box)
+        ttk.Combobox(row, textvariable=self.lookup_qs_currency, width=28,
+                     values=[OWN_CURRENCY, "BDT", "USD", "AED", "SAR", "QAR",
+                             "OMR", "KWD", "MYR", "SGD", "INR", "CNY"]
+                     ).pack(side="left")
+        ttk.Label(row, text="  pick one, or type any 3-letter code",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(box, 7, "Quick Sale currency:", row, label_width=18)
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -164,8 +195,15 @@ class PricingLookupMixin:
         seasons = [i for i, v in self.lookup_seasons.items() if v.get()]
         parts = {p: v.get() for p, v in self.lookup_parts.items()}
         if not (self.lookup_fare_bases.get().strip()
-                or self.lookup_routes.get().strip()):
-            messagebox.showerror(_TITLE, "Enter a fare basis or a route.")
+                or self.lookup_routes.get().strip()
+                or self.lookup_rbd.get().strip()):
+            messagebox.showerror(_TITLE, "Enter a fare basis, a booking "
+                                         "class or a route.")
+            return
+        try:
+            currency = qs_currency(self.lookup_qs_currency.get())
+        except ValueError as exc:
+            messagebox.showerror(_TITLE, str(exc))
             return
         if not seasons:
             messagebox.showerror(_TITLE, "Tick at least one season (press "
@@ -176,12 +214,13 @@ class PricingLookupMixin:
             return
         settings = LookupSettings(
             fare_bases_text=self.lookup_fare_bases.get(),
+            rbd_text=self.lookup_rbd.get(),
             routes_text=self.lookup_routes.get(),
             include_return=bool(self.lookup_return.get()),
             season_ids=seasons, fares=parts["Fare basis & fares"],
             penalties=parts["Penalties"], taxes=parts["Taxes"],
             tax_exemptions=bool(self.lookup_exemptions.get()),
-            quick_sale=parts["Quick Sale"])
+            quick_sale=parts["Quick Sale"], qs_currency=currency)
         out_dir = Path(self.pricing_output.get().strip() or str(Path.home()))
         self.pricing_summary.configure(text="")
         self._pricing_start(self._lookup_worker, (settings, out_dir),

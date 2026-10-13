@@ -89,22 +89,44 @@ def fdi_date(day: date) -> str:
 
 # ---- routes ------------------------------------------------------------------
 
+def route_pairs(text: str) -> tuple:
+    """Every route typed, however it is separated: 'DAC-DOH, DAC-DXB',
+    'DAC-DOH DAC-DXB', 'dac doh' or one per line; 'DAC-DOH-DXB' is a chain
+    (DAC-DOH, DOH-DXB). Returns ([(from, to)], [what could not be read])."""
+    import re
+    pairs, unread = [], []
+    for token in re.split(r"[,;\n]+", text or ""):
+        single = []                        # airports typed one at a time
+        for chunk in token.split():
+            codes = [c.upper() for c in re.findall(r"[A-Za-z]{3}", chunk)]
+            if re.sub(r"[A-Za-z]{3}|[-–/>]", "", chunk):
+                unread.append(chunk)
+                continue
+            if len(codes) >= 2:
+                pairs.extend(zip(codes, codes[1:]))
+            elif len(codes) == 1:
+                single.append(codes[0])
+                if len(single) == 2:
+                    pairs.append(tuple(single))
+                    single = []
+        if single:
+            unread.append(single[0])
+    return pairs, unread
+
+
 def parse_routes(text: str, known_legs, include_return: bool = True):
     """'DAC-CCU, dac dxb' -> {'DAC-CCU', 'CCU-DAC', ...}; unknown ones listed."""
-    import re
     known = set(known_legs)
     wanted, unknown = set(), []
-    for token in re.split(r"[,;\n]+", text or ""):
-        codes = re.findall(r"[A-Za-z]{3}", token)
-        if not codes:
-            continue
-        if len(codes) != 2:
-            unknown.append(token.strip())
-            continue
-        a, b = (c.upper() for c in codes)
+    pairs, unread = route_pairs(text)
+    unknown.extend(unread)
+    for a, b in pairs:
         legs = [f"{a}-{b}"] + ([f"{b}-{a}"] if include_return else [])
         for leg in legs:
-            (wanted.add(leg) if leg in known else unknown.append(leg))
+            if leg in known:
+                wanted.add(leg)
+            elif leg not in unknown:
+                unknown.append(leg)
     return wanted, unknown
 
 

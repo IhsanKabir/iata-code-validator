@@ -746,8 +746,33 @@ def test_a_lookup_needs_a_fare_basis_or_route(app, monkeypatch):
                         lambda t, m: shown.setdefault("msg", m))
     app.lookup_fare_bases.set("")
     app.lookup_routes.set("")
+    app.lookup_rbd.set("")
     app._lookup_run()
-    assert "fare basis or a route" in shown.get("msg", "")
+    assert "fare basis, a booking class or a route" in shown.get("msg", "")
+
+
+def test_lookup_passes_booking_class_and_currency(app, monkeypatch):
+    _unlock_pricing(app, monkeypatch)
+    monkeypatch.setattr(app, "_zenith_session", object(), raising=False)
+    started = []
+    monkeypatch.setattr(app, "_pricing_start",
+                        lambda target, args, msg: started.append(args[0]))
+    app.lookup_seasons = {1: tk.BooleanVar(value=True)}
+    app.lookup_fare_bases.set("")
+    app.lookup_routes.set("DAC-DOH DAC-DXB")
+    app.lookup_rbd.set("E, S, V, K")
+    app.lookup_qs_currency.set("usd")
+    app._lookup_run()
+    settings = started[-1]
+    assert (settings.rbd_text, settings.qs_currency) == ("E, S, V, K", "USD")
+    from src.pricing_lookup_gui import OWN_CURRENCY, qs_currency
+    assert qs_currency(OWN_CURRENCY) == ""
+    shown = {}
+    monkeypatch.setattr("src.pricing_lookup_gui.messagebox.showerror",
+                        lambda t, m: shown.setdefault("msg", m))
+    app.lookup_qs_currency.set("dollars")
+    app._lookup_run()
+    assert "not a currency code" in shown["msg"]
 
 
 def test_a_finished_lookup_shows_what_it_read(app, monkeypatch):
