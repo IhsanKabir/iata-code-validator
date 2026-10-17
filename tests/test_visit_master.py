@@ -165,6 +165,21 @@ def test_a_date_from_another_month_keeps_its_day(tmp_path):
     assert any(i.kind == "date_outside_month" for i in data.issues)
 
 
+def test_a_block_with_no_date_is_read_not_a_crash(tmp_path):
+    """A block whose date was left blank crashed the whole run
+    (UnboundLocalError on 'moved'). Its visits count, undated."""
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"rep1": [
+        ("", "Zone # 1", "ALEX ROY", [ROW_A]),
+        ("11/08/2026", "Zone # 1", "ALEX ROY", [ROW_B]),
+    ]})
+    data = vm.parse_workbook(p, month=8, year=2026)
+    assert len(data.visits) == 2
+    undated = [v for v in data.visits if v.day is None]
+    assert len(undated) == 1 and not undated[0].date_moved
+    assert any(i.kind == "no_date" for i in data.issues)
+
+
 def test_a_numbered_row_with_no_agency_is_skipped_and_reported(tmp_path):
     p = tmp_path / "visits.xlsx"
     _report(p, {"rep1": [("11/08/2026", "Zone # 1", "ALEX ROY", [

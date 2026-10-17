@@ -345,6 +345,7 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                         f"{ws.title} row {cells[0]}"))
                     continue
                 day = parse_visit_date(raw_day, month=month, year=year)
+                moved = False
                 if day is None:
                     data.issues.append(VisitIssue(rep or ws.title, "no_date",
                                                   agency))
