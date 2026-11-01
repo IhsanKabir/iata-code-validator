@@ -306,6 +306,93 @@ def test_one_rep_written_three_ways_is_one_rep():
     assert len(set(canon.values())) == 1
 
 
+@pytest.mark.parametrize("names", [
+    ["Rubayet Hossain Rupom", "Md. Rubayet Hossain Rupom"],   # title in front
+    ["Md. Nafiuzzaman", "Md.Nafiuzzaman"],                   # no space
+    ["Md Barru Ibna Azam Barno", "Md. Barru Ibna Azam Barno",
+     "Md. Barru Ibna Azam"],                                 # same key twice
+])
+def test_every_spelling_of_one_rep_maps_to_one_name(names):
+    canon = vm.canonical_people(names)
+    assert set(canon) == set(names)          # no spelling left unmapped
+    assert len(set(canon.values())) == 1
+
+
+def test_a_name_inside_another_name_is_not_the_same_person():
+    """By letters, 'Md Hasan' was a prefix of 'Md Hasanuzzaman'."""
+    canon = vm.canonical_people(["Md Hasan", "Md Hasanuzzaman"])
+    assert len(set(canon.values())) == 2
+
+
+def test_a_short_name_fitting_two_people_is_left_alone():
+    canon = vm.canonical_people(["Karim", "Karim Uddin", "Karim Ahmed"])
+    assert len(set(canon.values())) == 3
+
+
+def test_the_merge_does_not_depend_on_the_order_names_arrive():
+    names = ["Md. Barru Ibna Azam", "Barru Ibna Azam Barno", "Md Barru Ibna Azam"]
+    assert vm.canonical_people(names) == vm.canonical_people(names[::-1])
+
+
+@pytest.mark.parametrize("title, expected", [
+    ("01 SEP", "CCU (name not written)"),
+    ("07 SEPT", "CCU (name not written)"),
+    ("Sheet1 (2)", "CCU (name not written)"),
+    ("07.09.2026", "CCU (name not written)"),
+    ("Karim", "Karim"),                      # a person's tab is the person
+    ("Rafi 2", "Rafi 2"),                    # a number alone is not a date
+    ("Mark 2", "Mark 2"),                    # starts like "Mar", is a name
+    ("5 Junaid", "5 Junaid"),                # starts like "Jun", is a name
+])
+def test_a_tab_named_after_a_date_is_not_a_person(title, expected):
+    assert vm.sheet_owner(title, "CCU Sales Visit Report 01-9-2026.xlsx") \
+        == expected
+
+
+def test_without_a_station_code_the_file_name_names_the_sheet():
+    assert vm.sheet_owner("Sheet1", "visit report 3 sep (1).xlsx") \
+        == "visit report (name not written)"
+
+
+def test_report_by_names_the_rep(tmp_path):
+    """The CAN form writes 'Report By: Mr.Omar & Jun' in one cell."""
+    p = tmp_path / "Daily Agency & Cor. Visit Report--CAN.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["Daily Agency & Corporate Sales"])
+    ws.append(["Date & Day:", "11/08/2026", "Zone # 1"])
+    ws.append(["Report By: Mr.Omar & Jun"])
+    ws.append(HEADER)
+    ws.append(["1"] + ROW_A)
+    wb.save(p)
+    data = vm.parse_workbook(p, month=8, year=2026)
+    assert [v.rep for v in data.visits] == ["Mr.Omar & Jun"]
+
+
+def test_a_blank_name_on_date_tabs_is_one_rep_not_one_per_day(tmp_path):
+    p = tmp_path / "CCU Sales Visit Report 01-9-2026.xlsx"
+    wb = Workbook()
+    wb.remove(wb.active)
+    for tab, day in (("01 SEP", "01/09/2026"), ("02 SEP", "02/09/2026")):
+        _block(wb.create_sheet(tab), day, "Zone #22", "", [ROW_A])
+    wb.save(p)
+    data = vm.parse_workbook(p, month=9, year=2026)
+    assert {v.rep for v in data.visits} == {"CCU (name not written)"}
+
+
+def test_name_of_the_company_is_not_read_as_the_rep(tmp_path):
+    p = tmp_path / "visits.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Karim"
+    ws.append(["Name of the Company", "Some Airline"])
+    _block(ws, "11/08/2026", "Zone # 1", "", [ROW_A])
+    wb.save(p)
+    data = vm.parse_workbook(p, month=8, year=2026)
+    assert [v.rep for v in data.visits] == ["Karim"]
+
+
 def test_two_different_reps_on_one_sheet_stay_two():
     canon = vm.canonical_people(["Md. Mahmudul Hasan", "Yeachir Arafat"])
     assert len(set(canon.values())) == 2

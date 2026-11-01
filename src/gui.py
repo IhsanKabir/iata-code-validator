@@ -4666,6 +4666,13 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 f"Billing figure written on "
                 f"{info.get('figure_rate', 0):.0%} of visits; "
                 f"{info.get('zone_blank', 0):,} visit(s) name no zone")
+            repeated = (
+                f"Repeated entries: {info.get('stock_reps', 0)} rep(s) used one "
+                f"remark on many agencies · {info.get('copied_remarks', 0)} "
+                f"remark(s) written by more than one rep · "
+                f"{info.get('shared_phones', 0)} phone number(s) on more than "
+                f"one agency (REPEATED ENTRIES, under Days out)")
+            self._vis_log(repeated)
             self._vis_log(f"File: {info.get('path', '')}")
             self.vis_progress_label.configure(text=f"Done{note}.")
             messagebox.showinfo(
@@ -4673,7 +4680,7 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 f"{info.get('reps', 0)} rep(s), {info.get('visits', 0):,} "
                 f"visit(s), {info.get('agencies', 0):,} agencies{note}.\n"
                 f"Billing figure written on {info.get('figure_rate', 0):.0%} "
-                f"of visits.\n\n{info.get('path', '')}")
+                f"of visits.\n{repeated}.\n\n{info.get('path', '')}")
             self._vis_reset_buttons()
         elif kind == MSG_VIS_ERROR:
             self._vis_log(f"ERROR: {payload}")
@@ -7285,6 +7292,9 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
             "matched": result.matched, "lift": result.lift,
             "visited_change": result.visited_change,
             "control_change": result.control_change,
+            "stock_reps": result.stock_reps,
+            "copied_remarks": result.copied_remarks,
+            "shared_phones": result.shared_phones,
         })
 
     def _fsh_log(self, msg: str) -> None:

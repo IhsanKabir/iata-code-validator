@@ -79,30 +79,59 @@ def identity(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+#: Written in front of a name, or left off it: "Md. Rubayet Hossain Rupom" and
+#: "Rubayet Hossain Rupom" are one rep.
+_TITLES = frozenset({"md", "mr", "mrs", "ms", "dr"})
+
+
 def person_key(name: str) -> str:
-    """'Md. Barru Ibna Azam' and 'Md Barru Ibna Azam Barno' are one rep."""
-    return re.sub(r"[^a-z ]", "", _n(name).lower()).strip()
+    """'Md. Barru Ibna Azam', 'Md.Barru Ibna Azam' and 'Barru Ibna Azam' are one
+    key. Punctuation is a word break: dropping it instead glued 'Md.Nafiuzzaman'
+    into 'mdnafiuzzaman', a different person from 'Md. Nafiuzzaman'."""
+    words = re.sub(r"[^a-z]+", " ", _n(name).lower()).split()
+    start = 0
+    while start < len(words) - 1 and words[start] in _TITLES:
+        start += 1
+    return " ".join(words[start:])
+
+
+def _same_person(a: str, b: str) -> bool:
+    """One key is the other with words added: 'barru ibna azam' and 'barru ibna
+    azam barno'. Whole words only -- by letters, 'hasan' swallowed
+    'hasanuzzaman'."""
+    return a == b or a.startswith(b + " ") or b.startswith(a + " ")
 
 
 def canonical_people(names) -> dict:
     """Map every spelling of a rep to one name -- the fullest one written.
 
     One sheet carried three spellings of the same person, which split their work
-    three ways in a scorecard meant to compare people.
+    three ways in a scorecard meant to compare people. Every spelling is mapped,
+    not one per key, and a short name that fits two longer ones is left alone
+    rather than handed to whichever was seen first.
     """
-    keys = sorted({person_key(n): n for n in names}.items(),
-                  key=lambda kv: -len(kv[0]))
+    by_key: dict[str, list[str]] = defaultdict(list)
+    for n in names:
+        by_key[person_key(n)].append(n)
     canon: dict[str, str] = {}
     chosen: list[tuple[str, str]] = []
-    for key, name in keys:
-        for other_key, other_name in chosen:
-            if other_key.startswith(key) or key.startswith(other_key):
-                canon[name] = other_name
-                break
+    for key in sorted(by_key, key=lambda k: (-len(k), k)):
+        spellings = by_key[key]
+        fits = [name for other, name in chosen if _same_person(other, key)]
+        if len(fits) == 1:
+            target = fits[0]
         else:
-            chosen.append((key, name))
-            canon[name] = name
+            target = max(spellings, key=lambda s: (len(s), s))
+            chosen.append((key, target))
+        for s in spellings:
+            canon[s] = target
     return canon
+#: Where a form names the rep: "Name:", "Report By: Mr.Omar & Jun". The label
+#: must end there or be followed by a colon or dash, so "Name of the Company"
+#: is not read as a person.
+REP_LABEL_RE = re.compile(
+    r"^(?:name|report(?:ed)?\s*by|prepared\s+by|submitted\s+by|visited\s+by|"
+    r"sales\s*person(?:'s)?(?:\s+name)?)\s*(?:[:\-]\s*(.*))?$", re.I)
 PHONE_RE = re.compile(r"\d{6,}")
 ZONE_RE = re.compile(r"zone\s*[#:]?\s*(\d+)", re.I)
 #: An ISO date, optionally with a time: what openpyxl hands over when a
@@ -286,11 +315,56 @@ def _read_context(cells, keys, current, raw=None):
             if ZONE_CODE_RE.match(c):
                 zone = f"Zone {c.upper()}"
                 break
-    for j, k in enumerate(keys):
-        if k.startswith("name") and "agent" not in k and "agency" not in k:
-            if j + 1 < len(cells) and cells[j + 1]:
-                rep = cells[j + 1]
+    if cells and SERIAL_RE.match(cells[0]):
+        return day, zone, rep            # a visit row never names the rep
+    for j, c in enumerate(cells):
+        m = REP_LABEL_RE.match(c)
+        if not m or "agent" in keys[j] or "agency" in keys[j]:
+            continue
+        # "Report By: Mr.Omar & Jun" carries the name in the label's own cell;
+        # "Name:" puts it in the next one
+        inline = (m.group(1) or "").strip(" :-")
+        if inline:
+            rep = inline
+        elif j + 1 < len(cells) and cells[j + 1]:
+            rep = cells[j + 1]
     return day, zone, rep
+
+
+#: A month as it is written -- whole, so "Mark 2" and "5 Junaid" stay people.
+_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|"
+          r"july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+          r"dec(?:ember)?)\.?")
+#: A tab name that says nothing about who wrote it: "01 SEP", "Sep-7",
+#: "07.09.2026", "Sheet1 (2)". Used as the rep, each became a person of its own
+#: -- one CCU rep showed up as four, one per day.
+GENERIC_TAB_RE = re.compile(
+    rf"^(?:sheet\s*\d*(?:\s*\(\d+\))?|\d{{1,2}}(?:st|nd|rd|th)?[\s\-./]*{_MONTH}"
+    rf"(?:[\s\-./]*\d{{2,4}})?|{_MONTH}[\s\-./]*\d{{1,2}}(?:[\s\-./]*\d{{2,4}})?|"
+    r"[\d\s\-./]+)$", re.I)
+
+
+def sheet_owner(title: str, path) -> str:
+    """Who a sheet belongs to when its form names nobody.
+
+    A tab called after a person is that person. A tab called after a date or
+    left as 'Sheet1' is not, so the file speaks instead: its station code
+    ('CCU Sales Visit Report 01-9-2026' -> CCU), or failing that its name with
+    the dates and copy numbers taken off, so every day of one rep's reports
+    lands on one line.
+    """
+    title = _n(title)
+    if title and not GENERIC_TAB_RE.match(title):
+        return title
+    stem = Path(path).stem
+    codes = [w for w in re.split(r"[^A-Za-z]+", stem)
+             if len(w) == 3 and w.isupper() and w.lower() not in MONTH_NAMES]
+    if codes:
+        label = codes[0]
+    else:
+        label = re.sub(r"\(\d+\)|\d+|\b" + _MONTH + r"\b", " ", stem, flags=re.I)
+        label = re.sub(r"[\s\-_.,]+", " ", label).strip() or title or stem
+    return f"{label} (name not written)"
 
 
 def parse_workbook(path, *, month=None, year=None) -> VisitData:
@@ -305,6 +379,7 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                 data.empty_sheets += 1
                 continue
             data.sheets += 1
+            owner = sheet_owner(ws.title, path)
             cols: dict[int, str] = {}
             raw_day = zone = rep = ""
             for row in rows:
@@ -341,13 +416,13 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                     kind = ("no_agency" if any(got.values())
                             else "blank_row")
                     data.issues.append(VisitIssue(
-                        rep or ws.title, kind,
+                        rep or owner, kind,
                         f"{ws.title} row {cells[0]}"))
                     continue
                 day = parse_visit_date(raw_day, month=month, year=year)
                 moved = False
                 if day is None:
-                    data.issues.append(VisitIssue(rep or ws.title, "no_date",
+                    data.issues.append(VisitIssue(rep or owner, "no_date",
                                                   agency))
                 elif month and year and (day.month != month or day.year != year):
                     # An August report holding a March date is a template that
@@ -355,7 +430,7 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                     # counter sheets do. The DAY is what the rep meant; the
                     # month is the caller's, and the discrepancy is reported.
                     data.issues.append(VisitIssue(
-                        rep or ws.title, "date_outside_month",
+                        rep or owner, "date_outside_month",
                         f"{agency}: written {day:%d %b %Y}"))
                     try:
                         day, moved = date(year, month, day.day), True
@@ -365,13 +440,13 @@ def parse_workbook(path, *, month=None, year=None) -> VisitData:
                     moved = False
                 prod = parse_money(got.get("productivity"))
                 if prod is None:
-                    data.issues.append(VisitIssue(rep or ws.title,
+                    data.issues.append(VisitIssue(rep or owner,
                                                   "no_productivity", agency))
                 if not got.get("phone"):
-                    data.issues.append(VisitIssue(rep or ws.title, "no_phone",
+                    data.issues.append(VisitIssue(rep or owner, "no_phone",
                                                   agency))
                 data.visits.append(Visit(
-                    rep=rep or ws.title, sheet=ws.title, day=day, zone=zone,
+                    rep=rep or owner, sheet=ws.title, day=day, zone=zone,
                     agency=agency, contact=got.get("contact", ""),
                     designation=got.get("designation", ""),
                     phone=got.get("phone", ""), location=got.get("location", ""),
@@ -654,6 +729,9 @@ class VisitResult:
     visited_change: float | None = None
     stopped: bool = False
     window: str = ""
+    stock_reps: int = 0          # reps giving one remark to many agencies
+    copied_remarks: int = 0      # remarks written by two reps, not jointly
+    shared_phones: int = 0       # numbers filed for two different agencies
 
 
 def build_master(selection, out_path, *, month: int, year: int,
@@ -672,6 +750,11 @@ def build_master(selection, out_path, *, month: int, year: int,
         raise ValueError("No agency visits were found in those files.")
     reps, zones, agencies = summarise(data)
     issues = Counter(i.kind for i in data.issues)
+    # after summarise: the rep names are merged, so one person's two
+    # spellings do not read as two people writing the same remark
+    from .visit_repeats import find_repeats, stock_share, write_repeats
+    repeated = find_repeats(data.visits)
+    stock = stock_share(repeated)
 
     wb = Workbook()
     ws = wb.active
@@ -775,7 +858,7 @@ def build_master(selection, out_path, *, month: int, year: int,
         "Sales rep", "Visits", "Agencies seen", "Repeat visits", "Repeat %",
         "Days out", "Visits per day", "Zones", "Billing seen (BDT)",
         "Figure written", "Figure coverage", "Phone missing", "Date missing",
-        "", "", "", "", "", "", "", "Verdict"])
+        "Stock remark %", "", "", "", "", "", "", "Verdict"])
     for rp in sorted(reps.values(), key=lambda x: -len(x.agencies)):
         cover = rp.figure_rate
         if rp.no_date > rp.visits * 0.25:
@@ -814,7 +897,13 @@ def build_master(selection, out_path, *, month: int, year: int,
               align="center")
         _cell(ws, r, 13, rp.no_date or None, size=9, border=True,
               align="center")
-        for j in range(14, 21):
+        # visits carrying a remark this rep gave many agencies: the reason is
+        # under REPEATED ENTRIES
+        canned = stock.get(rp.rep)
+        _cell(ws, r, 14, canned, fmt=PCT, size=9, border=True, align="center",
+              fill=(BAD if canned and canned >= 0.5
+                    else WARN if canned and canned >= 0.25 else None))
+        for j in range(15, 21):
             _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
               align="center")
@@ -836,6 +925,7 @@ def build_master(selection, out_path, *, month: int, year: int,
     # immediately under the column it explains, rather than on a sheet
     # of its own that nobody opens.
     r = write_day_audit(ws, r, data)
+    r = write_repeats(ws, r, repeated)
 
     r = _band(ws, r, "ZONE COVERAGE",
               "a zone nobody wrote down cannot be assigned to anyone")
@@ -974,7 +1064,9 @@ def build_master(selection, out_path, *, month: int, year: int,
         lift=impact.lift if impact else None,
         control_change=impact.control_change if impact else None,
         visited_change=impact.visited_change if impact else None,
-        stopped=bool(stop_flag is not None and stop_flag()))
+        stopped=bool(stop_flag is not None and stop_flag()),
+        stock_reps=repeated.stock_reps, copied_remarks=repeated.copied,
+        shared_phones=len(repeated.phones))
 
 
 def build_master_path(out_dir, month: int, year: int) -> Path:
