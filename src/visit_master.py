@@ -89,6 +89,10 @@ def person_key(name: str) -> str:
     key. Punctuation is a word break: dropping it instead glued 'Md.Nafiuzzaman'
     into 'mdnafiuzzaman', a different person from 'Md. Nafiuzzaman'."""
     words = re.sub(r"[^a-z]+", " ", _n(name).lower()).split()
+    if not words:
+        # a name in Bangla has no a-z at all; reduced to nothing, every such
+        # rep shared one empty key and was merged into one person
+        return " ".join(re.sub(r"[\W_]+", " ", _n(name).lower()).split())
     start = 0
     while start < len(words) - 1 and words[start] in _TITLES:
         start += 1
@@ -752,7 +756,8 @@ def build_master(selection, out_path, *, month: int, year: int,
     issues = Counter(i.kind for i in data.issues)
     # after summarise: the rep names are merged, so one person's two
     # spellings do not read as two people writing the same remark
-    from .visit_repeats import find_repeats, stock_share, write_repeats
+    from .visit_repeats import (find_repeats, stock_share, write_overlaps,
+                                write_repeats)
     repeated = find_repeats(data.visits)
     stock = stock_share(repeated)
 
@@ -924,8 +929,10 @@ def build_master(selection, out_path, *, month: int, year: int,
     # Days out counts DATES, not rows. The reconciliation sits here,
     # immediately under the column it explains, rather than on a sheet
     # of its own that nobody opens.
-    r = write_day_audit(ws, r, data)
+    # straight under the scorecard it explains: below Days out it sat under
+    # that section's list of every omitted row, 800+ rows down
     r = write_repeats(ws, r, repeated)
+    r = write_day_audit(ws, r, data)
 
     r = _band(ws, r, "ZONE COVERAGE",
               "a zone nobody wrote down cannot be assigned to anyone")
@@ -1020,6 +1027,7 @@ def build_master(selection, out_path, *, month: int, year: int,
         r += 1
 
     r += 1
+    r = write_overlaps(ws, r, repeated)
     ws.merge_cells(f"A{r}:{LAST}{r}")
     _cell(ws, r, 1,
           "  Method: each rep's sheet repeats a block per day, and the columns "

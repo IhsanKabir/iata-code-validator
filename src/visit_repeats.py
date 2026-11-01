@@ -31,13 +31,15 @@ SHARED_MIN_WORDS = 4
 #: Two agency names this alike under one phone number are one agency spelled
 #: twice ("Darvish Travels" / "DARWISH TRAVEL"), not two agencies.
 AGENCY_SAME = 85
-#: How many example rows a finding shows.
-EXAMPLES = 12
 
 
 def norm_text(text) -> str:
-    """Lower case, punctuation as spaces: what two copies of one remark share."""
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+    """Lower case, punctuation as spaces: what two copies of one remark share.
+
+    Letters of any script are kept: a-z only turned a remark written in Bangla
+    into nothing, and it dropped out of every check without a word.
+    """
+    return " ".join(re.sub(r"[\W_]+", " ", str(text or "").lower()).split())
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,13 @@ class SharedPhone:
     phone: str
     agencies: tuple
     entries: list             # Entry.text is the contact person
-    same_contact: bool        # one person at every agency: one owner, two firms?
+    contact: str              # DIFFERENT, NOT_WRITTEN or SAME (see _contact)
+
+
+#: The contact people under one shared number. A different person at each
+#: agency is the case to check; one person at several may own several firms;
+#: a blank contact says neither, and is not counted as either.
+DIFFERENT, NOT_WRITTEN, SAME = "different", "not written", "same person"
 
 
 @dataclass
@@ -106,7 +114,7 @@ class RepeatResult:
     @property
     def phones_different(self) -> int:
         """Numbers with a different contact person at each agency."""
-        return sum(1 for p in self.phones if not p.same_contact)
+        return sum(1 for p in self.phones if p.contact == DIFFERENT)
 
     @property
     def copied(self) -> int:
@@ -183,7 +191,13 @@ def shared_remarks(visits, leader_of: dict) -> list:
         if (len(reps) < 2 or len(leader) < SHARED_MIN_CHARS
                 or len(leader.split()) < SHARED_MIN_WORDS):
             continue
-        joint = len({(identity(v.agency), v.day) for v in vs}) == 1
+        # joint when every row's agency-and-day was also visited by another
+        # rep: two reps on a round of three agencies together is still one
+        # round, not one rep copying the other
+        met: dict = defaultdict(set)
+        for v in vs:
+            met[(identity(v.agency), v.day)].add(v.rep)
+        joint = all(len(who) > 1 for who in met.values())
         out.append(SharedRemark(
             text=Counter(_n(v.remarks) for v in vs).most_common(1)[0][0],
             reps=tuple(reps), joint=joint,
@@ -201,6 +215,10 @@ def phone_keys(raw) -> list:
     text = _n(raw)
     if not text or ISO_DATE_RE.match(text) or DATE_RE.fullmatch(text):
         return []
+    # a number typed into a number cell comes back as "1711654417.0" or
+    # "1.711654417E9"; read as digits, the first became 7116544170
+    if re.fullmatch(r"\d+(?:\.\d+)?[eE]\+?\d+|\d+\.0+", text):
+        text = str(int(float(text)))
     keys = []
     for part in re.split(r"[,;/&]|\bor\b|\s{2,}", text):
         digits = re.sub(r"\D", "", part)
@@ -234,13 +252,25 @@ def _agency_groups(names) -> list:
     return groups
 
 
-def _one_contact(entries) -> bool:
-    """Every row names the same contact person (and at least one names one)."""
+def _one_person(a: str, b: str) -> bool:
+    """Two contact names for one person. A one-letter slip counts: on a name
+    as short as 'rony' / 'roni' it scores 75, under any useful threshold."""
     from rapidfuzz import fuzz
+    from rapidfuzz.distance import Levenshtein
 
-    keys = [person_key(e.text) for e in entries if person_key(e.text)]
-    return bool(keys) and len(keys) == len(entries) and all(
-        fuzz.ratio(keys[0], k) >= AGENCY_SAME for k in keys[1:])
+    return fuzz.ratio(a, b) >= AGENCY_SAME or Levenshtein.distance(a, b) <= 1
+
+
+def _contact(entries) -> str:
+    """DIFFERENT if two rows name different people, SAME if every row names
+    the same one, NOT_WRITTEN otherwise. A blank used to count as a different
+    person, and put a missing name among the strongest findings."""
+    keys = [person_key(e.text) for e in entries if _n(e.text)]
+    if any(not _one_person(keys[0], k) for k in keys[1:]):
+        return DIFFERENT
+    if keys and len(keys) == len(entries):
+        return SAME
+    return NOT_WRITTEN
 
 
 def shared_phones(visits) -> list:
@@ -257,9 +287,10 @@ def shared_phones(visits) -> list:
                    for v in sorted(vs, key=_order)]
         out.append(SharedPhone(
             phone=phone, agencies=tuple(g[0] for g in groups),
-            entries=entries, same_contact=_one_contact(entries)))
+            entries=entries, contact=_contact(entries)))
     # a different person at each agency is the one to check first
-    return sorted(out, key=lambda p: (p.same_contact, -len(p.agencies),
+    rank = {DIFFERENT: 0, NOT_WRITTEN: 1, SAME: 2}
+    return sorted(out, key=lambda p: (rank[p.contact], -len(p.agencies),
                                       p.phone))
 
 
@@ -314,11 +345,6 @@ def stock_share(res: RepeatResult) -> dict:
 # --------------------------------------------------------------------------
 # the section on the Visits sheet
 # --------------------------------------------------------------------------
-#: The overlap list is for information; past this it pushes the rest of the
-#: sheet out of sight for no gain.
-OVERLAPS_SHOWN = 40
-
-
 def _day(d) -> str:
     return f"{d:%d %b}" if d else "no date"
 
@@ -326,8 +352,8 @@ def _day(d) -> str:
 def write_repeats(ws, r: int, res: RepeatResult) -> int:
     """The repeated-entries section, from row r; returns the next free row.
 
-    On the Visits sheet, beside the Days out reconciliation, not on a sheet of
-    its own: both say how far a rep's rows can be taken at their word.
+    On the Visits sheet straight under the rep scorecard, not on a sheet of
+    its own: it says how far a rep's rows can be taken at their word.
     """
     from .counter_master import (BAD, GREY, LAST, PAPER, PCT, WARN, _band,
                                  _cell, _headers)
@@ -365,12 +391,9 @@ def write_repeats(ws, r: int, res: RepeatResult) -> int:
         _cell(ws, r, 3, s.rows, size=9, border=True, align="center")
         _cell(ws, r, 4, s.share, fmt=PCT, size=9, border=True, align="center",
               fill=BAD if s.share >= 0.5 else WARN if s.share >= 0.25 else None)
-        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=21)
-        _cell(ws, r, 5, s.text[:300]
+        _wide(ws, r, 5, s.text
               + (f"   (+{s.wordings - 1} near-identical wording(s))"
-                 if s.wordings > 1 else ""),
-              size=9, border=True, wrap=True)
-        ws.row_dimensions[r].height = 26 if len(s.text) > 110 else 15
+                 if s.wordings > 1 else ""), _cell)
         r += 1
     r += 1
 
@@ -382,12 +405,10 @@ def write_repeats(ws, r: int, res: RepeatResult) -> int:
                         "written by two different reps.", size=9, color=GREY)
         r += 1
     for s in res.shared:
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=21)
-        _cell(ws, r, 1,
+        _wide(ws, r, 1,
               f"  {'JOINT VISIT — ' if s.joint else ''}{len(s.reps)} reps, "
-              f"{len(s.entries)} row(s):  “{s.text[:250]}”",
-              bold=True, size=9, fill=PAPER if s.joint else WARN, wrap=True)
-        ws.row_dimensions[r].height = 26 if len(s.text) > 110 else 15
+              f"{len(s.entries)} row(s):  “{s.text}”", _cell,
+              bold=True, fill=PAPER if s.joint else WARN)
         r = _entries(ws, r + 1, s.entries, "Remark as written")
     r += 1
 
@@ -396,7 +417,7 @@ def write_repeats(ws, r: int, res: RepeatResult) -> int:
               "a different person at each agency first; one person at several "
               "may simply own several firms")
     r = _headers(ws, r, ["Number (last 10)", "Agencies", "Contact person",
-                         "Dates", "Agency — contact (rep)", *blank[5:]])
+                         "Agency — contact (rep, date)", *blank[4:]])
     if not res.phones:
         _cell(ws, r, 1, "No phone number was filed for two different agencies.",
               size=9, color=GREY)
@@ -404,60 +425,70 @@ def write_repeats(ws, r: int, res: RepeatResult) -> int:
     for p in res.phones:
         _cell(ws, r, 1, p.phone, bold=True, size=9, border=True)
         _cell(ws, r, 2, len(p.agencies), size=9, border=True, align="center")
-        _cell(ws, r, 3, "same person" if p.same_contact else "different",
-              size=9, border=True, align="center",
-              fill=None if p.same_contact else WARN)
-        _cell(ws, r, 4, ", ".join(dict.fromkeys(_day(e.day)
-                                                for e in p.entries))[:40],
-              size=8, color=GREY, border=True)
-        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=21)
+        _cell(ws, r, 3, p.contact, size=9, border=True, align="center",
+              fill=WARN if p.contact == DIFFERENT else None)
         text = "; ".join(dict.fromkeys(
-            f"{e.agency} — {e.text or '?'} ({e.rep})" for e in p.entries))
-        _cell(ws, r, 5, text[:400], size=9, border=True, wrap=True)
-        ws.row_dimensions[r].height = 26 if len(text) > 120 else 15
+            f"{e.agency} — {e.text or 'no contact written'} "
+            f"({e.rep}, {_day(e.day)})" for e in p.entries))
+        _wide(ws, r, 4, text, _cell)
         r += 1
-    r += 1
+    return r + 1
 
-    # ---- one agency, more than one rep -------------------------------------
+
+def write_overlaps(ws, r: int, res: RepeatResult) -> int:
+    """Agencies more than one rep visited, every one of them.
+
+    At the foot of the Visits sheet rather than inside REPEATED ENTRIES: it is
+    a territory question, not a copying one, and a long list there pushed
+    everything after it out of sight -- while cutting it short hid the rest.
+    """
+    from .counter_master import GREY, _band, _cell, _headers
+
     r = _band(ws, r, "ONE AGENCY, MORE THAN ONE REP",
-              "for information: a territory question, not a copying one")
-    r = _headers(ws, r, ["Agency", "Reps", "Visits", "Dates",
-                         "Which reps (location written)", *blank[5:]])
+              "for information: two reps covering one agency is a territory "
+              "question — a common name in two stations is usually two "
+              "businesses, so the location each rep wrote is shown")
+    r = _headers(ws, r, ["Agency", "Reps", "Visits",
+                         "Rep (location written) and dates", *[""] * 17])
     if not res.overlaps:
         _cell(ws, r, 1, "Every agency was visited by one rep only.",
               size=9, color=GREY)
-        r += 1
-    for o in res.overlaps[:OVERLAPS_SHOWN]:
+        return r + 2
+    for o in res.overlaps:
         _cell(ws, r, 1, o.agency, bold=True, size=9, border=True)
         _cell(ws, r, 2, len(o.reps), size=9, border=True, align="center")
         _cell(ws, r, 3, o.visits, size=9, border=True, align="center")
-        _cell(ws, r, 4, ", ".join(_day(d) for d in o.days)[:60] or "no date",
-              size=8, color=GREY, border=True)
-        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=21)
-        _cell(ws, r, 5, "; ".join(o.where or o.reps)[:300], size=9,
-              border=True)
-        r += 1
-    if len(res.overlaps) > OVERLAPS_SHOWN:
-        _cell(ws, r, 1, f"… and {len(res.overlaps) - OVERLAPS_SHOWN} more "
-                        "agencies, fewest reps last", size=8, color=GREY)
+        _wide(ws, r, 4, "; ".join(o.where or o.reps)
+              + f"   ·   {', '.join(_day(d) for d in o.days) or 'no date'}",
+              _cell)
         r += 1
     return r + 1
+
+
+#: About this many characters fit on one line of the merged D:U cell.
+LINE_CHARS = 150
+
+
+def _wide(ws, r: int, c: int, text: str, _cell, **kw) -> None:
+    """Text across the rest of the row, whole: wrapped and given the height it
+    needs, never cut short."""
+    ws.merge_cells(start_row=r, start_column=c, end_row=r, end_column=21)
+    _cell(ws, r, c, text, size=kw.pop("size", 9), border=True, wrap=True, **kw)
+    lines = max(1, -(-len(text) // LINE_CHARS))
+    ws.row_dimensions[r].height = max(ws.row_dimensions[r].height or 15,
+                                      13 * lines + 2)
 
 
 def _entries(ws, r: int, entries, what: str) -> int:
     from .counter_master import GREY, _cell, _headers
 
     r = _headers(ws, r, ["Sales rep", "Date", "Agency", what, *[""] * 17])
-    for e in entries[:EXAMPLES]:
+    # every row, not a sample: these rows are the evidence for the line above
+    for e in entries:
         _cell(ws, r, 1, e.rep, size=9, border=True)
         _cell(ws, r, 2, _day(e.day), size=9, border=True, align="center")
         _cell(ws, r, 3, e.agency, size=9, border=True)
-        ws.merge_cells(start_row=r, start_column=4, end_row=r, end_column=21)
-        _cell(ws, r, 4, e.text[:300], size=9, color=GREY, border=True)
-        r += 1
-    if len(entries) > EXAMPLES:
-        _cell(ws, r, 1, f"… and {len(entries) - EXAMPLES} more row(s)",
-              size=8, color=GREY)
+        _wide(ws, r, 4, e.text, _cell, color=GREY)
         r += 1
     return r
 

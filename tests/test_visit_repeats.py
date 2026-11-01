@@ -81,6 +81,21 @@ def test_two_reps_at_one_agency_on_one_day_is_a_joint_visit():
     assert res.shared[0].joint and res.copied == 0
 
 
+def test_two_reps_on_one_round_of_agencies_is_a_joint_visit():
+    """Together at three agencies, the same remark at each: one round."""
+    vs = [visit(rep, a, LINE) for rep in ("Karim", "Rahim")
+          for a in agencies(3)]
+    res = vr.find_repeats(vs)
+    assert res.shared[0].joint and res.copied == 0
+
+
+def test_a_joint_visit_does_not_cover_a_copy_elsewhere():
+    vs = [visit("Karim", "Alpha Travels", LINE),
+          visit("Rahim", "Alpha Travels", LINE),
+          visit("Rahim", "Beta Tours", LINE, day=5)]
+    assert vr.find_repeats(vs).copied == 1
+
+
 def test_two_reps_saying_new_agency_is_not_copying():
     vs = [visit("Karim", "Alpha Travels", "New agency"),
           visit("Rahim", "Beta Tours", "New agency")]
@@ -132,9 +147,57 @@ def test_a_different_person_at_each_agency_is_listed_first():
           visit("Atik", "DBM Travels", phone="01715612300",
                 contact="Mr. Tariqul")]
     res = vr.find_repeats(vs)
-    assert [(p.phone, p.same_contact) for p in res.phones] == [
-        ("1715612300", False), ("1711531548", True)]
+    assert [(p.phone, p.contact) for p in res.phones] == [
+        ("1715612300", vr.DIFFERENT), ("1711531548", vr.SAME)]
     assert res.phones_different == 1
+
+
+def test_a_blank_contact_is_not_counted_as_a_different_person():
+    vs = [visit("Atik", "Fly Feni", phone="01711531548", contact="Mr. Shaheen"),
+          visit("Atik", "Universal Overseas", phone="01711531548")]
+    res = vr.find_repeats(vs)
+    assert res.phones[0].contact == vr.NOT_WRITTEN
+    assert res.phones_different == 0
+
+
+def test_a_one_letter_slip_in_a_contact_name_is_the_same_person():
+    vs = [visit("Atik", "Sunrise Travel Inn", phone="01920502019",
+                contact="Mr Roni"),
+          visit("Atik", "Moonrise Holidays", phone="01920502019",
+                contact="Mr. Rony")]
+    assert vr.find_repeats(vs).phones[0].contact == vr.SAME
+
+
+def test_a_blank_does_not_hide_two_different_people():
+    vs = [visit("Atik", "Air Top", phone="01715612300", contact="Mr. Mamun"),
+          visit("Atik", "DBM Travels", phone="01715612300", contact="Mr. Tariqul"),
+          visit("Atik", "Grace Travels", phone="01715612300")]
+    assert vr.find_repeats(vs).phones[0].contact == vr.DIFFERENT
+
+
+@pytest.mark.parametrize("raw", ["1711654417.0", "1.711654417E9",
+                                 "1.711654417e+09"])
+def test_a_phone_stored_as_a_number_keeps_its_digits(raw):
+    """'1711654417.0' read as digits was 7116544170, a different number."""
+    assert vr.phone_keys(raw) == ["1711654417"]
+
+
+# --------------------------------------------------------------------------
+# remarks and names in Bangla
+# --------------------------------------------------------------------------
+BANGLA = "ঢাকা কুয়ালালামপুর রুটের ভাড়া নিয়ে মালিকের সাথে আলোচনা হয়েছে"
+
+
+def test_a_remark_in_bangla_is_checked_not_dropped():
+    vs = [visit("Hamed", a, BANGLA) for a in agencies(5)]
+    assert vr.norm_text(BANGLA)
+    assert vr.find_repeats(vs).stock[0].agencies == 5
+
+
+def test_reps_named_in_bangla_stay_different_people():
+    """With a-z only, every Bangla name became '' and all were one person."""
+    canon = vm.canonical_people(["করিম উদ্দিন", "রহিম আহমেদ"])
+    assert len(set(canon.values())) == 2
 
 
 @pytest.mark.parametrize("raw, keys", [
@@ -200,3 +263,39 @@ def test_the_findings_land_on_the_visits_sheet(tmp_path):
     hamed = next(row for row in ws.iter_rows(min_row=head[0].row)
                  if row[0].value == "Hamed")
     assert hamed[13].value == 1.0
+
+
+def _sheet_text(ws) -> list:
+    return [str(c.value) for row in ws.iter_rows() for c in row
+            if c.value is not None]
+
+
+def test_nothing_is_cut_short_and_overlaps_sit_at_the_foot(tmp_path):
+    """Every overlap and the whole remark: a cap hid the rest, a cut hid the
+    end of the sentence. The overlap list goes after DATA QUALITY so a long
+    one does not push the zone and agency tables out of sight."""
+    from tests.test_visit_master import _report
+
+    long_line = LINE + ", " + "and the group fare for the Hajj season " * 12
+    rows = [[a, "Mr. X", "Owner", f"0171000000{i}", "Motijheel",
+             "BDT- 1000000/-", "KSA", long_line]
+            for i, a in enumerate(agencies(5))]
+    shared = [[f"Shared {i} Travels", "Mr. Y", "Owner", f"0181000000{i}",
+               "Paltan", "", "", ""] for i in range(45)]
+    p = tmp_path / "visits.xlsx"
+    _report(p, {"Hamed": [("11/09/2026", "Zone # 1", "Hamed", rows + shared)],
+                "Karim": [("12/09/2026", "Zone # 1", "Karim", shared)]})
+    out = tmp_path / "master.xlsx"
+    vm.build_master(p, out, month=9, year=2026)
+    text = _sheet_text(load_workbook(out)["Visits"])
+    assert any(long_line.strip() in t for t in text)
+    joined = "\n".join(text)
+    assert all(f"Shared {i} Travels" in joined for i in range(45))
+    assert "more agencies" not in joined
+    assert joined.index("DATA QUALITY") < joined.index(
+        "ONE AGENCY, MORE THAN ONE REP")
+    # the findings sit under the scorecard, ahead of Days out and its long
+    # list of omitted rows
+    assert (joined.index("SALES REP SCORECARD")
+            < joined.index("REPEATED ENTRIES")
+            < joined.index("DAYS OUT"))

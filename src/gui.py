@@ -4671,7 +4671,8 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 f"remark on many agencies · {info.get('copied_remarks', 0)} "
                 f"remark(s) written by more than one rep · "
                 f"{info.get('shared_phones', 0)} phone number(s) on more than "
-                f"one agency (REPEATED ENTRIES, under Days out)")
+                f"one agency (REPEATED ENTRIES, under the rep scorecard; "
+                f"agencies two reps visited are at the foot of the sheet)")
             self._vis_log(repeated)
             self._vis_log(f"File: {info.get('path', '')}")
             self.vis_progress_label.configure(text=f"Done{note}.")
