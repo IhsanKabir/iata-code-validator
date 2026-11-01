@@ -4674,6 +4674,12 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 f"one agency (REPEATED ENTRIES, under the rep scorecard; "
                 f"agencies two reps visited are at the foot of the sheet)")
             self._vis_log(repeated)
+            resent = (
+                f"Re-sent reports: {info.get('resent_reports', 0)} day "
+                f"report(s) sent again under a later date · "
+                f"{info.get('resent_rows', 0)} row(s) repeating an earlier "
+                f"report (RE-SENT REPORTS, under the rep scorecard)")
+            self._vis_log(resent)
             self._vis_log(f"File: {info.get('path', '')}")
             self.vis_progress_label.configure(text=f"Done{note}.")
             messagebox.showinfo(
@@ -4681,7 +4687,7 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
                 f"{info.get('reps', 0)} rep(s), {info.get('visits', 0):,} "
                 f"visit(s), {info.get('agencies', 0):,} agencies{note}.\n"
                 f"Billing figure written on {info.get('figure_rate', 0):.0%} "
-                f"of visits.\n{repeated}.\n\n{info.get('path', '')}")
+                f"of visits.\n{resent}.\n{repeated}.\n\n{info.get('path', '')}")
             self._vis_reset_buttons()
         elif kind == MSG_VIS_ERROR:
             self._vis_log(f"ERROR: {payload}")
@@ -7296,6 +7302,8 @@ class App(WhatsAppMixin, HealthMixin, FFPMixin, PricingMixin):
             "stock_reps": result.stock_reps,
             "copied_remarks": result.copied_remarks,
             "shared_phones": result.shared_phones,
+            "resent_reports": result.resent_reports,
+            "resent_rows": result.resent_rows,
         })
 
     def _fsh_log(self, msg: str) -> None:

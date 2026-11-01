@@ -736,6 +736,8 @@ class VisitResult:
     stock_reps: int = 0          # reps giving one remark to many agencies
     copied_remarks: int = 0      # remarks written by two reps, not jointly
     shared_phones: int = 0       # numbers filed for two different agencies
+    resent_reports: int = 0      # day reports sent again whole, another date
+    resent_rows: int = 0         # rows repeating an earlier report
 
 
 def build_master(selection, out_path, *, month: int, year: int,
@@ -760,6 +762,9 @@ def build_master(selection, out_path, *, month: int, year: int,
                                 write_repeats)
     repeated = find_repeats(data.visits)
     stock = stock_share(repeated)
+    from .visit_resends import find_resends, resend_counts, write_resends
+    resent = find_resends(data.visits, repeated)
+    resent_by_rep = resend_counts(resent)
 
     wb = Workbook()
     ws = wb.active
@@ -863,10 +868,16 @@ def build_master(selection, out_path, *, month: int, year: int,
         "Sales rep", "Visits", "Agencies seen", "Repeat visits", "Repeat %",
         "Days out", "Visits per day", "Zones", "Billing seen (BDT)",
         "Figure written", "Figure coverage", "Phone missing", "Date missing",
-        "Stock remark %", "", "", "", "", "", "", "Verdict"])
+        "Stock remark %", "Days re-sent", "Rows re-sent", "", "", "", "",
+        "Verdict"])
     for rp in sorted(reps.values(), key=lambda x: -len(x.agencies)):
         cover = rp.figure_rate
-        if rp.no_date > rp.visits * 0.25:
+        # a day's report filed again under another date: under RE-SENT REPORTS
+        sent_days, sent_rows = resent_by_rep.get(rp.rep, (0, 0))
+        if sent_days:
+            # first: a "STRONG" earned on copied days is not strong
+            verdict, tone = "REPORT RE-SENT", BAD
+        elif rp.no_date > rp.visits * 0.25:
             verdict, tone = "DATES MISSING", WARN
         elif rp.visits and len(rp.agencies) / rp.visits < 0.5:
             verdict, tone = "MOSTLY REVISITS", WARN
@@ -908,7 +919,11 @@ def build_master(selection, out_path, *, month: int, year: int,
         _cell(ws, r, 14, canned, fmt=PCT, size=9, border=True, align="center",
               fill=(BAD if canned and canned >= 0.5
                     else WARN if canned and canned >= 0.25 else None))
-        for j in range(15, 21):
+        _cell(ws, r, 15, sent_days or None, size=9, border=True,
+              align="center", fill=BAD if sent_days else None)
+        _cell(ws, r, 16, sent_rows or None, size=9, border=True,
+              align="center", fill=WARN if sent_rows else None)
+        for j in range(17, 21):
             _cell(ws, r, j, None, border=True)
         _cell(ws, r, 21, verdict, bold=True, size=9, fill=tone, border=True,
               align="center")
@@ -931,6 +946,7 @@ def build_master(selection, out_path, *, month: int, year: int,
     # of its own that nobody opens.
     # straight under the scorecard it explains: below Days out it sat under
     # that section's list of every omitted row, 800+ rows down
+    r = write_resends(ws, r, resent)
     r = write_repeats(ws, r, repeated)
     r = write_day_audit(ws, r, data)
 
@@ -1074,7 +1090,9 @@ def build_master(selection, out_path, *, month: int, year: int,
         visited_change=impact.visited_change if impact else None,
         stopped=bool(stop_flag is not None and stop_flag()),
         stock_reps=repeated.stock_reps, copied_remarks=repeated.copied,
-        shared_phones=len(repeated.phones))
+        shared_phones=len(repeated.phones),
+        resent_reports=sum(d for d, _ in resent_by_rep.values()),
+        resent_rows=sum(n for _, n in resent_by_rep.values()))
 
 
 def build_master_path(out_dir, month: int, year: int) -> Path:
