@@ -885,3 +885,46 @@ def test_preview_looks_again_for_todays_sheet(app, monkeypatch, tmp_path):
     app.roe_sheet.set(str(mine))
     app._roe_preview()
     assert app.roe_sheet.get() == str(mine)
+
+
+def test_the_tax_setup_check_section_reads_its_form(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    if not hasattr(app, "btn_tax_setup_run"):
+        # the Pricing tab builds its contents only once unlocked
+        app._pricing_unlocked = True
+        app._pricing_build_contents(tk.Frame(app.root))
+    app._pricing_toggle("tax_setup", True)
+    assert app.btn_tax_setup_run in app._pricing_buttons("go")
+    assert app.btn_tax_setup_stop in app._pricing_buttons("stop")
+    app.tax_setup_codes.set("ae zr")
+    app.tax_setup_routes.set("AUH-*")
+    app.tax_setup_kinds["DOM-DOM"].set(False)
+    app.tax_setup_date.set("03/11/2026")
+    got = app._tax_setup_settings()
+    assert (got.codes_text, got.routes_text, got.date_ddmmyyyy) == (
+        "ae zr", "AUH-*", "03/11/2026")
+    assert "DOM-DOM" not in got.kinds and "INT-DOM" in got.kinds
+    app.tax_setup_date.set("2026-11-03")
+    with pytest.raises(ValueError):
+        app._tax_setup_settings()
+    assert app._pricing_handle_msg("pricing_tax_setup_unknown", None) is False
+
+
+def test_the_season_check_and_lookup_offer_route_types(app):
+    for widget in list(app._tab_widgets.values()):
+        app._ensure_tab_built(widget)
+    if not hasattr(app, "pricing_kinds"):
+        app._pricing_unlocked = True
+        app._pricing_build_contents(tk.Frame(app.root))
+    for kinds in (app.pricing_kinds, app.lookup_kinds):
+        assert app._ticked_kinds(kinds) == ("INT-INT", "INT-DOM", "DOM-INT",
+                                            "DOM-DOM")
+        for k, var in kinds.items():
+            var.set(k == "DOM-DOM")
+        assert app._ticked_kinds(kinds) == ("DOM-DOM",)
+        kinds["DOM-DOM"].set(False)
+        with pytest.raises(ValueError):
+            app._ticked_kinds(kinds)
+        for var in kinds.values():
+            var.set(True)

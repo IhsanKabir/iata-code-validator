@@ -51,7 +51,9 @@ class PricingLookupMixin:
                 "(current and later seasons only).\n\n"
                 "Fare basis: codes, or patterns — YBD* is every code starting "
                 "YBD. Route alone: every fare basis on it (from the route "
-                "list). READ ONLY, like the season check.")
+                "list); DAC-* is every route from DAC. Route types narrow "
+                "any of these to INT-INT, INT-DOM, DOM-INT or DOM-DOM routes. "
+                "READ ONLY, like the season check.")
 
     def _pricing_build_lookup(self, parent: ttk.Frame) -> None:
         box = self._section(parent, "What to look up")
@@ -74,16 +76,17 @@ class PricingLookupMixin:
         row = ttk.Frame(box)
         ttk.Entry(row, textvariable=self.lookup_routes, width=50
                   ).pack(side="left")
-        ttk.Label(row, text="  e.g. DAC-DOH, DAC-DXB — commas, spaces or "
-                            "one per line", style="Hint.TLabel"
+        ttk.Label(row, text="  e.g. DAC-DOH, DAC-*, *-CGP — commas, spaces "
+                            "or one per line", style="Hint.TLabel"
                   ).pack(side="left")
         self._form_row(box, 2, "Routes:", row, label_width=18)
         self.lookup_return = tk.BooleanVar(value=True)
         self._form_row(box, 3, "", ttk.Checkbutton(
             box, text="Include the return direction",
             variable=self.lookup_return), label_width=18)
+        self.lookup_kinds = self._route_kind_row(box, 4)
         self.lookup_season_row = ttk.Frame(box)
-        self._form_row(box, 4, "Seasons:", self.lookup_season_row,
+        self._form_row(box, 5, "Seasons:", self.lookup_season_row,
                        label_width=18)
         self.lookup_seasons: dict = {}          # season id -> BooleanVar
         self.lookup_parts = {p: tk.BooleanVar(value=True) for p in
@@ -93,9 +96,9 @@ class PricingLookupMixin:
         for p, var in self.lookup_parts.items():
             ttk.Checkbutton(row, text=p, variable=var).pack(side="left",
                                                             padx=(0, 10))
-        self._form_row(box, 5, "Parts:", row, label_width=18)
+        self._form_row(box, 6, "Parts:", row, label_width=18)
         self.lookup_exemptions = tk.BooleanVar(value=True)
-        self._form_row(box, 6, "", ttk.Checkbutton(
+        self._form_row(box, 7, "", ttk.Checkbutton(
             box, text="Tax exemptions — opens each tax (about 3 s each, ~40 s "
                       "per route and season)",
             variable=self.lookup_exemptions), label_width=18)
@@ -107,7 +110,7 @@ class PricingLookupMixin:
                      ).pack(side="left")
         ttk.Label(row, text="  pick one, or type any 3-letter code",
                   style="Hint.TLabel").pack(side="left")
-        self._form_row(box, 7, "Quick Sale currency:", row, label_width=18)
+        self._form_row(box, 8, "Quick Sale currency:", row, label_width=18)
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -202,6 +205,7 @@ class PricingLookupMixin:
             return
         try:
             currency = qs_currency(self.lookup_qs_currency.get())
+            kinds = self._ticked_kinds(self.lookup_kinds)
         except ValueError as exc:
             messagebox.showerror(_TITLE, str(exc))
             return
@@ -216,7 +220,7 @@ class PricingLookupMixin:
             fare_bases_text=self.lookup_fare_bases.get(),
             rbd_text=self.lookup_rbd.get(),
             routes_text=self.lookup_routes.get(),
-            include_return=bool(self.lookup_return.get()),
+            include_return=bool(self.lookup_return.get()), kinds=kinds,
             season_ids=seasons, fares=parts["Fare basis & fares"],
             penalties=parts["Penalties"], taxes=parts["Taxes"],
             tax_exemptions=bool(self.lookup_exemptions.get()),

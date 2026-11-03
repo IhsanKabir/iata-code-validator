@@ -150,8 +150,9 @@ def tax_page():
 def tax_list(rows):
     head = "".join(f"<th>{h}</th>" for h in pp._TAX_HEADER)
     body = ""
-    for name, code, dep, arr, value, intl in rows:
-        body += ("<tr>" + "".join(
+    for name, code, dep, arr, value, intl, *mark in rows:
+        attr = ' data-applicable="false"' if mark == [False] else ""
+        body += (f"<tr{attr}>" + "".join(
             f"<td>{lab} {val}</td>" for lab, val in zip(
                 pp._TAX_HEADER[:5], (name, code, dep, arr, value)))
             + f"<td>International {'&#xe5ca;' if intl else ''}</td>"
@@ -376,6 +377,16 @@ def test_a_tax_changed_between_seasons_is_reported(tmp_path):
     taxes = [f for f in res.findings if f.part == "Taxes"]
     assert [(f.detail, f.value_a, f.value_b) for f in taxes] == [
         ("Value", "5 USD", "7 USD")]
+
+
+def test_a_tax_turned_not_applicable_between_seasons_is_reported(tmp_path):
+    z = same_both_seasons(FakeZenith())
+    z.taxes["31/10/2026"][1] = ("Q - Carrier Imposed Fee", "YQ", "Dhaka",
+                                "Kolkata", "5 USD", True, False)
+    res = run(z, tmp_path)
+    taxes = [f for f in res.findings if f.part == "Taxes"]
+    assert [(f.detail, f.value_a, f.value_b) for f in taxes] == [
+        ("Applicable", "yes", "no")]
 
 
 def test_quick_sale_total_tax_is_compared_too(tmp_path):
@@ -642,3 +653,46 @@ def test_a_fare_set_up_twice_is_compared_copy_by_copy(tmp_path):
     kept = res.values["Fares"][("DAC-CCU", "YBDCCUO · AD - Adult(s) #2")]
     assert kept["Summer 2026"]["AmountOW"] == 350
     assert kept["Winter 2026-27"]["AmountOW"] == 360
+
+
+ZENITH_LEGS = ["DAC-CCU", "CCU-DAC", "DAC-DXB", "DXB-DAC", "DAC-CGP",
+               "CGP-DAC", "CGP-DXB", "DXB-CGP", "CGP-CXB"]
+
+
+def test_routes_from_or_to_an_airport():
+    legs, unknown = pc.parse_routes("DAC-*", ZENITH_LEGS,
+                                    include_return=False)
+    assert legs == {"DAC-CCU", "DAC-DXB", "DAC-CGP"} and unknown == []
+    legs, _ = pc.parse_routes("*-CGP", ZENITH_LEGS, include_return=True)
+    assert legs == {"DAC-CGP", "DXB-CGP", "CGP-DAC", "CGP-DXB", "CGP-CXB"}
+    # wildcards mix with the older ways of typing routes
+    legs, unknown = pc.parse_routes("dac ccu, *-CXB; DAC-DOH-DXB",
+                                    ZENITH_LEGS, include_return=False)
+    assert legs == {"DAC-CCU", "CGP-CXB"}
+    assert "DAC-DOH" in unknown and "DOH-DXB" in unknown
+    legs, unknown = pc.parse_routes("KTM-*", ZENITH_LEGS)
+    assert legs == set() and unknown == ["KTM-*"]
+
+
+def test_route_types_keep_only_those_legs():
+    assert pc.filter_kinds(ZENITH_LEGS, ("DOM-INT",)) == {
+        "DAC-CCU", "DAC-DXB", "CGP-DXB"}
+    assert pc.filter_kinds(ZENITH_LEGS, ("DOM-DOM",)) == {
+        "DAC-CGP", "CGP-DAC", "CGP-CXB"}
+
+
+def test_the_season_check_keeps_only_the_ticked_route_types(tmp_path):
+    z = same_both_seasons(FakeZenith())
+    res = run(z, tmp_path, kinds=("DOM-INT",))
+    assert res.routes == ["DAC-CCU"]
+    with pytest.raises(ValueError, match="route type"):
+        run(z, tmp_path, kinds=("DOM-DOM",))
+
+
+def test_an_odd_leg_name_is_kept_with_every_type_and_never_crashes():
+    odd = ZENITH_LEGS + ["DACCCU", "DAC-DOH-DXB"]
+    assert pc.filter_kinds(odd, ("INT-INT", "INT-DOM", "DOM-INT",
+                                 "DOM-DOM")) == set(odd)
+    assert "DACCCU" not in pc.filter_kinds(odd, ("DOM-INT",))
+    legs, _ = pc.parse_routes("DAC-*", odd, include_return=False)
+    assert "DACCCU" not in legs

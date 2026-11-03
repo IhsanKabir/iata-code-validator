@@ -17,6 +17,7 @@ Every difference is reported; nothing is excused (the user's rule).
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -114,10 +115,43 @@ def route_pairs(text: str) -> tuple:
     return pairs, unread
 
 
+#: A route with a wildcard end: DAC-* (every route from DAC), *-CGP.
+_WILD = re.compile(r"(?<![A-Za-z*])([A-Za-z]{3}|\*)\s*[-–/>]\s*([A-Za-z]{3}|\*)"
+                   r"(?![A-Za-z*])")
+
+
+def _wildcards(text: str) -> tuple:
+    """Take the DAC-* / *-CGP routes out of `text`: ([(from, to)], rest)."""
+    found = []
+
+    def take(m):
+        a, b = m.group(1).upper(), m.group(2).upper()
+        if "*" not in (a, b):
+            return m.group(0)
+        found.append((a, b))
+        return " , "
+    return found, _WILD.sub(take, text or "")
+
+
+def _ends_match(leg: str, a: str, b: str) -> bool:
+    dep, dash, arr = leg.partition("-")
+    return bool(dash) and a in ("*", dep) and b in ("*", arr)
+
+
 def parse_routes(text: str, known_legs, include_return: bool = True):
-    """'DAC-CCU, dac dxb' -> {'DAC-CCU', 'CCU-DAC', ...}; unknown ones listed."""
+    """'DAC-CCU, dac dxb, DAC-*, *-CGP' -> {'DAC-CCU', 'CCU-DAC', ...};
+    unknown ones listed. A * end means every Zenith route at that end."""
     known = set(known_legs)
     wanted, unknown = set(), []
+    wild, text = _wildcards(text)
+    for a, b in wild:
+        ways = [(a, b)] + ([(b, a)] if include_return else [])
+        hits = {leg for leg in known for x, y in ways
+                if _ends_match(leg, x, y)}
+        if hits:
+            wanted |= hits
+        else:
+            unknown.append(f"{a}-{b}")
     pairs, unread = route_pairs(text)
     unknown.extend(unread)
     for a, b in pairs:
@@ -128,6 +162,20 @@ def parse_routes(text: str, known_legs, include_return: bool = True):
             elif leg not in unknown:
                 unknown.append(leg)
     return wanted, unknown
+
+
+def filter_kinds(legs, kinds) -> set:
+    """Only the legs of the ticked types: INT-INT, INT-DOM, DOM-INT,
+    DOM-DOM (DOM = a Bangladesh airport)."""
+    from .tax_setup import KINDS, route_kind
+    if set(KINDS) <= set(kinds):
+        return set(legs)                 # every type: nothing filtered out
+    kept = set()
+    for leg in legs:
+        dep, dash, arr = leg.partition("-")
+        if dash and route_kind(dep, arr) in set(kinds):
+            kept.add(leg)
+    return kept
 
 
 # ---- the route list (which fare bases fly which routes) ----------------------
@@ -466,12 +514,14 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
                             "Value": t.value,
                             "International": "yes" if t.international
                             else "no",
-                            "Domestic": "yes" if t.domestic else "no"}
+                            "Domestic": "yes" if t.domestic else "no",
+                            "Applicable": "yes" if t.applicable else "no"}
                            for t in pp.parse_tax_list(html)]
         for other in others:
             compare_rows("Taxes", lambda r: f"{leg} ({r['route']})",
                          lambda r: r["item"], lists[base.id], lists[other.id],
-                         ("Value", "International", "Domestic"), base.name,
+                         ("Value", "International", "Domestic",
+                          "Applicable"), base.name,
                          other.name, result)
         progress(f"Taxes: {i:,} of {len(legs):,} routes")
 
@@ -541,6 +591,7 @@ def _penalty_rows(client, classes, season_ids, lid, pax_ids, result, leg):
 class Settings:
     routes_text: str = ""            # empty = all routes
     include_return: bool = True
+    kinds: tuple = ("INT-INT", "INT-DOM", "DOM-INT", "DOM-DOM")
     mode: str = "next"               # a SEASON_MODES key
     fares: bool = True
     quick_sale: bool = True
@@ -570,6 +621,11 @@ def run_check(client, index: RouteIndex, settings: Settings, *,
                                    + ", ".join(unknown))
     else:
         legs = set(lookups.legs.values())
+    typed = filter_kinds(legs, settings.kinds)
+    if legs and not typed:
+        raise ValueError("None of those routes is of the ticked route "
+                         "type(s): " + ", ".join(settings.kinds) + ".")
+    legs = typed
     if not legs:
         raise ValueError("No route to check.")
     result.routes = sorted(legs)

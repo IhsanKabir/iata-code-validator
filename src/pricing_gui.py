@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .pricing_lookup_gui import PricingLookupMixin
 from .roe_gui import ROE_HELP, RoeMixin
+from .tax_setup_gui import TAX_SETUP_HELP, TaxSetupMixin
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ PRICING_MSG_ERROR = "pricing_error"        # payload: str
 _TITLE = "Pricing"
 
 
-class PricingMixin(PricingLookupMixin, RoeMixin):
+class PricingMixin(PricingLookupMixin, TaxSetupMixin, RoeMixin):
     # ---- building ---------------------------------------------------------
     def _build_zenith_pricing_tab(self, parent: ttk.Frame) -> None:
         """A password screen first; the tab itself is built on unlock."""
@@ -86,6 +87,9 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
                 "and Quick Sale's total tax per fare.\n"
                 "• Penalties — change, refund and no-show fees per fare "
                 "class, route, passenger type and time window.\n\n"
+                "Routes: name them (DAC-CCU), or every route from or to an "
+                "airport (DAC-*, *-CGP); route types keep only INT-INT, "
+                "INT-DOM, DOM-INT or DOM-DOM routes (DOM = Bangladesh).\n\n"
                 "Every difference is listed. READ ONLY: the app cannot save "
                 "anything in Zenith from here — any request that could is "
                 "refused before it is sent.\n\n"
@@ -99,13 +103,15 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
         row = ttk.Frame(box)
         ttk.Entry(row, textvariable=self.pricing_routes, width=50
                   ).pack(side="left")
-        ttk.Label(row, text="  e.g. DAC-CCU, DAC-DXB — leave empty for ALL "
-                            "routes", style="Hint.TLabel").pack(side="left")
+        ttk.Label(row, text="  e.g. DAC-CCU, DAC-*, *-CGP — leave empty for "
+                            "ALL routes", style="Hint.TLabel"
+                  ).pack(side="left")
         self._form_row(box, 0, "Routes:", row, label_width=18)
         self.pricing_return = tk.BooleanVar(value=True)
         self._form_row(box, 1, "", ttk.Checkbutton(
             box, text="Include the return direction (DAC-CCU → also CCU-DAC)",
             variable=self.pricing_return), label_width=18)
+        self.pricing_kinds = self._route_kind_row(box, 2)
         from .pricing_check import SEASON_MODES
         self.pricing_mode = tk.StringVar(value="next")
         by_label = {v: k for k, v in SEASON_MODES.items()}
@@ -117,7 +123,7 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
             by_label[pick.get()]))
         pick.pack(side="left")
         self.pricing_mode_pick = pick
-        self._form_row(box, 2, "Seasons:", row, label_width=18)
+        self._form_row(box, 3, "Seasons:", row, label_width=18)
         self.pricing_parts = {p: tk.BooleanVar(value=True) for p in
                               ("Fares", "Quick Sale", "Taxes", "Penalties")}
         row = ttk.Frame(box)
@@ -127,7 +133,7 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
         ttk.Label(row, text="Fares + Quick Sale together also check each "
                             "fare is on sale at its amount",
                   style="Hint.TLabel").pack(side="left")
-        self._form_row(box, 3, "Parts:", row, label_width=18)
+        self._form_row(box, 4, "Parts:", row, label_width=18)
 
         ctl = ttk.Frame(parent)
         ctl.pack(fill="x", padx=4, pady=(8, 4))
@@ -157,6 +163,12 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
             help_text=self.LOOKUP_HELP)
         self._pricing_build_lookup(lookup)
 
+        taxes = self._pricing_fold(
+            top, "tax_setup", "Tax setup check",
+            "is a tax set up on every INT/DOM route it should be — and alike?",
+            help_text=TAX_SETUP_HELP)
+        self._tax_setup_build(taxes)
+
         rates = self._pricing_fold(
             top, "roe", "Exchange rates (ROE)",
             "update Zenith's rates from today's rate sheet, then check them",
@@ -164,7 +176,7 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
         self._roe_build(rates)
 
         parent = top
-        # both sections save here, so it sits outside them
+        # every section saves here, so it sits outside them
         out = ttk.Frame(parent)
         out.pack(fill="x", padx=4, pady=(12, 0))
         self.pricing_output = tk.StringVar(value=str(Path.home() /
@@ -186,6 +198,26 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
                                          foreground="#B00020")
         self.pricing_warning.pack(anchor="w", padx=8)
         self._pricing_show_index()
+
+    def _route_kind_row(self, box, grid_row: int) -> dict:
+        """Four ticks -- INT-INT, INT-DOM, DOM-INT, DOM-DOM -- all on."""
+        from .tax_setup import KINDS
+        kinds = {k: tk.BooleanVar(value=True) for k in KINDS}
+        row = ttk.Frame(box)
+        for k, var in kinds.items():
+            ttk.Checkbutton(row, text=k, variable=var).pack(side="left",
+                                                            padx=(0, 10))
+        ttk.Label(row, text="DOM = a Bangladesh airport",
+                  style="Hint.TLabel").pack(side="left")
+        self._form_row(box, grid_row, "Route types:", row, label_width=18)
+        return kinds
+
+    @staticmethod
+    def _ticked_kinds(kinds: dict) -> tuple:
+        got = tuple(k for k, v in kinds.items() if v.get())
+        if not got:
+            raise ValueError("Tick at least one route type.")
+        return got
 
     def _pricing_fold(self, parent, key: str, title: str,
                       about: str = "", help_text: str = "") -> ttk.Frame:
@@ -303,8 +335,14 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
                                          "(Quick Sale and Taxes alone work "
                                          "without it.)")
             return
+        try:
+            kinds = self._ticked_kinds(self.pricing_kinds)
+        except ValueError as exc:
+            messagebox.showerror(_TITLE, str(exc))
+            return
         settings = Settings(routes_text=self.pricing_routes.get(),
                             include_return=bool(self.pricing_return.get()),
+                            kinds=kinds,
                             mode=self.pricing_mode.get(),
                             fares=parts["Fares"],
                             quick_sale=parts["Quick Sale"],
@@ -393,10 +431,11 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
         """Each section has its own copy (either may be folded shut)."""
         names = {"go": ("btn_pricing_run", "btn_pricing_index",
                         "btn_lookup_run", "btn_lookup_seasons",
-                        "btn_roe_preview"),
-                 "stop": ("btn_pricing_stop", "btn_lookup_stop"),
+                        "btn_tax_setup_run", "btn_roe_preview"),
+                 "stop": ("btn_pricing_stop", "btn_lookup_stop",
+                          "btn_tax_setup_stop"),
                  "open": ("btn_pricing_open", "btn_lookup_open",
-                          "btn_roe_open")}[kind]
+                          "btn_tax_setup_open", "btn_roe_open")}[kind]
         return [getattr(self, n) for n in names if hasattr(self, n)]
 
     def _pricing_handle_msg(self, kind: str, payload) -> bool:
@@ -429,6 +468,7 @@ class PricingMixin(PricingLookupMixin, RoeMixin):
             self.pricing_warning.configure(text=str(payload))
         else:
             return (self._lookup_handle_msg(kind, payload)
+                    or self._tax_setup_handle_msg(kind, payload)
                     or self._roe_handle_msg(kind, payload))
         return True
 

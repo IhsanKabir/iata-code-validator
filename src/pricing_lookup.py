@@ -42,8 +42,10 @@ FARE_BASIS_FIELDS = (
 class LookupSettings:
     fare_bases_text: str = ""        # "YBDCCUO, BBD*" -- wildcards allowed
     rbd_text: str = ""               # booking classes: "E, S, V, K"
-    routes_text: str = ""            # "DAC-CCU, DAC-DXB"
+    routes_text: str = ""            # "DAC-CCU, DAC-DXB", "DAC-*"
     include_return: bool = True
+    #: route types kept (DOM = a Bangladesh airport); all four = no filter
+    kinds: tuple = ("INT-INT", "INT-DOM", "DOM-INT", "DOM-DOM")
     season_ids: list = field(default_factory=list)
     fares: bool = True
     penalties: bool = True
@@ -227,7 +229,9 @@ def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
                        "Departure": t.departure, "Arrival": t.arrival,
                        "Value": t.value,
                        "International": "yes" if t.international else "no",
-                       "Domestic": "yes" if t.domestic else "no"}
+                       "Domestic": "yes" if t.domestic else "no",
+                       "Applicable": "yes" if t.applicable else
+                       "NO — Zenith marks it not applicable"}
                 if exemptions and t.tax_id:
                     key = (t.tax_id, day)
                     if key not in opened:
@@ -333,6 +337,10 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
                              + ", ".join(unknown))
         if not legs:
             raise ValueError("None of those routes is in Zenith.")
+        legs = pc.filter_kinds(legs, settings.kinds)
+        if not legs:
+            raise ValueError("None of those routes is of the ticked route "
+                             "type(s): " + ", ".join(settings.kinds) + ".")
     by_id = {int(r["IdFareBasis"]): r for r in rows
              if r.get("IdFareBasis") is not None}
     classes = booking_classes(settings.rbd_text)
@@ -371,10 +379,20 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
     res.fare_bases = [{f: r.get(f) for f in FARE_BASIS_FIELDS}
                       for r in chosen]
 
+    # route types alone narrow what a fare basis / class search reads: the
+    # fares are read on those routes only, and taxes / Quick Sale then go
+    # where the fare bases actually fly -- not every route of the type
+    legs_filter = legs
+    if len(set(settings.kinds)) < 4 and not legs:
+        legs_filter = pc.filter_kinds(lookups.legs.values(), settings.kinds)
+        res.notes.append("Route types: " + ", ".join(settings.kinds))
+        if not legs_filter:
+            raise ValueError("Zenith has no route of the ticked type(s).")
+
     # which routes each fare basis flies -- from its fare rows
     currency_of: dict = {}
-    legs_of = _read_fares(client, lookups, chosen, seasons, legs, res, stop,
-                          progress, keep_rows=settings.fares,
+    legs_of = _read_fares(client, lookups, chosen, seasons, legs_filter, res,
+                          stop, progress, keep_rows=settings.fares,
                           currency_of=currency_of)
     if legs:
         routes = set(legs)

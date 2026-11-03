@@ -264,19 +264,26 @@ def parse_penalty_results(html: str) -> list:
 
 # ---- taxes -------------------------------------------------------------------
 
-def parse_tax_airports(html: str) -> dict:
-    """'DAC' -> geo id, from the tax screen's airport list."""
+def parse_tax_airport_list(html: str) -> list:
+    """[(code, geo id, name)] from the tax screen's airport list -- the
+    name is how a tax row shows its airports ("Abu Dhabi, Zayed ...")."""
     m = re.search(r'<select[^>]*name="RecCodeDestGeo"[^>]*>(.*?)</select>',
-                  html, re.S)
+                  html or "", re.S)
     if not m:
         raise LayoutChanged("Tax screen airport list not found.")
-    out = {}
+    out = []
     for value, label in re.findall(r'<option[^>]*value="(\d+)"[^>]*>([^<]*)',
                                    m.group(1)):
-        code = label.split(" - ", 1)[0].strip()
+        code, _sep, name = unescape(label).partition(" - ")
+        code = code.strip()
         if len(code) == 3:
-            out[code] = int(value)
+            out.append((code, int(value), re.sub(r"\s+", " ", name).strip()))
     return out
+
+
+def parse_tax_airports(html: str) -> dict:
+    """'DAC' -> geo id, from the tax screen's airport list."""
+    return {code: geo for code, geo, _name in parse_tax_airport_list(html)}
 
 
 def tax_search_form(dep_id: int, arr_id: int, date_ddmmyyyy: str) -> dict:
@@ -285,7 +292,10 @@ def tax_search_form(dep_id: int, arr_id: int, date_ddmmyyyy: str) -> dict:
             "Id_TaxeAeropackHidden": "", "NumeroTaxe": "",
             "RT_OrderHidden": "1", "RecCodeDestGeo": str(dep_id),
             "RecCodeDestGeoLinked": str(arr_id),
-            "RecEffDate": date_ddmmyyyy, "searchTaxCode": ""}
+            "RecEffDate": date_ddmmyyyy, "searchTaxCode": "",
+            # as the browser sends it once the box is ticked: taxes Zenith
+            # marks "not applicable" must come back too, never be dropped
+            "ShowNotInUseTaxes": "on"}
 
 
 @dataclass(frozen=True)
@@ -298,6 +308,9 @@ class Tax:
     international: bool
     domestic: bool
     tax_id: int = 0     # opens its details: Affiche(<id>) on the name
+    #: Zenith's own mark on the row (<tr data-applicable="false">): shown
+    #: greyed and hidden unless "Show unapplicable taxes" is ticked
+    applicable: bool = True
 
 
 _TAX_HEADER = ("Tax Name", "Tax Code", "Departure Airport", "Arrival Airport",
@@ -308,7 +321,7 @@ def parse_tax_list(html: str) -> list:
     body = re.sub(r"<script.*?</script>|<style.*?</style>", "", html or "",
                   flags=re.S)
     out, header_seen = [], False
-    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", body, re.S):
+    for attrs, row in re.findall(r"<tr\b([^>]*)>(.*?)</tr>", body, re.S):
         cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, re.S)
         if len(cells) != len(_TAX_HEADER):
             # one cell is a message line; anything else after the header
@@ -330,7 +343,9 @@ def parse_tax_list(html: str) -> list:
         opens = re.search(r"Affiche\((\d+)\)", cells[0])
         out.append(Tax(vals[0], vals[1], vals[2], vals[3], vals[4],
                        ticked[5], ticked[6],
-                       int(opens.group(1)) if opens else 0))
+                       int(opens.group(1)) if opens else 0,
+                       not re.search(r'data-applicable\s*=\s*"?false',
+                                     attrs, re.I)))
     if not header_seen and "Tax Code" in body:
         raise LayoutChanged("Tax list columns changed.")
     return out

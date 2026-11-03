@@ -276,3 +276,27 @@ def test_two_routes_however_typed(tmp_path):
         assert [f["Code"] for f in res.fare_bases] == ["YBDCCUO",
                                                        "YBDCCUR"], typed
         assert not any("Not Zenith routes" in n for n in res.notes), typed
+
+
+def test_route_types_narrow_a_fare_basis_lookup(tmp_path):
+    res = look(zenith(), tmp_path, fare_bases_text="YBDCCUO",
+               kinds=("DOM-INT",))
+    assert res.routes == ["DAC-CCU"] and res.fares
+    res = look(zenith(), tmp_path, fare_bases_text="YBDCCUO",
+               kinds=("INT-DOM",))                 # CCU-DAC / DXB-DAC only
+    assert res.routes == [] and not res.fares and not res.taxes
+
+
+def test_every_route_from_an_airport(tmp_path):
+    idx = pc.RouteIndex(tmp_path / "routes.json")
+    idx.legs = {11: {"DAC-CCU"}, 12: {"DAC-DXB"}}
+    idx.built = "today"
+    idx.save()
+    res = pl.run_lookup(zenith(), idx, pl.LookupSettings(
+        routes_text="DAC-*", include_return=False, season_ids=[SUMMER],
+        penalties=False, taxes=False, quick_sale=False), today=TODAY)
+    assert res.routes == ["DAC-CCU", "DAC-DXB"]
+    with pytest.raises(ValueError, match="route type"):
+        pl.run_lookup(zenith(), idx, pl.LookupSettings(
+            routes_text="DAC-*", include_return=False, season_ids=[SUMMER],
+            kinds=("DOM-DOM",)), today=TODAY)
