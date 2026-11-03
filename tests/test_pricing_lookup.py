@@ -25,7 +25,9 @@ def tax_list_with_ids(rows):
                  f"<td>Departure Airport Dhaka</td><td>Arrival Airport "
                  f"Kolkata</td><td>Value {value}</td><td>International "
                  f"&#xe5ca;</td><td>Domestic </td><td>History</td></tr>")
-    return f"<table><tr>{head}</tr>{body}</table>"
+    # as live: the search form above, the results table below
+    return (f'<select name="RecCodeDestGeo"></select><table id="SeekResult">'
+            f"<tr>{head}</tr>{body}</table>")
 
 
 def tax_detail(code, name, exempt_fb=(), exempt_pax=()):
@@ -186,9 +188,13 @@ def test_a_fare_basis_quick_sale_does_not_list_is_said_so(tmp_path):
                        "Currency": "not listed in Quick Sale"}]
 
 
-def test_a_route_alone_needs_the_route_list(tmp_path):
-    with pytest.raises(ValueError, match="route list"):
-        look(zenith(), tmp_path, routes_text="DAC-CCU")
+def test_a_route_alone_works_without_the_route_list(tmp_path):
+    # Quick Sale (and the penalty screen) say what is on the route
+    res = look(zenith(), tmp_path, routes_text="DAC-CCU",
+               include_return=False)
+    assert [f["Code"] for f in res.fare_bases] == ["YBDCCUO", "YBDCCUR"]
+    assert [f["Found via"] for f in res.fare_bases] == ["Quick Sale"] * 2
+    assert any("No route list yet" in n for n in res.notes)
     idx = pc.RouteIndex(tmp_path / "routes.json")
     idx.legs = {11: {"DAC-CCU"}, 12: {"DAC-CCU"}}
     idx.built = "2026-10-05 16:58"

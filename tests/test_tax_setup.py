@@ -354,3 +354,46 @@ def test_the_workbook(tmp_path):
     assert ts.NOT_SET_UP in findings
     every = [r for r in wb["All taxes"].iter_rows(min_row=5, values_only=True)]
     assert any("ZR" in r and "this route" in r for r in every)
+
+
+# ---- answers that are not a tax list --------------------------------------------
+
+def test_a_pair_with_no_tax_is_an_empty_list_not_an_error():
+    # the live search page always carries its form, with a "Tax Code" label
+    empty = tax_page() + '<label class="FNTFieldName"> Tax Code</label>'
+    assert pp.parse_tax_list(empty) == []
+    _z, res = run([], routes_text="AUH-BKK")
+    assert kinds(res) == [(ts.NO_ROUTE_TAX, "AUH-BKK", "")]
+
+
+def test_a_page_that_is_not_the_tax_screen_stops_with_a_reason():
+    with pytest.raises(pp.LayoutChanged, match="not the tax screen"):
+        pp.parse_tax_list("<html>Please sign in</html>")
+    moved = tax_list([(1, "Fee", "AE", "AUH", "BKK", "75 AED")]).replace(
+        "<th>Tax Code</th>", "<th>Code</th>")
+    with pytest.raises(pp.LayoutChanged, match="column headings"):
+        pp.parse_tax_list(moved)
+
+
+def test_one_unreadable_pair_is_skipped_and_named():
+    class OneOdd(FakeTaxScreen):
+        def tax_search(self, form):
+            if {form["RecCodeDestGeo"], form["RecCodeDestGeoLinked"]} == {
+                    "5543", "6207"}:
+                return "<html>odd</html>"
+            return super().tax_search(form)
+    z = OneOdd(AUH)
+    res = ts.run_tax_setup_check(z, ts.TaxSetupSettings(
+        routes_text="AUH-BKK AUH-CAN AUH-DAC", date_ddmmyyyy="03/11/2026"))
+    assert ("AUH", "CAN") in res.unread and ("AUH", "BKK") not in res.unread
+    assert any(n.startswith("AUH-CAN") and "skipped" in n for n in res.notes)
+    assert (ts.NOT_READ, "AUH-CAN", "") in kinds(res)
+
+
+def test_nothing_readable_at_all_stops_the_run():
+    class Gone(FakeTaxScreen):
+        def tax_search(self, form):
+            return "<html>Please sign in</html>"
+    with pytest.raises(pp.LayoutChanged, match="first 3 airport pairs"):
+        ts.run_tax_setup_check(Gone(AUH), ts.TaxSetupSettings(
+            routes_text="AUH-*", date_ddmmyyyy="03/11/2026"))

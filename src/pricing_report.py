@@ -120,6 +120,9 @@ def write_summary(ws, res) -> None:
               color="B00020")
     else:
         _cell(ws, r, 1, "Everything asked for was read.", color=GREY)
+    for note in getattr(res, "notes", []):
+        r += 1
+        _cell(ws, r, 1, note, color=GREY)
 
 
 # ---- values: every season side by side ---------------------------------------

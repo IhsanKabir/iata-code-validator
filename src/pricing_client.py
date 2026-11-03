@@ -164,6 +164,7 @@ class PricingClient:
         self.pause_s = max(0.0, pause_s)
         self.requests = 0
         self._task_id = ""
+        self._qs_seen: dict = {}                 # command -> answer, this run
         self._classic_at = time.monotonic()      # sign-in just touched it
 
     # ---- transport ---------------------------------------------------------
@@ -263,13 +264,18 @@ class PricingClient:
 
     # ---- Quick Sale --------------------------------------------------------
     def quick_sale(self, command: str) -> str:
-        """Run one FDI command; opens the Quick Sale session the first time."""
+        """Run one FDI command; opens the Quick Sale session the first time.
+        A display already asked for in this run is answered from memory --
+        finding fare bases and the check ask for the same ones."""
+        if command in self._qs_seen:
+            return self._qs_seen[command]
         if not self._task_id:
             self._task_id = self._open_quick_sale()
         r = self._send("GET", QS_COMMAND, params={
             "taskId": self._task_id, "txtRequest": command, "color": "true"},
             headers={"X-Requested-With": "XMLHttpRequest"})
-        return r.text or ""
+        self._qs_seen[command] = r.text or ""
+        return self._qs_seen[command]
 
     def _open_quick_sale(self) -> str:
         r = self._send("GET", QS_INIT, params={

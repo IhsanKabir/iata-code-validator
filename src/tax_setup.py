@@ -41,6 +41,9 @@ from . import pricing_parse as pp
 from .flight_change_auth import BD_AIRPORTS
 
 KINDS = ("INT-INT", "INT-DOM", "DOM-INT", "DOM-DOM")
+#: Airport pairs whose answer cannot be read, with none read yet, before
+#: the run stops (the screen changed, or the session is gone).
+GIVE_UP_AFTER = 3
 ANY = ""                         # a tax that names no airport on that side
 
 NOT_SET_UP, MISSING, DIFFERENT, TWICE, SOME, NOT_APPLICABLE, NOT_TICKED, \
@@ -260,11 +263,29 @@ def run_tax_setup_check(client, settings: TaxSetupSettings, *, stop=None,
     res.notes.extend(notes)
     pairs = sorted({tuple(sorted(r)) for r in res.routes})
     found: dict = {}
+    failures = read_ok = 0
     for i, (a, b) in enumerate(pairs, 1):
         if stop.is_set():
             raise InterruptedError("Stopped.")
-        taxes = pp.parse_tax_list(client.tax_search(
-            pp.tax_search_form(geo[a], geo[b], res.date)))
+        try:
+            taxes = pp.parse_tax_list(client.tax_search(
+                pp.tax_search_form(geo[a], geo[b], res.date)))
+        except pp.LayoutChanged as exc:
+            # one odd answer costs that pair, not the run -- unless nothing
+            # can be read at all (signed out, or the screen really changed)
+            failures += 1
+            if failures >= GIVE_UP_AFTER and not read_ok:
+                raise pp.LayoutChanged(
+                    f"the tax screen's answer could not be read for the "
+                    f"first {failures} airport pairs (last {a}-{b}: {exc})"
+                ) from exc
+            res.notes.append(f"{a}-{b}: the tax screen's answer could not "
+                             f"be read ({exc}); this pair was skipped.")
+            res.unread |= {(a, b), (b, a)}
+            found[(a, b)] = []
+            res.searches += 1
+            continue
+        read_ok += 1
         before = len(res.notes)
         found[(a, b)] = setup_rows(taxes, code_of_name, (a, b), res.notes)
         if len(res.notes) > before:

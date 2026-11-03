@@ -29,6 +29,11 @@ from . import pricing_parse as pp
 #: Fare classes per penalty search. Big searches are slow and sometimes do
 #: not finish loading; a page that stops part-way is searched again smaller.
 PENALTY_CHUNK = 15
+#: Fare classes per search when asking for EVERY class on one route: the
+#: answer lists only classes with penalties there, so it stays small.
+PENALTY_SWEEP_CHUNK = 400
+#: A route list older than this may miss fare bases added since.
+ROUTE_LIST_STALE_DAYS = 7
 
 SAME, DIFFERENT, MISSING, NEW, DUPLICATE = (
     "same", "different", "missing", "new", "duplicate")
@@ -205,6 +210,19 @@ class RouteIndex:
             "legs": {str(k): sorted(v) for k, v in self.legs.items()}}),
             encoding="utf-8")
 
+    def age_note(self, today: date) -> str:
+        """A warning when the list is old enough to miss new fare bases."""
+        try:
+            built = datetime.strptime(self.built, "%Y-%m-%d %H:%M").date()
+        except ValueError:
+            return ""
+        days = (today - built).days
+        if days <= ROUTE_LIST_STALE_DAYS:
+            return ""
+        return (f"The route list was built {self.built} ({days} days ago): "
+                f"fare bases added or moved to new routes since are not in "
+                f"it — press 'Rebuild route list'.")
+
     def fare_bases_for(self, legs) -> list:
         legs = set(legs)
         return sorted(k for k, v in self.legs.items() if v & legs)
@@ -253,6 +271,7 @@ class CheckResult:
     findings: list = field(default_factory=list)
     compared: dict = field(default_factory=dict)   # part -> items compared
     problems: list = field(default_factory=list)   # couldn't check
+    notes: list = field(default_factory=list)      # worth knowing, read OK
     #: every value read: part -> {(route, item): {season: {field: value}}}
     values: dict = field(default_factory=dict)
     value_fields: dict = field(default_factory=dict)   # part -> fields
@@ -343,8 +362,10 @@ def compare_rows(part, route_of, item_of, rows_a, rows_b, fields, season_a,
 # ---- the three parts ---------------------------------------------------------
 
 def check_fares(client, lookups, fb_by_id, fare_base_ids, legs, base, others,
-                result, *, stop, progress):
-    """Returns {season id: {(code, leg): adult row}} for the sales check."""
+                result, *, stop, progress, learned=None):
+    """Returns {season id: {(code, leg): adult row}} for the sales check.
+    `learned` gets {fare basis id: every route its rows show} -- for the
+    route list to catch up with."""
     pax = lookups.passenger_types
     adults: dict = {}
     for i, fb_id in enumerate(fare_base_ids, 1):
@@ -356,6 +377,8 @@ def check_fares(client, lookups, fb_by_id, fare_base_ids, legs, base, others,
             rows = []
             for row in client.load_fares(fb_id, s.id):
                 leg = lookups.legs.get(int(row.get("IdLeg", -1)), "")
+                if leg and learned is not None:
+                    learned.setdefault(fb_id, set()).add(leg)
                 if leg in legs:
                     row = dict(row, _leg=leg, _code=fb.code)
                     rows.append(row)
@@ -509,6 +532,13 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
             day = check_date(s, today).strftime("%d/%m/%Y")
             html = client.tax_search(pp.tax_search_form(
                 airports[dep], airports[arr], day))
+            try:
+                pp.parse_tax_list(html)
+            except pp.LayoutChanged as exc:
+                result.problems.append(f"{leg} {s.name}: the tax screen's "
+                                       f"answer could not be read ({exc}); "
+                                       f"taxes not checked.")
+                break
             lists[s.id] = [{"route": f"{t.departure} → {t.arrival}",
                             "item": f"{t.code} · {t.name}",
                             "Value": t.value,
@@ -518,6 +548,8 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
                             "Applicable": "yes" if t.applicable else "no"}
                            for t in pp.parse_tax_list(html)]
         for other in others:
+            if base.id not in lists or other.id not in lists:
+                continue
             compare_rows("Taxes", lambda r: f"{leg} ({r['route']})",
                          lambda r: r["item"], lists[base.id], lists[other.id],
                          ("Value", "International", "Domestic",
@@ -526,23 +558,27 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
         progress(f"Taxes: {i:,} of {len(legs):,} routes")
 
 
-def check_penalties(client, options, index, lookups, legs, base, others,
+def check_penalties(client, options, enabled_ids, legs, base, others,
                     result, *, stop, progress):
+    """Every enabled fare class is asked for on each route: the penalty
+    screen, not the route list, says which classes have penalties there
+    (a class can have penalties on a route it has no Fare Editor row
+    for -- EX-CAN classes on CAN-MLE)."""
     leg_id = {v.replace(" ", ""): k for k, v in options.legs.items()}
     pax_ids = sorted(options.passenger_types)
     seasons = [base] + others
+    classes = sorted(c for c in options.classes if c in set(enabled_ids))
     for i, leg in enumerate(sorted(legs), 1):
         if stop.is_set():
             raise InterruptedError("Stopped.")
         lid = leg_id.get(leg)
-        classes = [c for c in index.fare_bases_for([leg])
-                   if c in options.classes]
         if lid is None or not classes:
-            result.problems.append(f"{leg}: no fare classes on the penalty "
-                                   f"screen for this route.")
+            result.problems.append(f"{leg}: route not on the penalty "
+                                   f"screen; penalties not checked.")
             continue
         rows = _penalty_rows(client, classes, [s.id for s in seasons], lid,
-                             pax_ids, result, leg)
+                             pax_ids, result, leg,
+                             chunk_size=PENALTY_SWEEP_CHUNK)
         by_season = {s.name: [] for s in seasons}
         for r in rows:
             if r.season in by_season:
@@ -559,13 +595,14 @@ def check_penalties(client, options, index, lookups, legs, base, others,
         progress(f"Penalties: {i:,} of {len(legs):,} routes")
 
 
-def _penalty_rows(client, classes, season_ids, lid, pax_ids, result, leg):
-    """Search in small pieces. A page that did not load completely is split
+def _penalty_rows(client, classes, season_ids, lid, pax_ids, result, leg,
+                  chunk_size=PENALTY_CHUNK, failed=None):
+    """Search in pieces. A page that did not load completely is split
     in half and searched again; one class that still fails is reported as
     not checked rather than trusted."""
     out = []
-    queue = [classes[i:i + PENALTY_CHUNK]
-             for i in range(0, len(classes), PENALTY_CHUNK)]
+    queue = [classes[i:i + chunk_size]
+             for i in range(0, len(classes), chunk_size)]
     while queue:
         chunk = queue.pop(0)
         html = client.penalty_search(pp.penalty_search_form(
@@ -580,6 +617,8 @@ def _penalty_rows(client, classes, season_ids, lid, pax_ids, result, leg):
                 result.problems.append(
                     f"{leg}: penalties for fare class {chunk[0]} did not load "
                     f"completely; not checked.")
+                if failed is not None:
+                    failed.append(chunk[0])
             continue
         out.extend(rows)
     return out
@@ -629,15 +668,35 @@ def run_check(client, index: RouteIndex, settings: Settings, *,
     if not legs:
         raise ValueError("No route to check.")
     result.routes = sorted(legs)
-    if (settings.fares or settings.penalties) and not index.legs:
+    if settings.fares and not index.legs:
         raise ValueError("The route list has not been built yet — press "
                          "'Rebuild route list' first.")
+    if settings.fares and index.age_note(today):
+        result.problems.append(index.age_note(today))
     fb_by_id = {f.id: f for f in enabled}
     ids = [i for i in index.fare_bases_for(legs) if i in fb_by_id]
     adults = {}
     if settings.fares:
+        from . import pricing_discover as pd
+        # the route list can be stale: what Quick Sale sells on the routes
+        # is added, so a fare basis new since the list was built is read
+        sources = {i: {pd.ROUTE_LIST} for i in ids}
+        pd.merge(sources, pd.on_sale(
+            client, legs, [base] + others, today,
+            {f.code.strip().upper(): f.id for f in enabled},
+            result.problems, stop=stop, progress=progress), pd.QUICK_SALE)
+        extra = [i for i in pd.outside_list(index, legs, sources)
+                 if i in fb_by_id]
+        ids = sorted(set(ids) | set(extra))
+        learned: dict = {}
         adults = check_fares(client, lookups, fb_by_id, ids, legs, base,
-                             others, result, stop=stop, progress=progress)
+                             others, result, stop=stop, progress=progress,
+                             learned=learned)
+        gained = pd.learn(index, learned)
+        if extra:
+            result.notes.append(pd.note(
+                [fb_by_id[i].code for i in extra],
+                {fb_by_id[i].code: sources[i] for i in extra}, gained))
     if settings.quick_sale:
         check_quick_sale(client, legs, base, others, today, adults, result,
                          stop=stop, progress=progress)
@@ -647,8 +706,12 @@ def run_check(client, index: RouteIndex, settings: Settings, *,
                     stop=stop, progress=progress)
     if settings.penalties:
         options = pp.parse_penalty_page(client.penalty_page())
-        check_penalties(client, options, index, lookups, legs, base, others,
-                        result, stop=stop, progress=progress)
+        check_penalties(client, options, [f.id for f in enabled], legs,
+                        base, others, result, stop=stop, progress=progress)
+    # finding fare bases and the Quick Sale part can hit the same failed
+    # display: each problem is said once
+    result.problems = list(dict.fromkeys(result.problems))
+    result.notes = list(dict.fromkeys(result.notes))
     result.finished = time.strftime("%Y-%m-%d %H:%M")
     return result
 

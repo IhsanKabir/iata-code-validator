@@ -156,44 +156,118 @@ def _read_fares(client, lookups, chosen, seasons, legs_filter, res, stop,
     return legs_of
 
 
-def _read_penalties(client, chosen, legs_of, seasons, res, stop, progress):
+def _search_leg(client, options, leg_id, classes, seasons, every):
+    """(rows, failed class ids, problems) for one route."""
+    check, failed = pc.CheckResult(), []
+    rows = pc._penalty_rows(
+        client, classes, [s.id for s in seasons], leg_id,
+        sorted(options.passenger_types), check, str(leg_id),
+        chunk_size=pc.PENALTY_SWEEP_CHUNK if every else pc.PENALTY_CHUNK,
+        failed=failed)
+    return rows, failed, check.problems
+
+
+def sweep_penalties(client, legs, seasons, enabled_ids, stop, progress):
+    """Every enabled class on each route, asked once: (options,
+    {leg: (rows, failed, problems)}) -- for finding fare bases and then
+    for the Penalties sheet without asking twice."""
     options = pp.parse_penalty_page(client.penalty_page())
     leg_id = {v.replace(" ", ""): k for k, v in options.legs.items()}
+    every = sorted(c for c in options.classes if c in set(enabled_ids))
+    out = {}
+    for i, leg in enumerate(sorted(legs), 1):
+        if stop.is_set():
+            raise InterruptedError("Stopped.")
+        if leg in leg_id and every:
+            out[leg] = _search_leg(client, options, leg_id[leg], every,
+                                   seasons, True)
+        progress(f"Penalties: {i:,} of {len(legs):,} routes")
+    return options, out
+
+
+def _read_penalties(client, chosen, legs_of, seasons, res, stop, progress,
+                    sweep=None, route_legs=(), prefetched=None):
+    """Penalties per route. `sweep` (enabled fare basis ids) asks the
+    penalty screen for EVERY enabled class on the route -- a route lookup
+    must not depend on the route list, which can miss classes with
+    penalties there (EX-CAN classes on CAN-MLE). Without it, only the
+    looked-up fare bases are asked for. A looked-up fare basis with no
+    penalty on a route it flies gets a row saying so."""
+    options, found = prefetched or (
+        pp.parse_penalty_page(client.penalty_page()), {})
+    leg_id = {v.replace(" ", ""): k for k, v in options.legs.items()}
     code = {int(fb["IdFareBasis"]): fb["Code"] for fb in chosen}
-    names = {s.name for s in seasons}
-    by_leg: dict = {}
+    names = [s.name for s in seasons]
+    by_leg: dict = {leg: [] for leg in route_legs}
     for fb_id, legs in legs_of.items():
         for leg in legs:
             by_leg.setdefault(leg, []).append(fb_id)
+    every = (sorted(c for c in options.classes if c in set(sweep))
+             if sweep is not None else None)
+    # results name a class by its description: the screen's own list, then
+    # the fare bases' Text, lead back to the code
+    by_text = {str(fb.get("Text") or ""): fb["Code"] for fb in chosen
+               if fb.get("Text")}
+    texts = [str(fb.get("Text")) for fb in chosen if fb.get("Text")]
+    for text in {t for t in texts if texts.count(t) > 1}:
+        by_text.pop(text, None)            # shared by two fare bases
+    by_text.update(options.code_of_text())
     for i, (leg, fb_ids) in enumerate(sorted(by_leg.items()), 1):
         if stop.is_set():
             raise InterruptedError("Stopped.")
-        classes = [c for c in sorted(fb_ids) if c in options.classes]
-        missing = sorted(set(fb_ids) - set(classes))
+        mine = sorted(c for c in fb_ids if c in options.classes)
+        missing = sorted(set(fb_ids) - set(mine))
         if missing:
             res.notes.append(f"{leg}: not on the penalty screen — "
                              + ", ".join(code[c] for c in missing))
+        classes = every if every is not None else mine
         if leg not in leg_id or not classes:
+            if leg not in leg_id:
+                res.notes.append(f"{leg}: route not on the penalty screen; "
+                                 f"penalties not read.")
             continue
-        check = pc.CheckResult()
-        rows = pc._penalty_rows(client, classes, [s.id for s in seasons],
-                                leg_id[leg], sorted(options.passenger_types),
-                                check, leg)
-        res.notes.extend(check.problems)
-        # results name a class by the fare basis's description (its Text),
-        # the screen's own list by its code -- both lead back to the code
-        by_text = {str(fb.get("Text") or ""): fb["Code"] for fb in chosen
-                   if int(fb["IdFareBasis"]) in classes}
-        by_text.update({options.classes[c]: code[c] for c in classes})
+        rows, failed, problems = found.get(leg) or _search_leg(
+            client, options, leg_id[leg], classes, seasons, every is not None)
+        res.notes.extend(p.replace(f"{leg_id[leg]}:", f"{leg}:", 1)
+                         for p in problems)
+        # only classes really searched can be said to have no penalty
+        searched = set(classes) - set(failed)
+        expected = {code[c] for c in fb_ids if c in searched}
+        seen, extra, unnamed = set(), set(), 0
         for r in rows:
             if r.season not in names:
                 continue
-            res.penalties.append({
-                "Season": r.season, "Route": leg,
-                "Fare basis": _code_for(r.fare_class, by_text),
-                "Fare class (as shown)": r.fare_class,
-                "Passenger": r.passenger, "Window": r.window,
-                "Change fee": r.change, "Refund fee": r.refund})
+            fb_code = _code_for(r.fare_class, by_text)
+            seen.add((fb_code, r.season))
+            unnamed += not fb_code
+            row = {"Season": r.season, "Route": leg, "Fare basis": fb_code,
+                   "Fare class (as shown)": r.fare_class,
+                   "Passenger": r.passenger, "Window": r.window,
+                   "Change fee": r.change, "Refund fee": r.refund}
+            if fb_code not in expected:
+                extra.add(fb_code or r.fare_class)
+                row["Status"] = ("penalty set, but no Fare Editor fare for "
+                                 "it on this route")
+            res.penalties.append(row)
+        if extra:
+            res.notes.append(
+                f"{leg}: penalties set for {len(extra)} fare basis(es) with "
+                f"no Fare Editor fare on this route (included, marked in "
+                f"Status): " + ", ".join(sorted(extra)))
+        if unnamed:
+            res.notes.append(
+                f"{leg}: {unnamed} penalty row(s) could not be matched to a "
+                f"fare basis code (Fare basis left empty) — so no fare "
+                f"basis on this route is reported as having no penalty.")
+            expected = set()
+        for fb_code in sorted(expected):
+            for season in names:
+                if (fb_code, season) not in seen:
+                    res.penalties.append({
+                        "Season": season, "Route": leg,
+                        "Fare basis": fb_code,
+                        "Status": "NO PENALTY SET in Zenith for this "
+                                  "route and season"})
         progress(f"Penalties: {i:,} of {len(by_leg):,} routes")
 
 
@@ -201,10 +275,10 @@ def _code_for(shown: str, by_text: dict) -> str:
     """The penalty table names a class by its description; match it back."""
     if shown in by_text:
         return by_text[shown]
-    for text, code in by_text.items():
-        if shown and (shown in text or text in shown):
-            return code
-    return ""
+    # a near match only when exactly one description fits -- never a guess
+    near = {code for text, code in by_text.items()
+            if shown and text and (shown in text or text in shown)}
+    return near.pop() if len(near) == 1 else ""
 
 
 def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
@@ -222,8 +296,15 @@ def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
             if stop.is_set():
                 raise InterruptedError("Stopped.")
             day = lookup_date(s, today).strftime("%d/%m/%Y")
-            for t in pp.parse_tax_list(client.tax_search(pp.tax_search_form(
-                    airports[dep], airports[arr], day))):
+            try:
+                taxes = pp.parse_tax_list(client.tax_search(
+                    pp.tax_search_form(airports[dep], airports[arr], day)))
+            except pp.LayoutChanged as exc:
+                res.notes.append(f"{leg} {s.name}: the tax screen's answer "
+                                 f"could not be read ({exc}); taxes not "
+                                 f"read.")
+                continue
+            for t in taxes:
                 row = {"Season": s.name, "Route": leg, "On date": day,
                        "Tax code": t.code, "Tax": t.name,
                        "Departure": t.departure, "Arrival": t.arrival,
@@ -310,6 +391,39 @@ def _quick_sale_in(client, od, leg, season, day, cur, codes, res) -> None:
 
 # ---- the whole lookup --------------------------------------------------------
 
+def _discover(client, index, rows, by_id, chosen, legs, seasons, today,
+              settings, res, stop, progress):
+    """A route lookup: the route list's fare bases, plus every enabled one
+    Quick Sale sells on the routes or the penalty screen has there -- so a
+    stale route list cannot hide one. Returns (chosen, {id: found via},
+    the penalty answers to reuse or None)."""
+    from . import pricing_discover as pd
+    by_code = pd.enabled_ids_by_code(rows)
+    sources = {int(r["IdFareBasis"]): {pd.ROUTE_LIST} for r in chosen}
+    pd.merge(sources, pd.on_sale(client, legs, seasons, today, by_code,
+                                 res.notes, stop=stop, progress=progress),
+             pd.QUICK_SALE)
+    prefetched = None
+    if settings.penalties:
+        prefetched = sweep_penalties(client, legs, seasons,
+                                     set(by_code.values()), stop, progress)
+        options, per_leg = prefetched
+        names = options.code_of_text()
+        hits = {}
+        for leg_rows, _failed, _problems in per_leg.values():
+            for r in leg_rows:
+                fb_id = by_code.get(names.get(r.fare_class, "").strip()
+                                    .upper())
+                if fb_id is not None:
+                    hits[fb_id] = True
+        pd.merge(sources, hits, pd.PENALTY_SCREEN)
+    have = {int(r["IdFareBasis"]) for r in chosen}
+    extra = [i for i in pd.outside_list(index, legs, sources)
+             if i in by_id and i not in have]
+    return chosen + [by_id[i] for i in extra], sources, prefetched
+
+
+
 def run_lookup(client, index, settings: LookupSettings, *, today=None,
                stop=None, progress=lambda _m: None) -> LookupResult:
     stop = stop or threading.Event()
@@ -349,13 +463,20 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
         if unmatched:
             res.notes.append("No fare basis matches: " + ", ".join(unmatched))
     elif legs:
-        if not index.load():
-            raise ValueError("To look up a route without fare basis codes, "
-                             "build the route list first.")
-        chosen = [by_id[i] for i in index.fare_bases_for(legs) if i in by_id]
-        res.notes.append(f"Fare bases on these routes come from the route "
-                         f"list built {index.built} (enabled fare bases "
-                         f"only).")
+        if index.load():
+            chosen = [by_id[i] for i in index.fare_bases_for(legs)
+                      if i in by_id]
+            res.notes.append(f"Fare bases on these routes: the route list "
+                             f"built {index.built}, plus what Quick Sale and "
+                             f"the penalty screen show there (enabled fare "
+                             f"bases only).")
+            if index.age_note(today):
+                res.notes.append(index.age_note(today))
+        else:
+            chosen = []
+            res.notes.append("No route list yet: fare bases on these routes "
+                             "come from Quick Sale and the penalty screen "
+                             "only — build the route list to add the rest.")
     elif classes:
         chosen = [r for r in rows if r.get("IsEnabled")
                   and r.get("IdFareBasis") is not None]
@@ -364,6 +485,12 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
     else:
         raise ValueError("Enter a fare basis, a booking class (RBD) or a "
                          "route.")
+    found_via: dict = {}
+    prefetched = None
+    if legs and not settings.fare_bases_text.strip() and not classes:
+        chosen, found_via, prefetched = _discover(
+            client, index, rows, by_id, chosen, legs, seasons, today,
+            settings, res, stop, progress)
     if classes:
         chosen = by_class(chosen, classes)
         res.notes.append("Booking classes: " + ", ".join(sorted(classes)))
@@ -373,10 +500,13 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
             if classes else "") + ".")
     if len(chosen) > MAX_FARE_BASES:
         raise ValueError(f"That is {len(chosen):,} fare bases — narrow it to "
-                         f"{MAX_FARE_BASES} or fewer (a code pattern or a "
-                         f"route).")
+                         f"{MAX_FARE_BASES} or fewer: fewer routes, a route "
+                         f"type, a booking class or a code pattern.")
     chosen.sort(key=lambda r: str(r.get("Code")))
-    res.fare_bases = [{f: r.get(f) for f in FARE_BASIS_FIELDS}
+    res.fare_bases = [{**{f: r.get(f) for f in FARE_BASIS_FIELDS},
+                       **({"Found via": ", ".join(sorted(found_via.get(
+                           int(r["IdFareBasis"]), ())))} if found_via
+                          else {})}
                       for r in chosen]
 
     # route types alone narrow what a fare basis / class search reads: the
@@ -394,6 +524,16 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
     legs_of = _read_fares(client, lookups, chosen, seasons, legs_filter, res,
                           stop, progress, keep_rows=settings.fares,
                           currency_of=currency_of)
+    if found_via:
+        from . import pricing_discover as pd
+        gained = pd.learn(index, legs_of)
+        extra = sorted(str(r["Code"]) for r in chosen
+                       if pd.ROUTE_LIST not in found_via.get(
+                           int(r["IdFareBasis"]), {pd.ROUTE_LIST}))
+        if extra:
+            how = {str(r["Code"]): found_via[int(r["IdFareBasis"])]
+                   for r in chosen if str(r["Code"]) in extra}
+            res.notes.append(pd.note(extra, how, gained))
     if legs:
         routes = set(legs)
     else:
@@ -403,8 +543,18 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
         res.notes.append("No fares found for these fare bases in the ticked "
                          "seasons, so no routes to read taxes, penalties or "
                          "Quick Sale for.")
-    if settings.penalties and legs_of:
-        _read_penalties(client, chosen, legs_of, seasons, res, stop, progress)
+    # a route lookup reads every enabled class on the route; a fare
+    # basis / class lookup only the ones asked for
+    by_route = bool(legs) and not (settings.fare_bases_text.strip()
+                                   or classes)
+    if settings.penalties and (legs_of or by_route):
+        _read_penalties(client, chosen, legs_of, seasons, res, stop, progress,
+                        sweep=[int(r["IdFareBasis"]) for r in rows
+                               if r.get("IsEnabled")
+                               and r.get("IdFareBasis") is not None]
+                        if by_route else None,
+                        route_legs=sorted(legs) if by_route else (),
+                        prefetched=prefetched)
     if settings.taxes and routes:
         _read_taxes(client, chosen, routes, seasons, today,
                     settings.tax_exemptions, res, stop, progress)
@@ -415,6 +565,7 @@ def run_lookup(client, index, settings: LookupSettings, *, today=None,
         res.notes.append("Quick Sale amounts are in " + (
             forced if forced else "each fare's own currency, as filed in the "
             "Fare Editor") + " — see the Currency column.")
+    res.notes = list(dict.fromkeys(res.notes))      # each said once
     res.finished = time.strftime("%Y-%m-%d %H:%M")
     return res
 

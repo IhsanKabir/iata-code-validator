@@ -173,10 +173,25 @@ class PenaltyOptions:
     legs: dict = field(default_factory=dict)       # id -> "DAC - DXB"
     seasons: dict = field(default_factory=dict)    # id -> name
     passenger_types: dict = field(default_factory=dict)
+    #: id -> the description results name a class by ("B - Economy Flex |
+    #: EX-CAN SITI OW"), without the "(Modifiable ... )" note
+    class_texts: dict = field(default_factory=dict)
+
+    def code_of_text(self) -> dict:
+        """A result row's class description -> its fare basis code. A
+        description two classes share leads to neither: never guessed."""
+        from collections import Counter
+        seen = Counter(self.class_texts.values())
+        return {text: self.classes[i] for i, text in self.class_texts.items()
+                if i in self.classes and text and seen[text] == 1}
 
 
 def parse_penalty_page(html: str) -> PenaltyOptions:
     out = PenaltyOptions()
+    for m in re.finditer(r'name="(\d+)_IDClasse".*?</td>\s*<td[^>]*>(.*?)'
+                         r'</td>', html or "", re.S):
+        text = re.sub(r"\s*\([^()]*\)\s*$", "", _text(m.group(2)))
+        out.class_texts.setdefault(int(m.group(1)), text)
     for kind, attr, target in (("IDClasse", "idClass", out.classes),
                                ("IDLeg", "idLeg", out.legs),
                                ("IDPeriode", "idPeriod", out.seasons),
@@ -318,8 +333,16 @@ _TAX_HEADER = ("Tax Name", "Tax Code", "Departure Airport", "Arrival Airport",
 
 
 def parse_tax_list(html: str) -> list:
+    """The taxes a search found. No results table on the tax screen = no
+    tax for that pair ([]); a page that is not the tax screen, or a table
+    whose columns moved, stops the read rather than being misread."""
     body = re.sub(r"<script.*?</script>|<style.*?</style>", "", html or "",
                   flags=re.S)
+    if 'id="SeekResult"' not in body:
+        if 'name="RecCodeDestGeo"' in body:
+            return []                      # searched: nothing set up
+        raise LayoutChanged("the answer was not the tax screen (signed out, "
+                            "or an error page)")
     out, header_seen = [], False
     for attrs, row in re.findall(r"<tr\b([^>]*)>(.*?)</tr>", body, re.S):
         cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, re.S)
@@ -327,7 +350,8 @@ def parse_tax_list(html: str) -> list:
             # one cell is a message line; anything else after the header
             # would be a tax row read wrong -- stop rather than drop it
             if header_seen and len(cells) > 1:
-                raise LayoutChanged(f"Tax row has {len(cells)} columns.")
+                raise LayoutChanged(f"a tax row has {len(cells)} columns "
+                                    f"instead of {len(_TAX_HEADER)}")
             continue
         texts = [_text(c) for c in cells]
         if tuple(texts) == _TAX_HEADER:
@@ -346,8 +370,9 @@ def parse_tax_list(html: str) -> list:
                        int(opens.group(1)) if opens else 0,
                        not re.search(r'data-applicable\s*=\s*"?false',
                                      attrs, re.I)))
-    if not header_seen and "Tax Code" in body:
-        raise LayoutChanged("Tax list columns changed.")
+    if not header_seen:
+        raise LayoutChanged("the tax list's column headings are not the "
+                            "expected " + " / ".join(_TAX_HEADER))
     return out
 
 

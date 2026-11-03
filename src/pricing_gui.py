@@ -95,8 +95,10 @@ class PricingMixin(PricingLookupMixin, TaxSetupMixin, RoeMixin):
                 "refused before it is sent.\n\n"
                 "The route list (which fare bases have fares on which route) "
                 "is built once by reading every fare basis — press 'Rebuild "
-                "route list' the first time, and again after fare bases are "
-                "added or routes change."))
+                "route list' the first time. Each run also adds any fare "
+                "basis Quick Sale sells on the route that the list misses, "
+                "and the list learns it; penalties ask the penalty screen "
+                "for every class, so they never depend on the list."))
 
         box = self._section(parent, "What to check")
         self.pricing_routes = tk.StringVar(value="")
@@ -271,9 +273,13 @@ class PricingMixin(PricingLookupMixin, TaxSetupMixin, RoeMixin):
     def _pricing_show_index(self) -> None:
         idx = self._pricing_index()
         if idx.load():
+            from datetime import date
+            stale = idx.age_note(date.today())
             self.pricing_index_lbl.configure(
                 text=f"Route list: {len(idx.legs):,} fare bases, built "
-                     f"{idx.built}.")
+                     f"{idx.built}." + (" ⚠ Over a week old — rebuild it "
+                                        "to include new fare bases."
+                                        if stale else ""))
         else:
             self.pricing_index_lbl.configure(
                 text="Route list not built yet — press 'Rebuild route list' "
@@ -326,14 +332,14 @@ class PricingMixin(PricingLookupMixin, TaxSetupMixin, RoeMixin):
         if not any(parts.values()):
             messagebox.showerror(_TITLE, "Tick at least one part.")
             return
-        # Quick Sale and taxes go by route alone; only the Fare Editor and
-        # penalty reads need to know which fare bases fly where
-        needs_list = parts["Fares"] or parts["Penalties"]
-        if needs_list and not self._pricing_index().load():
+        # Quick Sale, taxes and penalties go by route alone (penalties ask
+        # the penalty screen for every class); only the Fare Editor read
+        # needs to know which fare bases fly where
+        if parts["Fares"] and not self._pricing_index().load():
             messagebox.showerror(_TITLE, "Build the route list first — "
                                          "press 'Rebuild route list'. "
-                                         "(Quick Sale and Taxes alone work "
-                                         "without it.)")
+                                         "(Quick Sale, Taxes and Penalties "
+                                         "work without it.)")
             return
         try:
             kinds = self._ticked_kinds(self.pricing_kinds)
@@ -498,6 +504,9 @@ def _explain(exc: Exception) -> str:
         return (f"Refused before sending: {exc} Nothing was changed in "
                 f"Zenith — please report this.")
     if isinstance(exc, pp.LayoutChanged):
-        return (f"A Zenith screen looks different from when this check was "
-                f"built ({exc}). Stopped rather than misread it.")
+        return (f"Zenith's answer could not be read: {exc}. Stopped rather "
+                f"than guess — nothing was changed in Zenith. Sign in again "
+                f"and re-run; if it happens again, open that screen in the "
+                f"browser, save the network log (F12 → Network → Save all as "
+                f"HAR) and send it so the app can be updated.")
     return f"{type(exc).__name__}: {exc}"

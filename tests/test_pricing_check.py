@@ -157,7 +157,9 @@ def tax_list(rows):
                 pp._TAX_HEADER[:5], (name, code, dep, arr, value)))
             + f"<td>International {'&#xe5ca;' if intl else ''}</td>"
             + "<td>Domestic </td><td>History History</td></tr>")
-    return f"<table><tr>{head}</tr>{body}</table>"
+    # as live: the search form above, the results table below
+    return (f'<select name="RecCodeDestGeo"></select><table id="SeekResult">'
+            f"<tr>{head}</tr>{body}</table>")
 
 
 def fare(leg, pax, cur, ow, rt=0, bag=20, excess=5):

@@ -51,7 +51,9 @@ class PricingLookupMixin:
                 "(current and later seasons only).\n\n"
                 "Fare basis: codes, or patterns — YBD* is every code starting "
                 "YBD. Route alone: every fare basis on it (from the route "
-                "list); DAC-* is every route from DAC. Route types narrow "
+                "list) — and, for penalties, every class the penalty screen "
+                "has on it, listed in the route list or not; DAC-* is every "
+                "route from DAC. Route types narrow "
                 "any of these to INT-INT, INT-DOM, DOM-INT or DOM-DOM routes. "
                 "READ ONLY, like the season check.")
 
