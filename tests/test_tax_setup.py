@@ -119,6 +119,46 @@ def test_a_red_cross_is_not_read_as_not_international():
     assert t.international_text == "crossed (not applicable)"
 
 
+def detail_page(applicable=False, intl=True, dom=False):
+    """The tax's detail page as recorded: its ticks are checkboxes."""
+    def box(name, on):
+        return (f'<input type="checkbox" name="{name}" id="{name}"\n'
+                f'    value="On" {"checked" if on else ""} />')
+    return (box("BoolApplicable", applicable)
+            + box("BoolApplicableInternational", intl)
+            + box("BoolApplicableDomestic", dom))
+
+
+def crossed_tax(tax_id=1221):
+    return pp.Tax("Fuel Surcharge", "YQ", "Guangzhou", "Muscat", "25 CNY",
+                  False, False, tax_id, applicable=False, crossed=True)
+
+
+def test_a_crossed_entry_gets_its_real_ticks_from_its_details():
+    opened, seen = [], {}
+    def open_detail(tid):
+        opened.append(tid)
+        return detail_page(intl=True, dom=False)
+    taxes = [crossed_tax(), crossed_tax()]          # same entry, twice
+    out = pp.settle_crossed(taxes, open_detail, seen)
+    assert [(t.international, t.domestic, t.crossed, t.applicable)
+            for t in out] == [(True, False, False, False)] * 2
+    assert out[0].international_text == "yes"
+    assert opened == [1221]                          # opened once
+
+
+def test_a_crossed_entry_whose_details_cannot_be_read_stays_unknown():
+    out = pp.settle_crossed([crossed_tax()], lambda _tid: "<html></html>", {})
+    assert out[0].crossed and out[0].international_text.startswith("crossed")
+
+
+def test_only_crossed_entries_are_opened():
+    plain = pp.Tax("Fee", "BD", "Dhaka", "Bangkok", "500 BDT", True, False, 7)
+    def never(_tid):
+        raise AssertionError("opened an entry that was not crossed")
+    assert pp.settle_crossed([plain], never, {}) == [plain]
+
+
 def test_a_crossed_every_route_entry_is_shown_not_dropped():
     def row(crossed):
         return ts.SetupRow(9, "YR", "Old fee", "CAN", ts.ANY, "5 USD", False,

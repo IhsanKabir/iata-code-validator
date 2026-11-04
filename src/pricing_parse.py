@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html import unescape
 
 #: Fare-row fields compared between seasons ("all of them" -- the user).
@@ -425,6 +425,46 @@ class TaxDetail:
     def exempt_fare_bases(self) -> set:
         return {int(k) for k in self.exempt.get("ClasseTarifaireExempted", {})
                 if str(k).isdigit()}
+
+
+#: The detail page's own ticks (checkbox name -> Tax field).
+_TICK_BOXES = {"BoolApplicable": "applicable",
+               "BoolApplicableInternational": "international",
+               "BoolApplicableDomestic": "domestic"}
+
+
+def tax_ticks(html: str) -> dict:
+    """{applicable, international, domestic} as the tax's detail page ticks
+    them -- the truth behind a red cross in the list."""
+    html = re.sub(r"<!--.*?-->", "", html or "", flags=re.S)
+    out = {}
+    for name, key in _TICK_BOXES.items():
+        tag = re.search(r'<input\b[^>]*\bname="' + name + r'"[^>]*>', html)
+        if not tag:
+            raise LayoutChanged(f"the tax's details have no {name} box")
+        out[key] = bool(re.search(r"\bchecked\b", tag.group(0), re.I))
+    return out
+
+
+def settle_crossed(taxes: list, open_detail, seen: dict) -> list:
+    """Taxes whose International shows a red cross get their real ticks
+    from their detail page (open_detail(tax id) -> html, a read). One that
+    cannot be opened stays crossed, so it is reported as unknown, never as
+    "no". `seen` keeps tax id -> ticks (or None) across calls."""
+    out = []
+    for t in taxes:
+        if t.crossed and t.tax_id:
+            if t.tax_id not in seen:
+                try:
+                    seen[t.tax_id] = tax_ticks(open_detail(t.tax_id))
+                except LayoutChanged:
+                    seen[t.tax_id] = None
+            ticks = seen[t.tax_id]
+            if ticks:
+                t = replace(t, international=ticks["international"],
+                            domestic=ticks["domestic"], crossed=False)
+        out.append(t)
+    return out
 
 
 def _field_value(html: str, name: str) -> str:

@@ -519,6 +519,7 @@ def _sales_check(client, od, day, leg, season, adults, result):
 
 def check_taxes(client, airports, legs, base, others, today, result, *, stop,
                 progress):
+    opened: dict = {}                    # tax id -> its detail page's ticks
     for i, leg in enumerate(sorted(legs), 1):
         if stop.is_set():
             raise InterruptedError("Stopped.")
@@ -533,19 +534,23 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
             html = client.tax_search(pp.tax_search_form(
                 airports[dep], airports[arr], day))
             try:
-                pp.parse_tax_list(html)
+                taxes = pp.parse_tax_list(html)
             except pp.LayoutChanged as exc:
                 result.problems.append(f"{leg} {s.name}: the tax screen's "
                                        f"answer could not be read ({exc}); "
                                        f"taxes not checked.")
                 break
+            taxes = pp.settle_crossed(
+                taxes, lambda tid, day=day: client.tax_search(
+                    pp.tax_detail_form(tid, airports[dep], airports[arr],
+                                       day)), opened)
             lists[s.id] = [{"route": f"{t.departure} → {t.arrival}",
                             "item": f"{t.code} · {t.name}",
                             "Value": t.value,
                             "International": t.international_text,
                             "Domestic": "yes" if t.domestic else "no",
                             "Applicable": "yes" if t.applicable else "no"}
-                           for t in pp.parse_tax_list(html)]
+                           for t in taxes]
         for other in others:
             if base.id not in lists or other.id not in lists:
                 continue

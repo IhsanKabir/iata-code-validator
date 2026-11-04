@@ -286,6 +286,7 @@ def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
     airports = pp.parse_tax_airports(client.tax_page())
     fb_code = {int(fb["IdFareBasis"]): fb["Code"] for fb in chosen}
     opened: dict = {}                      # (tax id, day) -> TaxDetail
+    ticks: dict = {}                       # tax id -> its detail's ticks
     for i, leg in enumerate(sorted(legs), 1):
         dep, arr = leg.split("-")
         if dep not in airports or arr not in airports:
@@ -304,6 +305,10 @@ def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
                                  f"could not be read ({exc}); taxes not "
                                  f"read.")
                 continue
+            taxes = pp.settle_crossed(
+                taxes, lambda tid, day=day: client.tax_search(
+                    pp.tax_detail_form(tid, airports[dep], airports[arr],
+                                       day)), ticks)
             for t in taxes:
                 row = {"Season": s.name, "Route": leg, "On date": day,
                        "Tax code": t.code, "Tax": t.name,

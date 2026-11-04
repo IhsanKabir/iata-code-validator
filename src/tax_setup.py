@@ -264,6 +264,7 @@ def run_tax_setup_check(client, settings: TaxSetupSettings, *, stop=None,
     res.notes.extend(notes)
     pairs = sorted({tuple(sorted(r)) for r in res.routes})
     found: dict = {}
+    opened: dict = {}                    # tax id -> its detail page's ticks
     failures = read_ok = 0
     for i, (a, b) in enumerate(pairs, 1):
         if stop.is_set():
@@ -287,6 +288,9 @@ def run_tax_setup_check(client, settings: TaxSetupSettings, *, stop=None,
             res.searches += 1
             continue
         read_ok += 1
+        taxes = pp.settle_crossed(
+            taxes, lambda tid, a=a, b=b: client.tax_search(
+                pp.tax_detail_form(tid, geo[a], geo[b], res.date)), opened)
         before = len(res.notes)
         found[(a, b)] = setup_rows(taxes, code_of_name, (a, b), res.notes)
         if len(res.notes) > before:
