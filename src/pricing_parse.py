@@ -326,6 +326,21 @@ class Tax:
     #: Zenith's own mark on the row (<tr data-applicable="false">): shown
     #: greyed and hidden unless "Show unapplicable taxes" is ticked
     applicable: bool = True
+    #: a red cross in the International column -- Zenith draws it on
+    #: not-applicable entries instead of the tick, so whether the entry is
+    #: international cannot be told; never read it as "no"
+    crossed: bool = False
+
+    @property
+    def international_text(self) -> str:
+        return tick_text(self.international, self.crossed)
+
+
+def tick_text(ticked: bool, crossed: bool = False) -> str:
+    """The International column as Zenith shows it."""
+    if crossed:
+        return "crossed (not applicable)"
+    return "yes" if ticked else "no"
 
 
 _TAX_HEADER = ("Tax Name", "Tax Code", "Departure Airport", "Arrival Airport",
@@ -364,12 +379,14 @@ def parse_tax_list(html: str) -> list:
                 for t, h in zip(texts, _TAX_HEADER)]
         # the tick is an icon-font character, written as an HTML entity
         ticked = ["" in unescape(c) for c in cells]
+        crossed = "" in unescape(cells[5])
         opens = re.search(r"Affiche\((\d+)\)", cells[0])
         out.append(Tax(vals[0], vals[1], vals[2], vals[3], vals[4],
                        ticked[5], ticked[6],
                        int(opens.group(1)) if opens else 0,
                        not re.search(r'data-applicable\s*=\s*"?false',
-                                     attrs, re.I)))
+                                     attrs, re.I),
+                       crossed and not ticked[5]))
     if not header_seen:
         raise LayoutChanged("the tax list's column headings are not the "
                             "expected " + " / ".join(_TAX_HEADER))

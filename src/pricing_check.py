@@ -542,8 +542,7 @@ def check_taxes(client, airports, legs, base, others, today, result, *, stop,
             lists[s.id] = [{"route": f"{t.departure} → {t.arrival}",
                             "item": f"{t.code} · {t.name}",
                             "Value": t.value,
-                            "International": "yes" if t.international
-                            else "no",
+                            "International": t.international_text,
                             "Domestic": "yes" if t.domestic else "no",
                             "Applicable": "yes" if t.applicable else "no"}
                            for t in pp.parse_tax_list(html)]

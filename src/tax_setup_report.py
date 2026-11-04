@@ -13,6 +13,7 @@ from datetime import date
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
+from . import pricing_parse as pp
 from . import tax_setup as ts
 from .counter_master import BAD, GREY, NAVY, PAPER, WARN, _cell, _headers
 from .pricing_lookup_report import write_table
@@ -111,7 +112,7 @@ def all_rows(res) -> list:
                 "Set for": (f"every route to {r.arr}" if r.dep == ts.ANY
                             else f"every route from {r.dep}"
                             if r.arr == ts.ANY else "this route"),
-                "International": "yes" if r.international else "no",
+                "International": pp.tick_text(r.international, r.crossed),
                 "Domestic": "yes" if r.domestic else "no",
                 "Applicable": "yes" if r.applicable else "NO",
                 "Tax id": r.tax_id})

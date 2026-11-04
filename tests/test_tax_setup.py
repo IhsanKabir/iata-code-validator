@@ -104,6 +104,29 @@ def test_a_row_without_the_mark_counts_as_applicable():
     assert pp.parse_tax_list(html)[0].applicable
 
 
+def test_a_red_cross_is_not_read_as_not_international():
+    # Zenith draws a red cross, not a tick, in International on entries it
+    # marks not applicable: whether they are international is not shown
+    html = tax_list([(1221, "Fuel Surcharge", "YQ", "CAN", "MCT", "25 CNY",
+                      False, False, False)]).replace(
+        '<div class="visible-xs-inline xs-right"></div></td><td><div '
+        'class="visible-xs-inline xs-left">Domestic',
+        '<div class="visible-xs-inline xs-right"><i class="material-icons" '
+        'style="color: red">&#xE5CD;</i></div></td><td><div '
+        'class="visible-xs-inline xs-left">Domestic', 1)
+    t = pp.parse_tax_list(html)[0]
+    assert t.crossed and not t.international and not t.domestic
+    assert t.international_text == "crossed (not applicable)"
+
+
+def test_a_crossed_every_route_entry_is_shown_not_dropped():
+    def row(crossed):
+        return ts.SetupRow(9, "YR", "Old fee", "CAN", ts.ANY, "5 USD", False,
+                           False, False, crossed=crossed)
+    assert not row(False).applies_to("CAN", "MCT")   # unticked: not its kind
+    assert row(True).applies_to("CAN", "MCT")        # unknown: shown
+
+
 def test_the_search_asks_for_not_applicable_taxes_too():
     form = pp.tax_search_form(5543, 6207, "03/11/2026")
     assert form["ShowNotInUseTaxes"] == "on" and form["hAction"] == "Seek"

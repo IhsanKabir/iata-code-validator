@@ -164,6 +164,7 @@ class SetupRow:
     international: bool
     domestic: bool
     applicable: bool
+    crossed: bool = False    # International shown as a red cross: unknown
 
     @property
     def key(self) -> tuple:
@@ -179,8 +180,8 @@ class SetupRow:
         / Domestic tick takes in the kind of route."""
         if self.dep not in (dep, ANY) or self.arr not in (arr, ANY):
             return False
-        if not self.every_route:
-            return True
+        if not self.every_route or self.crossed:
+            return True     # a crossed entry is shown (as not applicable)
         return (self.domestic if route_kind(dep, arr) == "DOM-DOM"
                 else self.international)
 
@@ -201,7 +202,7 @@ def setup_rows(taxes, code_of_name: dict, pair: tuple, notes: list) -> list:
             continue
         out.append(SetupRow(t.tax_id, t.code, t.name, ends[0], ends[1],
                             t.value, t.international, t.domestic,
-                            t.applicable))
+                            t.applicable, t.crossed))
     return out
 
 

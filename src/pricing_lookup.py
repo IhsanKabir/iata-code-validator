@@ -309,7 +309,7 @@ def _read_taxes(client, chosen, legs, seasons, today, exemptions, res, stop,
                        "Tax code": t.code, "Tax": t.name,
                        "Departure": t.departure, "Arrival": t.arrival,
                        "Value": t.value,
-                       "International": "yes" if t.international else "no",
+                       "International": t.international_text,
                        "Domestic": "yes" if t.domestic else "no",
                        "Applicable": "yes" if t.applicable else
                        "NO — Zenith marks it not applicable"}
